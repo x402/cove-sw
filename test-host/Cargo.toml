@@ -1,0 +1,9 @@
+[package]
+name = "test-host"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+riscv = "0.16"
+sbi-rt = { path = "../../rustsbi/library/sbi-rt", features = ["legacy"] }
+sbi-spec = { path = "../../rustsbi/library/sbi-spec" }

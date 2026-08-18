@@ -1,0 +1,6 @@
+[alias]
+xtask = "run --package xtask --"
+pack = "run --package xtask -- pack"
+
+[target.riscv64gc-unknown-none-elf]
+rustflags = ["-Aunused-features", "-Aunused-imports", "-Adead-code", "-Amismatched-lifetime-syntaxes", "-Aunsafe-op-in-unsafe-fn"]

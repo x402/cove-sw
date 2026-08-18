@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = [
+    "tsm",
+    "test-host",
+    "test-guest",
+    "xtask",
+    "vendor/data-model",
+    "vendor/sync",
+    "vendor/riscv-pages",
+    "vendor/page-tracking",
+    "vendor/riscv-page-tables",
+    "vendor/riscv-regs",
+    "vendor/s-mode-utils",
+]

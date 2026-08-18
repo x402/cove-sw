@@ -1,0 +1,7 @@
+[package]
+name = "riscv-pages"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+riscv-cove = { path = "../../../rustsbi/library/riscv-cove" }

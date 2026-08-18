@@ -1,0 +1,9 @@
+[package]
+name = "page-tracking"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+riscv-pages = { path = "../riscv-pages" }
+sync = { path = "../sync" }
+arrayvec = { version = "0.7", default-features = false }

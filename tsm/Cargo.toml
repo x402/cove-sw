@@ -1,0 +1,18 @@
+[package]
+name = "tsm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+riscv = "0.16"
+spin = "0.9"
+data-model = { path = "../vendor/data-model" }
+sync = { path = "../vendor/sync" }
+riscv-pages = { path = "../vendor/riscv-pages" }
+page-tracking = { path = "../vendor/page-tracking" }
+riscv-page-tables = { path = "../vendor/riscv-page-tables" }
+riscv-regs = { path = "../vendor/riscv-regs" }
+s-mode-utils = { path = "../vendor/s-mode-utils" }
+riscv-cove = { path = "../../rustsbi/library/riscv-cove" }
+sbi-rt = { path = "../../rustsbi/library/sbi-rt" }
+sbi-spec = { path = "../../rustsbi/library/sbi-spec" }

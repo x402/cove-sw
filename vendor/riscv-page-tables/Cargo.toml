@@ -1,0 +1,13 @@
+[package]
+name = "riscv-page-tables"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+page-tracking = { path = "../page-tracking" }
+riscv-pages = { path = "../riscv-pages" }
+sync = { path = "../sync" }
+
+[features]
+default = []
+hardware_ad_updates = []

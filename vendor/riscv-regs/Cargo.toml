@@ -1,0 +1,11 @@
+[package]
+name = "riscv-regs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+riscv-page-tables = { path = "../riscv-page-tables" }
+riscv-pages = { path = "../riscv-pages" }
+riscv-decode = "0.2"
+tock-registers = "0.8"
+seq-macro = "0.3"
