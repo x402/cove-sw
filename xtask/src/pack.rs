@@ -66,35 +66,35 @@ pub fn run_pack(output_path: Option<PathBuf>) -> Result<PathBuf, Box<dyn std::er
         .join("riscv64gc-unknown-none-elf")
         .join("release");
 
-    println!("[xtask] Building tsm...");
+    println!("[xtask] Building test-guest...");
     let status = Command::new("cargo")
         .current_dir(tsm_root)
         .args([
             "build",
             "-p",
-            "tsm",
+            "test-guest",
             "--target",
             "riscv64gc-unknown-none-elf",
             "--release",
         ])
         .status()?;
     if !status.success() {
-        return Err("Failed to build tsm".into());
+        return Err("Failed to build test-guest".into());
     }
 
-    let tsm_elf = target_dir.join("tsm");
-    let tsm_bin = target_dir.join("tsm.bin");
-    println!("[xtask] Converting tsm to binary...");
+    let guest_elf = target_dir.join("test-guest");
+    let guest_bin = target_dir.join("test-guest.bin");
+    println!("[xtask] Converting test-guest to binary...");
     let status = Command::new("rust-objcopy")
         .args([
             "-O",
             "binary",
-            tsm_elf.to_str().unwrap(),
-            tsm_bin.to_str().unwrap(),
+            guest_elf.to_str().unwrap(),
+            guest_bin.to_str().unwrap(),
         ])
         .status()?;
     if !status.success() {
-        return Err("Failed to run rust-objcopy for tsm".into());
+        return Err("Failed to run rust-objcopy for test-guest".into());
     }
 
     println!("[xtask] Building test-host...");
@@ -128,6 +128,37 @@ pub fn run_pack(output_path: Option<PathBuf>) -> Result<PathBuf, Box<dyn std::er
         return Err("Failed to run rust-objcopy for test-host".into());
     }
 
+    println!("[xtask] Building tsm...");
+    let status = Command::new("cargo")
+        .current_dir(tsm_root)
+        .args([
+            "build",
+            "-p",
+            "tsm",
+            "--target",
+            "riscv64gc-unknown-none-elf",
+            "--release",
+        ])
+        .status()?;
+    if !status.success() {
+        return Err("Failed to build tsm".into());
+    }
+
+    let tsm_elf = target_dir.join("tsm");
+    let tsm_bin = target_dir.join("tsm.bin");
+    println!("[xtask] Converting tsm to binary...");
+    let status = Command::new("rust-objcopy")
+        .args([
+            "-O",
+            "binary",
+            tsm_elf.to_str().unwrap(),
+            tsm_bin.to_str().unwrap(),
+        ])
+        .status()?;
+    if !status.success() {
+        return Err("Failed to run rust-objcopy for tsm".into());
+    }
+
     let tsm_data = fs::read(&tsm_bin)?;
     let host_data = fs::read(&host_bin)?;
 
@@ -155,18 +186,16 @@ pub fn run_pack(output_path: Option<PathBuf>) -> Result<PathBuf, Box<dyn std::er
     out_file.write_all(&host_data)?;
 
     println!(
-        "[xtask] Successfully packed cove-payload.bin at {}\n\
-         - TSM  : offset = 0x{:x}, size = {} B, load = 0x{:x}, entry = 0x{:x}\n\
-         - Host : offset = 0x{:x}, size = {} B, load = 0x{:x}, entry = 0x{:x}",
-        out_file_path.display(),
-        tsm_offset,
-        tsm_size,
-        TSM_LOAD_PADDR,
-        TSM_ENTRY_PADDR,
-        host_offset,
-        host_size,
-        HOST_LOAD_PADDR,
-        HOST_ENTRY_PADDR,
+        "[xtask] Successfully packed cove-payload.bin at {}",
+        out_file_path.display()
+    );
+    println!(
+        "- TSM  : offset = 0x{:x}, size = {} B, load = 0x{:x}, entry = 0x{:x}",
+        tsm_offset, tsm_size, TSM_LOAD_PADDR, TSM_ENTRY_PADDR
+    );
+    println!(
+        "- Host : offset = 0x{:x}, size = {} B, load = 0x{:x}, entry = 0x{:x}",
+        host_offset, host_size, HOST_LOAD_PADDR, HOST_ENTRY_PADDR
     );
 
     Ok(out_file_path)

@@ -28,7 +28,7 @@ SECTIONS
     }
 
     .stack (NOLOAD) : ALIGN(4K) {
-        . += 0x10000;
+        . += 0x1000;
         boot_stack_top = .;
     }
 

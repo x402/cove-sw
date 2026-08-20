@@ -1,24 +1,24 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+pub mod mm;
+pub mod rdsm;
+pub mod tvm;
+
 use core::arch::{asm, naked_asm};
 use core::fmt::{self, Write};
 use core::panic::PanicInfo;
-
-pub const EID_RDSM: usize = 0x5244534D; // "RDSM"
-pub const FID_RDSM_GET_INFO: usize = 0;
-pub const FID_RDSM_MPT_SET: usize = 1;
-pub const FID_RDSM_MFENCE_PA: usize = 2;
-pub const FID_RDSM_TEERET: usize = 3;
-
-pub const NORMAL_RETURN: usize = 0;
-pub const TVM_EXIT: usize = 1;
-pub const TSM_READY: usize = 2;
+use core::sync::atomic::{AtomicUsize, Ordering};
+use mm::page_tracker;
+use rdsm::{NORMAL_RETURN, TSM_READY, rdsm_mfence_pa, rdsm_teeret};
+use tvm::tvm_manager;
 
 pub const TSM_IMPL_CUSTOM: u32 = 0x54534D31; // "TSM1"
 pub const TSM_VERSION: u32 = 1;
 
-struct SbiConsole;
+pub struct SbiConsole;
 
 impl Write for SbiConsole {
     fn write_str(&mut self, s: &str) -> fmt::Result {
@@ -34,21 +34,51 @@ pub fn print_str(s: &str) {
     let _ = SbiConsole.write_str(s);
 }
 
+#[macro_export]
 macro_rules! print {
     ($($arg:tt)*) => {
-        let _ = core::fmt::write(&mut SbiConsole, format_args!($($arg)*));
+        let _ = core::fmt::write(&mut $crate::SbiConsole, format_args!($($arg)*));
     };
 }
 
+#[macro_export]
 macro_rules! println {
     () => {
-        print!("\n");
+        $crate::print!("
+");
     };
     ($($arg:tt)*) => {
-        let _ = core::fmt::write(&mut SbiConsole, format_args!($($arg)*));
-        print!("\n");
+        let _ = core::fmt::write(&mut $crate::SbiConsole, format_args!($($arg)*));
+        $crate::print!("
+");
     };
 }
+
+struct BumpAlloc {
+    heap: [u8; 64 * 1024],
+    next: AtomicUsize,
+}
+
+unsafe impl core::alloc::GlobalAlloc for BumpAlloc {
+    unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
+        let align = layout.align();
+        let size = layout.size();
+        let current = self.next.load(Ordering::Relaxed);
+        let aligned = (current + align - 1) & !(align - 1);
+        if aligned + size > self.heap.len() {
+            return core::ptr::null_mut();
+        }
+        self.next.store(aligned + size, Ordering::Relaxed);
+        unsafe { self.heap.as_ptr().add(aligned) as *mut u8 }
+    }
+    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: core::alloc::Layout) {}
+}
+
+#[global_allocator]
+static ALLOCATOR: BumpAlloc = BumpAlloc {
+    heap: [0; 64 * 1024],
+    next: AtomicUsize::new(0),
+};
 
 #[unsafe(naked)]
 #[unsafe(no_mangle)]
@@ -89,8 +119,7 @@ pub unsafe extern "C" fn tsm_dispatch_entry() -> ! {
         "li a7, 0x5244534D", // EID_RDSM
         "li a6, 3",          // FID_RDSM_TEERET
         "ecall",
-        "1: wfi",
-        "j 1b"
+        "j tsm_dispatch_entry"
     )
 }
 
@@ -112,9 +141,15 @@ impl SbiRet {
     pub const fn success(value: usize) -> Self {
         Self { error: 0, value }
     }
-    pub const fn not_supported() -> Self {
+    pub const fn failed() -> Self {
         Self {
             error: (-1isize) as usize,
+            value: 0,
+        }
+    }
+    pub const fn not_supported() -> Self {
+        Self {
+            error: (-2isize) as usize,
             value: 0,
         }
     }
@@ -124,22 +159,55 @@ impl SbiRet {
             value: 0,
         }
     }
+    pub const fn invalid_address() -> Self {
+        Self {
+            error: (-5isize) as usize,
+            value: 0,
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn tsm_dispatch(
     a0: usize,
     a1: usize,
-    _a2: usize,
-    _a3: usize,
-    _a4: usize,
-    _a5: usize,
+    a2: usize,
+    a3: usize,
+    a4: usize,
+    a5: usize,
     fid: usize,
     eid: usize,
 ) -> SbiRet {
     match eid {
         riscv_cove::host::EID_COVH => match fid {
             riscv_cove::host::GET_TSM_INFO => handle_get_tsm_info(a0, a1),
+            riscv_cove::host::CONVERT_PAGES => page_tracker().convert_pages(a0, a1),
+            riscv_cove::host::RECLAIM_PAGES => page_tracker().reclaim_pages(a0, a1),
+            riscv_cove::host::GLOBAL_FENCE => {
+                let _ = rdsm_mfence_pa(0, 0);
+                SbiRet::success(0)
+            }
+            riscv_cove::host::LOCAL_FENCE => {
+                unsafe {
+                    asm!("sfence.vma", "hfence.gvma");
+                }
+                SbiRet::success(0)
+            }
+            riscv_cove::host::CREATE_TVM => tvm_manager().create_tvm(a0, a1),
+            riscv_cove::host::FINALIZE_TVM => tvm_manager().finalize_tvm(a0, a1, a2, a3),
+            riscv_cove::host::DESTROY_TVM => tvm_manager().destroy_tvm(a0),
+            riscv_cove::host::ADD_TVM_MEMORY_REGION => tvm_manager().add_memory_region(a0, a1, a2),
+            riscv_cove::host::ADD_TVM_PAGE_TABLE_PAGES => {
+                tvm_manager().add_page_table_pages(a0, a1, a2)
+            }
+            riscv_cove::host::ADD_TVM_MEASURED_PAGES => {
+                tvm_manager().add_measured_pages(a0, a1, a2, a3, a4, a5)
+            }
+            riscv_cove::host::ADD_TVM_ZERO_PAGES => {
+                tvm_manager().add_zero_pages(a0, a1, a2, a3, a4)
+            }
+            riscv_cove::host::CREATE_TVM_VCPU => tvm_manager().create_tvm_vcpu(a0, a1, a2),
+            riscv_cove::host::RUN_TVM_VCPU => tvm_manager().run_tvm_vcpu(a0, a1),
             _ => SbiRet::not_supported(),
         },
         _ => SbiRet::not_supported(),
@@ -151,7 +219,7 @@ fn handle_get_tsm_info(buf_paddr: usize, buf_len: usize) -> SbiRet {
         return SbiRet::invalid_param();
     }
     if buf_paddr % core::mem::align_of::<riscv_cove::host::TsmInfo>() != 0 {
-        return SbiRet::invalid_param();
+        return SbiRet::invalid_address();
     }
 
     let tsm_info = riscv_cove::host::TsmInfo {
@@ -168,21 +236,7 @@ fn handle_get_tsm_info(buf_paddr: usize, buf_len: usize) -> SbiRet {
         core::ptr::write_volatile(buf_paddr as *mut riscv_cove::host::TsmInfo, tsm_info);
     }
 
-    SbiRet::success(0)
-}
-
-pub fn rdsm_teeret(reason: usize, a1: usize, a2: usize) -> ! {
-    unsafe {
-        asm!(
-            "ecall",
-            in("a7") EID_RDSM,
-            in("a6") FID_RDSM_TEERET,
-            in("a0") reason,
-            in("a1") a1,
-            in("a2") a2,
-            options(noreturn)
-        );
-    }
+    SbiRet::success(core::mem::size_of::<riscv_cove::host::TsmInfo>())
 }
 
 #[panic_handler]

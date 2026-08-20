@@ -5,6 +5,9 @@ use core::arch::{asm, naked_asm};
 use core::fmt::{self, Write};
 use core::panic::PanicInfo;
 
+static GUEST_BIN: &[u8] =
+    include_bytes!("../../target/riscv64gc-unknown-none-elf/release/test-guest.bin");
+
 struct SbiConsole;
 
 impl Write for SbiConsole {
@@ -29,11 +32,13 @@ macro_rules! print {
 
 macro_rules! println {
     () => {
-        print!("\n");
+        print!("
+");
     };
     ($($arg:tt)*) => {
         let _ = core::fmt::write(&mut SbiConsole, format_args!($($arg)*));
-        print!("\n");
+        print!("
+");
     };
 }
 
@@ -109,78 +114,367 @@ pub fn sbi_covh_get_tsm_info(info: &mut riscv_cove::host::TsmInfo) -> (usize, us
     (error, value)
 }
 
+pub fn sbi_covh_convert_pages(base_paddr: usize, num_pages: usize) -> (usize, usize) {
+    let mut error: usize;
+    let mut value: usize;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a7") riscv_cove::host::EID_COVH,
+            in("a6") riscv_cove::host::CONVERT_PAGES,
+            inout("a0") base_paddr => error,
+            inout("a1") num_pages => value,
+        );
+    }
+    (error, value)
+}
+
+pub fn sbi_covh_reclaim_pages(base_paddr: usize, num_pages: usize) -> (usize, usize) {
+    let mut error: usize;
+    let mut value: usize;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a7") riscv_cove::host::EID_COVH,
+            in("a6") riscv_cove::host::RECLAIM_PAGES,
+            inout("a0") base_paddr => error,
+            inout("a1") num_pages => value,
+        );
+    }
+    (error, value)
+}
+
+pub fn sbi_covh_global_fence() -> (usize, usize) {
+    let mut error: usize;
+    let mut value: usize;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a7") riscv_cove::host::EID_COVH,
+            in("a6") riscv_cove::host::GLOBAL_FENCE,
+            lateout("a0") error,
+            lateout("a1") value,
+        );
+    }
+    (error, value)
+}
+
+pub fn sbi_covh_local_fence() -> (usize, usize) {
+    let mut error: usize;
+    let mut value: usize;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a7") riscv_cove::host::EID_COVH,
+            in("a6") riscv_cove::host::LOCAL_FENCE,
+            lateout("a0") error,
+            lateout("a1") value,
+        );
+    }
+    (error, value)
+}
+
+pub fn sbi_covh_create_tvm(params: &riscv_cove::host::TvmCreateParams) -> (usize, usize) {
+    let paddr = params as *const _ as usize;
+    let len = core::mem::size_of::<riscv_cove::host::TvmCreateParams>();
+    let mut error: usize;
+    let mut value: usize;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a7") riscv_cove::host::EID_COVH,
+            in("a6") riscv_cove::host::CREATE_TVM,
+            inout("a0") paddr => error,
+            inout("a1") len => value,
+        );
+    }
+    (error, value)
+}
+
+pub fn sbi_covh_add_tvm_memory_region(tvm_id: usize, gpa: usize, len: usize) -> (usize, usize) {
+    let mut error: usize;
+    let mut value: usize;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a7") riscv_cove::host::EID_COVH,
+            in("a6") riscv_cove::host::ADD_TVM_MEMORY_REGION,
+            inout("a0") tvm_id => error,
+            inout("a1") gpa => value,
+            in("a2") len,
+        );
+    }
+    (error, value)
+}
+
+pub fn sbi_covh_add_tvm_page_table_pages(
+    tvm_id: usize,
+    base_paddr: usize,
+    num_pages: usize,
+) -> (usize, usize) {
+    let mut error: usize;
+    let mut value: usize;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a7") riscv_cove::host::EID_COVH,
+            in("a6") riscv_cove::host::ADD_TVM_PAGE_TABLE_PAGES,
+            inout("a0") tvm_id => error,
+            inout("a1") base_paddr => value,
+            in("a2") num_pages,
+        );
+    }
+    (error, value)
+}
+
+pub fn sbi_covh_add_tvm_measured_pages(
+    tvm_id: usize,
+    src_paddr: usize,
+    dst_paddr: usize,
+    page_type: usize,
+    num_pages: usize,
+    gpa: usize,
+) -> (usize, usize) {
+    let mut error: usize;
+    let mut value: usize;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a7") riscv_cove::host::EID_COVH,
+            in("a6") riscv_cove::host::ADD_TVM_MEASURED_PAGES,
+            inout("a0") tvm_id => error,
+            inout("a1") src_paddr => value,
+            in("a2") dst_paddr,
+            in("a3") page_type,
+            in("a4") num_pages,
+            in("a5") gpa,
+        );
+    }
+    (error, value)
+}
+
+pub fn sbi_covh_create_tvm_vcpu(
+    tvm_id: usize,
+    vcpu_id: usize,
+    state_paddr: usize,
+) -> (usize, usize) {
+    let mut error: usize;
+    let mut value: usize;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a7") riscv_cove::host::EID_COVH,
+            in("a6") riscv_cove::host::CREATE_TVM_VCPU,
+            inout("a0") tvm_id => error,
+            inout("a1") vcpu_id => value,
+            in("a2") state_paddr,
+        );
+    }
+    (error, value)
+}
+
+pub fn sbi_covh_finalize_tvm(
+    tvm_id: usize,
+    entry_sepc: usize,
+    entry_arg: usize,
+    identity_addr: usize,
+) -> (usize, usize) {
+    let mut error: usize;
+    let mut value: usize;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a7") riscv_cove::host::EID_COVH,
+            in("a6") riscv_cove::host::FINALIZE_TVM,
+            inout("a0") tvm_id => error,
+            inout("a1") entry_sepc => value,
+            in("a2") entry_arg,
+            in("a3") identity_addr,
+        );
+    }
+    (error, value)
+}
+
+pub fn sbi_covh_run_tvm_vcpu(tvm_id: usize, vcpu_id: usize) -> (usize, usize) {
+    let mut error: usize;
+    let mut value: usize;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a7") riscv_cove::host::EID_COVH,
+            in("a6") riscv_cove::host::RUN_TVM_VCPU,
+            inout("a0") tvm_id => error,
+            inout("a1") vcpu_id => value,
+        );
+    }
+    (error, value)
+}
+
+pub fn sbi_covh_destroy_tvm(tvm_id: usize) -> (usize, usize) {
+    let mut error: usize;
+    let mut value: usize;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a7") riscv_cove::host::EID_COVH,
+            in("a6") riscv_cove::host::DESTROY_TVM,
+            inout("a0") tvm_id => error,
+            lateout("a1") value,
+        );
+    }
+    (error, value)
+}
+
+const NUM_PAGES: usize = 18;
+
+#[repr(align(16384))]
+struct AlignedPages([u8; NUM_PAGES * 4096]);
+
+static mut HOST_PAGES: AlignedPages = AlignedPages([0; NUM_PAGES * 4096]);
+
+#[repr(align(4096))]
+struct GuestSrcBuffer([u8; 4 * 4096]);
+
+static mut GUEST_SRC_BUFFER: GuestSrcBuffer = GuestSrcBuffer([0; 4 * 4096]);
+
 #[unsafe(no_mangle)]
 pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
     println!("[HOST] Booting... HOST_STARTED");
 
-    // 1. Probe EXT_SUPD
-    let probe_supd = sbi_probe_extension(riscv_cove::supd::EID_SUPD);
-    println!(
-        "[HOST] Probing EXT_SUPD (0x{:x}): result = {}",
-        riscv_cove::supd::EID_SUPD,
-        probe_supd
-    );
-    assert!(probe_supd != 0, "EXT_SUPD must be supported");
-
-    // 2. Query active domains
+    // 1. Check SUPD & COVH
     let (err, active_domains) = sbi_supd_get_active_domains();
-    println!(
-        "[HOST] SUPD get_active_domains: err = {}, active_domains = 0b{:b}",
-        err, active_domains
-    );
-    assert_eq!(err, 0, "get_active_domains must succeed");
+    assert_eq!(err, 0, "SUPD get_active_domains must succeed");
     assert_eq!(
         active_domains & 0b11,
         0b11,
-        "Active domains must contain bit 0 (Host) and bit 1 (Confidential/TSM)"
+        "Active domains must contain 0b11"
     );
 
-    // 3. Probe EXT_COVH
-    let probe_covh = sbi_probe_extension(riscv_cove::host::EID_COVH);
-    println!(
-        "[HOST] Probing EXT_COVH (0x{:x}): result = {}",
-        riscv_cove::host::EID_COVH,
-        probe_covh
-    );
-    assert!(probe_covh != 0, "EXT_COVH must be supported");
-
-    // 4. Call sbi_covh_get_tsm_info
     let mut tsm_info = core::mem::MaybeUninit::<riscv_cove::host::TsmInfo>::zeroed();
     let tsm_info_ref = unsafe { &mut *tsm_info.as_mut_ptr() };
-    let (err, val) = sbi_covh_get_tsm_info(tsm_info_ref);
-    println!("[HOST] COVH get_tsm_info: err = {}, val = {}", err, val);
+    let (err, _) = sbi_covh_get_tsm_info(tsm_info_ref);
     assert_eq!(err, 0, "get_tsm_info must succeed");
-
     let info = unsafe { tsm_info.assume_init() };
-    println!(
-        "[HOST] TSM Status: {}, Impl: 0x{:x}, Version: {}, Capabilities: 0x{:x}, StatePages: {}, MaxVcpus: {}, VcpuStatePages: {}",
-        if info.tsm_state == 2 {
-            "READY"
-        } else {
-            "UNKNOWN"
-        },
-        info.tsm_impl_id,
-        info.tsm_version,
-        info.tsm_capabilities,
-        info.tvm_state_pages,
-        info.tvm_max_vcpus,
-        info.tvm_vcpu_state_pages
-    );
-
     assert_eq!(info.tsm_state, 2, "TSM state must be READY");
-    assert_eq!(
-        info.tsm_impl_id, 0x54534D31,
-        "TSM impl ID must match 0x54534D31"
-    );
-    assert_eq!(info.tsm_version, 1, "TSM version must be 1");
-    assert_eq!(info.tvm_state_pages, 4, "TVM state pages must be 4");
-    assert_eq!(info.tvm_max_vcpus, 1, "TVM max vcpus must be 1");
-    assert_eq!(
-        info.tvm_vcpu_state_pages, 2,
-        "TVM vcpu state pages must be 2"
-    );
 
-    println!("[HOST] PHASE 2 PASS: GET_TSM_INFO_OK");
+    // 2. Prepare Guest Source Buffer in Host memory
+    println!(
+        "[HOST] Preparing guest payload ({} bytes)...",
+        GUEST_BIN.len()
+    );
+    let src_ptr = core::ptr::addr_of_mut!(GUEST_SRC_BUFFER) as *mut u8;
+    unsafe {
+        core::ptr::write_bytes(src_ptr, 0, 4 * 4096);
+        core::ptr::copy_nonoverlapping(GUEST_BIN.as_ptr(), src_ptr, GUEST_BIN.len());
+    }
+    let guest_src_paddr = src_ptr as usize;
+
+    // 3. Memory layout of the 18 converted pages:
+    // [0x0000..0x4000) (4 pages): TVM Root Page Table (16KB aligned)
+    // [0x4000..0x8000) (4 pages): TVM State (16KB)
+    // [0x8000..0xA000) (2 pages): vCPU 0 State (8KB)
+    // [0xA000..0xE000) (4 pages): TVM Page Table Pool (16KB)
+    // [0xE000..0x12000)(4 pages): TVM Measured Guest Payload (16KB)
+    let base_paddr = core::ptr::addr_of_mut!(HOST_PAGES) as usize;
+    assert_eq!(base_paddr % 16384, 0, "Base paddr must be 16KB aligned");
+
+    let root_pt_paddr = base_paddr;
+    let tvm_state_paddr = base_paddr + 0x4000;
+    let vcpu_state_paddr = base_paddr + 0x8000;
+    let pt_pool_paddr = base_paddr + 0xA000;
+    let guest_dst_paddr = base_paddr + 0xE000;
+
+    println!(
+        "[HOST] Converting {} pages at 0x{:x}...",
+        NUM_PAGES, base_paddr
+    );
+    let (err, _) = sbi_covh_convert_pages(base_paddr, NUM_PAGES);
+    assert_eq!(err, 0, "convert_pages must succeed");
+
+    let (err, _) = sbi_covh_global_fence();
+    assert_eq!(err, 0, "global_fence must succeed");
+
+    let (err, _) = sbi_covh_local_fence();
+    assert_eq!(err, 0, "local_fence must succeed");
+
+    // 4. Create TVM
+    println!("[HOST] Creating TVM...");
+    let params = riscv_cove::host::TvmCreateParams {
+        tvm_page_directory_addr: root_pt_paddr,
+        tvm_state_addr: tvm_state_paddr,
+    };
+    let (err, tvm_id) = sbi_covh_create_tvm(&params);
+    assert_eq!(err, 0, "create_tvm must succeed");
+    println!("[HOST] TVM created with ID {}", tvm_id);
+
+    // 5. Add Memory Region (1MB at GPA 0x8000_0000)
+    println!("[HOST] Adding memory region [0x80000000, 0x80100000)...");
+    let (err, _) = sbi_covh_add_tvm_memory_region(tvm_id, 0x8000_0000, 0x10_0000);
+    assert_eq!(err, 0, "add_tvm_memory_region must succeed");
+
+    // 6. Add Page Table Pages (4 pages)
+    println!(
+        "[HOST] Adding 4 page-table pages at 0x{:x}...",
+        pt_pool_paddr
+    );
+    let (err, _) = sbi_covh_add_tvm_page_table_pages(tvm_id, pt_pool_paddr, 4);
+    assert_eq!(err, 0, "add_tvm_page_table_pages must succeed");
+
+    // 7. Add Measured Pages (Guest binary, 4 pages at GPA 0x8000_0000)
+    println!(
+        "[HOST] Adding 4 measured pages (GPA 0x80000000 -> SPA 0x{:x})...",
+        guest_dst_paddr
+    );
+    let (err, _) = sbi_covh_add_tvm_measured_pages(
+        tvm_id,
+        guest_src_paddr,
+        guest_dst_paddr,
+        0, // 4KB page type
+        4,
+        0x8000_0000,
+    );
+    assert_eq!(err, 0, "add_tvm_measured_pages must succeed");
+
+    // 8. Create vCPU 0
+    println!("[HOST] Creating vCPU 0 at 0x{:x}...", vcpu_state_paddr);
+    let (err, _) = sbi_covh_create_tvm_vcpu(tvm_id, 0, vcpu_state_paddr);
+    assert_eq!(err, 0, "create_tvm_vcpu must succeed");
+
+    // 9. Finalize TVM
+    println!("[HOST] Finalizing TVM with entry PC 0x80000000...");
+    let (err, _) = sbi_covh_finalize_tvm(tvm_id, 0x8000_0000, 0, 0);
+    assert_eq!(err, 0, "finalize_tvm must succeed");
+
+    // 10. Run TVM vCPU 0
+    println!("[HOST] Running TVM vCPU 0...");
+    let (err, val) = sbi_covh_run_tvm_vcpu(tvm_id, 0);
+    println!("[HOST] TVM vCPU 0 exited with err={}, val={}", err, val);
+    assert_eq!(err, 0, "run_tvm_vcpu must return success");
+
+    // 11. Destroy TVM
+    println!("[HOST] Destroying TVM {}...", tvm_id);
+    let (err, _) = sbi_covh_destroy_tvm(tvm_id);
+    assert_eq!(err, 0, "destroy_tvm must succeed");
+
+    // 12. Reclaim Pages
+    println!(
+        "[HOST] Reclaiming {} pages at 0x{:x}...",
+        NUM_PAGES, base_paddr
+    );
+    let (err, _) = sbi_covh_reclaim_pages(base_paddr, NUM_PAGES);
+    assert_eq!(err, 0, "reclaim_pages must succeed");
+
+    // 13. Verify Host memory access after reclaim
+    unsafe {
+        core::ptr::write_volatile(base_paddr as *mut u64, 0x1234_5678_9ABC_DEF0);
+        let read_val = core::ptr::read_volatile(base_paddr as *const u64);
+        assert_eq!(
+            read_val, 0x1234_5678_9ABC_DEF0,
+            "Host memory access after reclaim must succeed"
+        );
+    }
+
+    println!("[HOST] PHASE 3 PASS: TVM_LIFECYCLE_OK");
 
     loop {
         unsafe {

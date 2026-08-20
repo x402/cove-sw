@@ -1,0 +1,344 @@
+use core::arch::global_asm;
+
+#[repr(C, align(16))]
+#[derive(Clone, Copy, Debug)]
+pub struct GuestContext {
+    pub gprs: [usize; 32],
+    pub sepc: usize,
+    pub sstatus: usize,
+    pub hstatus: usize,
+    pub scause: usize,
+    pub stval: usize,
+    pub htval: usize,
+    pub htinst: usize,
+    pub hgatp: usize,
+}
+
+impl GuestContext {
+    pub const fn new() -> Self {
+        Self {
+            gprs: [0; 32],
+            sepc: 0,
+            sstatus: 0x120, // SPP=1, SPIE=1
+            hstatus: 0x180, // SPV=1, SPVP=1
+            scause: 0,
+            stval: 0,
+            htval: 0,
+            htinst: 0,
+            hgatp: 0,
+        }
+    }
+}
+
+pub struct Vcpu {
+    pub id: usize,
+    pub state_paddr: usize,
+    pub ctx: GuestContext,
+}
+
+impl Vcpu {
+    pub fn new(id: usize, state_paddr: usize) -> Self {
+        Self {
+            id,
+            state_paddr,
+            ctx: GuestContext::new(),
+        }
+    }
+
+    pub fn init_boot(&mut self, entry_sepc: usize, entry_arg: usize, hgatp: usize) {
+        self.ctx.sepc = entry_sepc;
+        self.ctx.gprs[10] = self.id; // a0 = hart_id / vcpu_id
+        self.ctx.gprs[11] = entry_arg; // a1 = fdt / arg
+        self.ctx.sstatus = 0x120; // SPP=1, SPIE=1
+        self.ctx.hstatus = 0x180; // SPV=1, SPVP=1
+        self.ctx.hgatp = hgatp;
+    }
+
+    pub fn run(&mut self) -> usize {
+        unsafe { tsm_enter_guest(&mut self.ctx as *mut GuestContext) }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub static mut TSM_SAVED_SP: usize = 0;
+
+#[unsafe(no_mangle)]
+pub static mut CURRENT_GUEST_CTX: usize = 0;
+
+unsafe extern "C" {
+    pub fn tsm_enter_guest(ctx: *mut GuestContext) -> usize;
+}
+
+pub const TRAP_ACTION_RESUME: usize = 0;
+pub const TRAP_ACTION_EXIT: usize = 1;
+
+#[unsafe(no_mangle)]
+pub extern "C" fn handle_guest_trap(ctx: *mut GuestContext) -> usize {
+    let ctx_ref = unsafe { &mut *ctx };
+    let scause = ctx_ref.scause;
+
+    if scause == 10 {
+        // Virtual supervisor ecall
+        let eid = ctx_ref.gprs[17]; // a7
+        let fid = ctx_ref.gprs[16]; // a6
+
+        if eid == 1 {
+            // SBI legacy console_putchar
+            let ch = ctx_ref.gprs[10] as u8; // a0
+            #[allow(deprecated)]
+            let _ = sbi_rt::legacy::console_putchar(ch as usize);
+            ctx_ref.sepc += 4;
+            return TRAP_ACTION_RESUME;
+        } else if eid == 0x53525354 || eid == 0x434F5647 || (eid == 0 && fid == 0) || eid == 0x08 {
+            // Guest exit
+            ctx_ref.sepc += 4;
+            return TRAP_ACTION_EXIT;
+        } else {
+            crate::println!(
+                "[TSM] Unhandled guest ECALL: eid=0x{:x}, fid=0x{:x}",
+                eid,
+                fid
+            );
+            ctx_ref.sepc += 4;
+            return TRAP_ACTION_EXIT;
+        }
+    } else {
+        crate::println!(
+            "[TSM] Guest trap: scause=0x{:x}, sepc=0x{:x}, stval=0x{:x}, htval=0x{:x}",
+            scause,
+            ctx_ref.sepc,
+            ctx_ref.stval,
+            ctx_ref.htval
+        );
+        return TRAP_ACTION_EXIT;
+    }
+}
+
+global_asm!(
+    r#"
+.section .text
+.global tsm_enter_guest
+.global tsm_guest_trap_vector
+.global tsm_exit_guest_restore
+
+tsm_enter_guest:
+    addi sp, sp, -128
+    sd ra, 0(sp)
+    sd s0, 8(sp)
+    sd s1, 16(sp)
+    sd s2, 24(sp)
+    sd s3, 32(sp)
+    sd s4, 40(sp)
+    sd s5, 48(sp)
+    sd s6, 56(sp)
+    sd s7, 64(sp)
+    sd s8, 72(sp)
+    sd s9, 80(sp)
+    sd s10, 88(sp)
+    sd s11, 96(sp)
+    
+    csrr t0, stvec
+    sd t0, 104(sp)
+    csrr t1, sstatus
+    sd t1, 112(sp)
+    csrr t2, hstatus
+    sd t2, 120(sp)
+
+    la t0, TSM_SAVED_SP
+    sd sp, 0(t0)
+
+    la t0, CURRENT_GUEST_CTX
+    sd a0, 0(t0)
+
+    ld t0, 312(a0)
+    csrw hgatp, t0
+    hfence.gvma
+
+    la t0, tsm_guest_trap_vector
+    csrw stvec, t0
+
+    csrw sscratch, a0
+
+    ld t0, 272(a0)
+    csrw hstatus, t0
+
+    ld t0, 264(a0)
+    csrw sstatus, t0
+
+    ld t0, 256(a0)
+    csrw sepc, t0
+
+    ld ra, 8(a0)
+    ld sp, 16(a0)
+    ld gp, 24(a0)
+    ld tp, 32(a0)
+    ld t0, 40(a0)
+    ld t1, 48(a0)
+    ld t2, 56(a0)
+    ld s0, 64(a0)
+    ld s1, 72(a0)
+    ld a1, 88(a0)
+    ld a2, 96(a0)
+    ld a3, 104(a0)
+    ld a4, 112(a0)
+    ld a5, 120(a0)
+    ld a6, 128(a0)
+    ld a7, 136(a0)
+    ld s2, 144(a0)
+    ld s3, 152(a0)
+    ld s4, 160(a0)
+    ld s5, 168(a0)
+    ld s6, 176(a0)
+    ld s7, 184(a0)
+    ld s8, 192(a0)
+    ld s9, 200(a0)
+    ld s10, 208(a0)
+    ld s11, 216(a0)
+    ld t3, 224(a0)
+    ld t4, 232(a0)
+    ld t5, 240(a0)
+    ld t6, 248(a0)
+    ld a0, 80(a0)
+
+    sret
+
+.align 4
+tsm_guest_trap_vector:
+    csrrw a0, sscratch, a0
+
+    sd ra, 8(a0)
+    sd sp, 16(a0)
+    sd gp, 24(a0)
+    sd tp, 32(a0)
+    sd t0, 40(a0)
+    sd t1, 48(a0)
+    sd t2, 56(a0)
+    sd s0, 64(a0)
+    sd s1, 72(a0)
+
+    csrr t0, sscratch
+    sd t0, 80(a0)
+
+    sd a1, 88(a0)
+    sd a2, 96(a0)
+    sd a3, 104(a0)
+    sd a4, 112(a0)
+    sd a5, 120(a0)
+    sd a6, 128(a0)
+    sd a7, 136(a0)
+    sd s2, 144(a0)
+    sd s3, 152(a0)
+    sd s4, 160(a0)
+    sd s5, 168(a0)
+    sd s6, 176(a0)
+    sd s7, 184(a0)
+    sd s8, 192(a0)
+    sd s9, 200(a0)
+    sd s10, 208(a0)
+    sd s11, 216(a0)
+    ld t3, 224(a0)
+    ld t4, 232(a0)
+    ld t5, 240(a0)
+    ld t6, 248(a0)
+
+    csrr t0, sepc
+    sd t0, 256(a0)
+    csrr t1, sstatus
+    sd t1, 264(a0)
+    csrr t2, hstatus
+    sd t2, 272(a0)
+    csrr t3, scause
+    sd t3, 280(a0)
+    csrr t4, stval
+    sd t4, 288(a0)
+    csrr t5, htval
+    sd t5, 296(a0)
+    csrr t6, htinst
+    sd t6, 304(a0)
+
+    la t0, TSM_SAVED_SP
+    ld sp, 0(t0)
+
+    call handle_guest_trap
+
+    bnez a0, tsm_exit_guest_restore
+
+    la t0, CURRENT_GUEST_CTX
+    ld a0, 0(t0)
+    csrw sscratch, a0
+
+    ld t0, 256(a0)
+    csrw sepc, t0
+    ld t1, 264(a0)
+    csrw sstatus, t1
+    ld t2, 272(a0)
+    csrw hstatus, t2
+
+    ld ra, 8(a0)
+    ld sp, 16(a0)
+    ld gp, 24(a0)
+    ld tp, 32(a0)
+    ld t0, 40(a0)
+    ld t1, 48(a0)
+    ld t2, 56(a0)
+    ld s0, 64(a0)
+    ld s1, 72(a0)
+    ld a1, 88(a0)
+    ld a2, 96(a0)
+    ld a3, 104(a0)
+    ld a4, 112(a0)
+    ld a5, 120(a0)
+    ld a6, 128(a0)
+    ld a7, 136(a0)
+    ld s2, 144(a0)
+    ld s3, 152(a0)
+    ld s4, 160(a0)
+    ld s5, 168(a0)
+    ld s6, 176(a0)
+    ld s7, 184(a0)
+    ld s8, 192(a0)
+    ld s9, 200(a0)
+    ld s10, 208(a0)
+    ld s11, 216(a0)
+    ld t3, 224(a0)
+    ld t4, 232(a0)
+    ld t5, 240(a0)
+    ld t6, 248(a0)
+    ld a0, 80(a0)
+
+    sret
+
+tsm_exit_guest_restore:
+    la t0, TSM_SAVED_SP
+    ld sp, 0(t0)
+
+    csrw hgatp, zero
+    hfence.gvma
+
+    ld t0, 104(sp)
+    csrw stvec, t0
+    ld t1, 112(sp)
+    csrw sstatus, t1
+    ld t2, 120(sp)
+    csrw hstatus, t2
+    csrw sscratch, zero
+
+    ld ra, 0(sp)
+    ld s0, 8(sp)
+    ld s1, 16(sp)
+    ld s2, 24(sp)
+    ld s3, 32(sp)
+    ld s4, 40(sp)
+    ld s5, 48(sp)
+    ld s6, 56(sp)
+    ld s7, 64(sp)
+    ld s8, 72(sp)
+    ld s9, 80(sp)
+    ld s10, 88(sp)
+    ld s11, 96(sp)
+    addi sp, sp, 128
+
+    li a0, 0
+    ret
+"#
+);
