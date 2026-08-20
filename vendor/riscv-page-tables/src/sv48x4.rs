@@ -266,14 +266,16 @@ mod tests {
         page_tracker
             .unblock_page(promoted_paddr, PageSize::Size2M)
             .unwrap();
-        assert!(guest_page_table
-            .get_mapped_pages(gpa_base, PageSize::Size2M as u64, |addr, ps| {
-                if ps != PageSize::Size2M {
-                    return false;
-                }
-                page_tracker.is_mapped_page(addr, ps, id, MemType::Ram)
-            })
-            .is_ok());
+        assert!(
+            guest_page_table
+                .get_mapped_pages(gpa_base, PageSize::Size2M as u64, |addr, ps| {
+                    if ps != PageSize::Size2M {
+                        return false;
+                    }
+                    page_tracker.is_mapped_page(addr, ps, id, MemType::Ram)
+                })
+                .is_ok()
+        );
     }
 
     #[test]
@@ -333,13 +335,15 @@ mod tests {
         page_tracker
             .unblock_page(demoted_paddr, PageSize::Size2M)
             .unwrap();
-        assert!(guest_page_table
-            .get_mapped_pages(gpa_base, PageSize::Size2M as u64, |addr, ps| {
-                if ps != PageSize::Size4k {
-                    return false;
-                }
-                page_tracker.is_mapped_page(addr, ps, id, MemType::Ram)
-            })
-            .is_ok());
+        assert!(
+            guest_page_table
+                .get_mapped_pages(gpa_base, PageSize::Size2M as u64, |addr, ps| {
+                    if ps != PageSize::Size4k {
+                        return false;
+                    }
+                    page_tracker.is_mapped_page(addr, ps, id, MemType::Ram)
+                })
+                .is_ok()
+        );
     }
 }

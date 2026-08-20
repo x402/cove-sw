@@ -5,5 +5,6 @@ edition = "2024"
 
 [dependencies]
 riscv = "0.16"
+riscv-cove = { path = "../../rustsbi/library/riscv-cove" }
 sbi-rt = { path = "../../rustsbi/library/sbi-rt", features = ["legacy"] }
 sbi-spec = { path = "../../rustsbi/library/sbi-spec" }

@@ -76,7 +76,7 @@ impl<S: State> SequentialPages<S> {
                         seq.into_iter()
                             .chain(core::iter::once(page))
                             .chain(page_iter),
-                    ))
+                    ));
                 }
             };
             if page.addr() != next_addr {

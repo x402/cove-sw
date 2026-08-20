@@ -9,10 +9,10 @@ pub mod defs;
 pub mod traps;
 
 pub use csr_access::RiscvCsrInterface;
+pub use tock_registers::LocalRegisterCopy;
 pub use tock_registers::interfaces::ReadWriteable;
 pub use tock_registers::interfaces::Readable;
 pub use tock_registers::interfaces::Writeable;
-pub use tock_registers::LocalRegisterCopy;
 
 pub use defs::*;
 pub use traps::*;

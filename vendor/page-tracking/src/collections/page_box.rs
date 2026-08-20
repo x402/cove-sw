@@ -342,14 +342,16 @@ mod tests {
 
         for _pi in 0..TEST_PAGE_COUNT {
             // Should go back to hypervisor-owned after the PageBox was dropped.
-            assert!(page_tracker
-                .get_converted_page::<Page<ConvertedDirty>>(
-                    addr,
-                    PageSize::Size4k,
-                    PageOwnerId::hypervisor(),
-                    TlbVersion::new()
-                )
-                .is_ok());
+            assert!(
+                page_tracker
+                    .get_converted_page::<Page<ConvertedDirty>>(
+                        addr,
+                        PageSize::Size4k,
+                        PageOwnerId::hypervisor(),
+                        TlbVersion::new()
+                    )
+                    .is_ok()
+            );
             addr = addr.checked_add_pages_with_size(1, page_size).unwrap();
         }
     }

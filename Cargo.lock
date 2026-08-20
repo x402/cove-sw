@@ -354,6 +354,7 @@ name = "test-host"
 version = "0.1.0"
 dependencies = [
  "riscv",
+ "riscv-cove",
  "sbi-rt",
  "sbi-spec",
 ]

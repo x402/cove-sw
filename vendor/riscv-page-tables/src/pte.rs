@@ -216,8 +216,8 @@ impl PteFieldBits {
 #[cfg(test)]
 mod tests {
     use crate::{
-        pte::{Pte, PteFieldBit},
         PteFieldBits, PteLeafPerms,
+        pte::{Pte, PteFieldBit},
     };
 
     #[test]

@@ -10,8 +10,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use riscv_pages::{InternalClean, InternalDirty, PageAddr, PageSize, RawAddr, SequentialPages};
 
-use crate::collections::PageBox;
 use crate::PageTracker;
+use crate::collections::PageBox;
 
 #[repr(C)]
 struct PageArcInner<T> {
@@ -232,14 +232,16 @@ mod tests {
         }
 
         // Should go back to hypervisor-owned after the PageArc was dropped.
-        assert!(page_tracker
-            .get_converted_page::<Page<ConvertedDirty>>(
-                addr,
-                PageSize::Size4k,
-                PageOwnerId::hypervisor(),
-                TlbVersion::new()
-            )
-            .is_ok());
+        assert!(
+            page_tracker
+                .get_converted_page::<Page<ConvertedDirty>>(
+                    addr,
+                    PageSize::Size4k,
+                    PageOwnerId::hypervisor(),
+                    TlbVersion::new()
+                )
+                .is_ok()
+        );
     }
 
     #[test]

@@ -29,12 +29,7 @@ pub struct PayloadHeader {
 const _: () = assert!(core::mem::size_of::<PayloadHeader>() == 4096);
 
 impl PayloadHeader {
-    pub fn new(
-        tsm_offset: u64,
-        tsm_size: u64,
-        host_offset: u64,
-        host_size: u64,
-    ) -> Self {
+    pub fn new(tsm_offset: u64, tsm_size: u64, host_offset: u64, host_size: u64) -> Self {
         Self {
             magic: COVE_MAGIC,
             version: COVE_VERSION,
@@ -66,7 +61,10 @@ fn align_up(val: u64, align: u64) -> u64 {
 
 pub fn run_pack(output_path: Option<PathBuf>) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let tsm_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-    let target_dir = tsm_root.join("target").join("riscv64gc-unknown-none-elf").join("release");
+    let target_dir = tsm_root
+        .join("target")
+        .join("riscv64gc-unknown-none-elf")
+        .join("release");
 
     println!("[xtask] Building tsm...");
     let status = Command::new("cargo")
@@ -147,7 +145,7 @@ pub fn run_pack(output_path: Option<PathBuf>) -> Result<PathBuf, Box<dyn std::er
 
     let mut out_file = File::create(&out_file_path)?;
     out_file.write_all(header.as_bytes())?;
-    
+
     // Write TSM
     out_file.seek(SeekFrom::Start(tsm_offset))?;
     out_file.write_all(&tsm_data)?;

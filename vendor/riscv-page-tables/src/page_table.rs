@@ -1714,7 +1714,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::TableEntryType;
-    use crate::{pte::Pte, sv48x4::Sv48x4Level, PteFieldBits, PteLeafPerms, Sv48x4};
+    use crate::{PteFieldBits, PteLeafPerms, Sv48x4, pte::Pte, sv48x4::Sv48x4Level};
     use riscv_pages::Pfn;
 
     #[test]

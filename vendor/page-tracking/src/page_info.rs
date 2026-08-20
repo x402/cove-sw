@@ -572,10 +572,12 @@ impl PageMap {
                 current_entry.num_pages += 1;
             }
             // Make sure we won't overflow later.
-            assert!(current_entry
-                .base_pfn
-                .checked_add(current_entry.num_pages)
-                .is_some());
+            assert!(
+                current_entry
+                    .base_pfn
+                    .checked_add(current_entry.num_pages)
+                    .is_some()
+            );
         }
         self.sparse_map.push(current_entry);
     }
@@ -792,9 +794,10 @@ mod tests {
     fn page_ownership() {
         let mut page = PageInfo::new();
         assert!(page.is_free());
-        assert!(page
-            .assign(PageOwnerId::hypervisor(), PageState::ConvertedLocked)
-            .is_ok());
+        assert!(
+            page.assign(PageOwnerId::hypervisor(), PageState::ConvertedLocked)
+                .is_ok()
+        );
         assert!(page.assign(PageOwnerId::host(), PageState::Mapped).is_ok());
         assert_eq!(page.owner().unwrap(), PageOwnerId::host());
         let version = TlbVersion::new();
@@ -819,8 +822,9 @@ mod tests {
 
         let mut page = PageInfo::new_reserved();
         assert!(!page.is_free());
-        assert!(page
-            .assign(PageOwnerId::hypervisor(), PageState::ConvertedLocked)
-            .is_err());
+        assert!(
+            page.assign(PageOwnerId::hypervisor(), PageState::ConvertedLocked)
+                .is_err()
+        );
     }
 }

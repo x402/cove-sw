@@ -819,31 +819,32 @@ mod tests {
             SupervisorPageAddr::with_alignment(RawAddr::supervisor(0x1000), PageSize::Size2M)
                 .is_none()
         );
-        assert!(SupervisorPageAddr::with_alignment(
-            RawAddr::supervisor(0x20_0000),
-            PageSize::Size2M
-        )
-        .is_some());
-        assert!(SupervisorPageAddr::with_alignment(
-            RawAddr::supervisor(0x20_0000),
-            PageSize::Size1G
-        )
-        .is_none());
-        assert!(SupervisorPageAddr::with_alignment(
-            RawAddr::supervisor(0x4000_0000),
-            PageSize::Size1G
-        )
-        .is_some());
-        assert!(SupervisorPageAddr::with_alignment(
-            RawAddr::supervisor(0x4000_0000),
-            PageSize::Size512G
-        )
-        .is_none());
-        assert!(SupervisorPageAddr::with_alignment(
-            RawAddr::supervisor(0x80_0000_0000),
-            PageSize::Size512G
-        )
-        .is_some());
+        assert!(
+            SupervisorPageAddr::with_alignment(RawAddr::supervisor(0x20_0000), PageSize::Size2M)
+                .is_some()
+        );
+        assert!(
+            SupervisorPageAddr::with_alignment(RawAddr::supervisor(0x20_0000), PageSize::Size1G)
+                .is_none()
+        );
+        assert!(
+            SupervisorPageAddr::with_alignment(RawAddr::supervisor(0x4000_0000), PageSize::Size1G)
+                .is_some()
+        );
+        assert!(
+            SupervisorPageAddr::with_alignment(
+                RawAddr::supervisor(0x4000_0000),
+                PageSize::Size512G
+            )
+            .is_none()
+        );
+        assert!(
+            SupervisorPageAddr::with_alignment(
+                RawAddr::supervisor(0x80_0000_0000),
+                PageSize::Size512G
+            )
+            .is_some()
+        );
     }
 
     #[test]

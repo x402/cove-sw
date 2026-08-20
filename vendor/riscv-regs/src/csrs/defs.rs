@@ -6,8 +6,8 @@ use riscv_page_tables::{
     FirstStagePageTable, FirstStagePagingMode, GuestStagePageTable, GuestStagePagingMode,
 };
 use riscv_pages::Pfn;
-use tock_registers::register_bitfields;
 use tock_registers::LocalRegisterCopy;
+use tock_registers::register_bitfields;
 
 // Supervisor status.
 register_bitfields![u64,

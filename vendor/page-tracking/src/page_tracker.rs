@@ -7,7 +7,7 @@ use sync::Mutex;
 
 use crate::collections::{RawPageVec, StaticPageRef};
 use crate::page_info::{PageInfo, PageMap, PageState};
-use crate::{hw_mem_map, HwMemMap, PageList, TlbVersion};
+use crate::{HwMemMap, PageList, TlbVersion, hw_mem_map};
 
 /// Errors related to managing physical page information.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

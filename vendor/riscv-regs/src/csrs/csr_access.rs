@@ -8,9 +8,9 @@
 use core::arch::asm;
 use core::marker::PhantomData;
 
+use tock_registers::RegisterLongName;
 use tock_registers::fields::Field;
 use tock_registers::interfaces::{Readable, Writeable};
-use tock_registers::RegisterLongName;
 
 /// Trait defining the possible operations on a RISC-V CSR.
 pub trait RiscvCsrInterface {

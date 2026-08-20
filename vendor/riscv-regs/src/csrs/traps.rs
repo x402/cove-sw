@@ -4,8 +4,8 @@
 
 use crate::{hedeleg, hideleg, hie, hip, hstatus, hvip, reason, scause, sie, sip};
 use core::{fmt, result};
-use tock_registers::fields::FieldValue;
 use tock_registers::LocalRegisterCopy;
+use tock_registers::fields::FieldValue;
 
 /// Errors as a result of converting to/from CSR values and Trap enums.
 #[derive(Copy, Clone, Debug)]

@@ -114,7 +114,9 @@ impl<P: PhysPage> PageList<P> {
         }
         let mut prev = self.head.unwrap();
         while let Some(addr) = self.page_tracker.linked_page(prev, self.page_size) {
-            if let Some(next) = prev.checked_add_pages_with_size(1, self.page_size) && addr == next {
+            if let Some(next) = prev.checked_add_pages_with_size(1, self.page_size)
+                && addr == next
+            {
                 prev = next;
             } else {
                 return false;
