@@ -13,6 +13,7 @@ pub enum PageState {
     AssignedVcpuState,
     AssignedPageTable,
     AssignedPayload,
+    Shared,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -20,6 +21,7 @@ pub struct PageEntry {
     pub paddr: usize,
     pub state: PageState,
     pub owner_tvm_id: Option<usize>,
+    pub gpa: Option<usize>,
 }
 
 pub struct PageTracker {
@@ -84,6 +86,7 @@ impl PageTracker {
                         paddr,
                         state: PageState::ConvertedClean,
                         owner_tvm_id: None,
+                        gpa: None,
                     });
                     break;
                 }
@@ -192,6 +195,76 @@ impl PageTracker {
             }
         }
         true
+    }
+
+    pub fn find_free_page(&self) -> Option<usize> {
+        for slot in self.entries.iter().flatten() {
+            if slot.owner_tvm_id.is_none() && slot.state == PageState::ConvertedClean {
+                return Some(slot.paddr);
+            }
+        }
+        None
+    }
+
+    pub fn assign_page(&mut self, paddr: usize, state: PageState, tvm_id: usize) -> bool {
+        for slot in self.entries.iter_mut().flatten() {
+            if slot.paddr == paddr
+                && slot.owner_tvm_id.is_none()
+                && slot.state == PageState::ConvertedClean
+            {
+                slot.state = state;
+                slot.owner_tvm_id = Some(tvm_id);
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn set_shared(&mut self, paddr: usize, gpa: usize, tvm_id: usize) -> bool {
+        for slot in self.entries.iter_mut().flatten() {
+            if slot.paddr == paddr && slot.owner_tvm_id == Some(tvm_id) {
+                slot.state = PageState::Shared;
+                slot.gpa = Some(gpa);
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn find_shared_by_gpa(&self, gpa: usize, tvm_id: usize) -> Option<usize> {
+        self.entries
+            .iter()
+            .flatten()
+            .find(|slot| {
+                slot.owner_tvm_id == Some(tvm_id)
+                    && slot.state == PageState::Shared
+                    && slot.gpa == Some(gpa)
+            })
+            .map(|slot| slot.paddr)
+    }
+
+    pub fn clear_shared(&mut self, paddr: usize, tvm_id: usize) -> bool {
+        for slot in self.entries.iter_mut().flatten() {
+            if slot.paddr == paddr && slot.owner_tvm_id == Some(tvm_id) {
+                if slot.state != PageState::Shared {
+                    return false;
+                }
+                slot.state = PageState::AssignedPayload;
+                slot.gpa = None;
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn release_page(&mut self, paddr: usize, tvm_id: usize) {
+        for slot in self.entries.iter_mut().flatten() {
+            if slot.paddr == paddr && slot.owner_tvm_id == Some(tvm_id) {
+                slot.owner_tvm_id = None;
+                slot.state = PageState::ConvertedClean;
+                return;
+            }
+        }
     }
 
     pub fn release_tvm_pages(&mut self, tvm_id: usize) {

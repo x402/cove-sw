@@ -310,6 +310,120 @@ pub fn sbi_covh_run_tvm_vcpu(tvm_id: usize, vcpu_id: usize) -> (usize, usize) {
     (error, value)
 }
 
+pub fn sbi_covh_add_tvm_zero_pages(
+    tvm_id: usize,
+    dst_paddr: usize,
+    page_type: usize,
+    num_pages: usize,
+    gpa: usize,
+) -> (usize, usize) {
+    let mut error: usize;
+    let mut value: usize;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a7") riscv_cove::host::EID_COVH,
+            in("a6") riscv_cove::host::ADD_TVM_ZERO_PAGES,
+            inout("a0") tvm_id => error,
+            inout("a1") dst_paddr => value,
+            in("a2") page_type,
+            in("a3") num_pages,
+            in("a4") gpa,
+        );
+    }
+    (error, value)
+}
+
+pub fn sbi_covh_add_tvm_shared_pages(
+    tvm_id: usize,
+    src_paddr: usize,
+    dst_paddr: usize,
+    num_pages: usize,
+    gpa: usize,
+) -> (usize, usize) {
+    let mut error: usize;
+    let mut value: usize;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a7") riscv_cove::host::EID_COVH,
+            in("a6") riscv_cove::host::ADD_TVM_SHARED_PAGES,
+            inout("a0") tvm_id => error,
+            inout("a1") src_paddr => value,
+            in("a2") dst_paddr,
+            in("a3") num_pages,
+            in("a4") gpa,
+        );
+    }
+    (error, value)
+}
+
+pub fn sbi_covh_tvm_fence(tvm_id: usize) -> (usize, usize) {
+    let mut error: usize;
+    let mut value: usize;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a7") riscv_cove::host::EID_COVH,
+            in("a6") riscv_cove::host::TVM_FENCE,
+            inout("a0") tvm_id => error,
+            lateout("a1") value,
+        );
+    }
+    (error, value)
+}
+
+pub fn sbi_covh_tvm_invalidate_pages(tvm_id: usize, gpa: usize, length: usize) -> (usize, usize) {
+    let mut error: usize;
+    let mut value: usize;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a7") riscv_cove::host::EID_COVH,
+            in("a6") riscv_cove::host::TVM_INVALIDATE_PAGES,
+            inout("a0") tvm_id => error,
+            in("a1") gpa,
+            in("a2") length,
+            lateout("a3") value,
+        );
+    }
+    (error, value)
+}
+
+pub fn sbi_covh_tvm_validate_pages(tvm_id: usize, gpa: usize, length: usize) -> (usize, usize) {
+    let mut error: usize;
+    let mut value: usize;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a7") riscv_cove::host::EID_COVH,
+            in("a6") riscv_cove::host::TVM_VALIDATE_PAGES,
+            inout("a0") tvm_id => error,
+            in("a1") gpa,
+            in("a2") length,
+            lateout("a3") value,
+        );
+    }
+    (error, value)
+}
+
+pub fn sbi_covh_tvm_remove_pages(tvm_id: usize, gpa: usize, length: usize) -> (usize, usize) {
+    let mut error: usize;
+    let mut value: usize;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a7") riscv_cove::host::EID_COVH,
+            in("a6") riscv_cove::host::TVM_REMOVE_PAGES,
+            inout("a0") tvm_id => error,
+            in("a1") gpa,
+            in("a2") length,
+            lateout("a3") value,
+        );
+    }
+    (error, value)
+}
+
 pub fn sbi_covh_destroy_tvm(tvm_id: usize) -> (usize, usize) {
     let mut error: usize;
     let mut value: usize;
@@ -325,7 +439,7 @@ pub fn sbi_covh_destroy_tvm(tvm_id: usize) -> (usize, usize) {
     (error, value)
 }
 
-const NUM_PAGES: usize = 18;
+const NUM_PAGES: usize = 26;
 
 #[repr(align(16384))]
 struct AlignedPages([u8; NUM_PAGES * 4096]);
@@ -369,12 +483,14 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
     }
     let guest_src_paddr = src_ptr as usize;
 
-    // 3. Memory layout of the 18 converted pages:
-    // [0x0000..0x4000) (4 pages): TVM Root Page Table (16KB aligned)
-    // [0x4000..0x8000) (4 pages): TVM State (16KB)
-    // [0x8000..0xA000) (2 pages): vCPU 0 State (8KB)
-    // [0xA000..0xE000) (4 pages): TVM Page Table Pool (16KB)
-    // [0xE000..0x12000)(4 pages): TVM Measured Guest Payload (16KB)
+    // 3. Memory layout of the 26 converted pages:
+    // [0x0000..0x4000)  (4 pages): TVM Root Page Table (16KB aligned)
+    // [0x4000..0x8000)  (4 pages): TVM State (16KB)
+    // [0x8000..0xA000)  (2 pages): vCPU 0 State (8KB)
+    // [0xA000..0xE000)  (4 pages): TVM Page Table Pool (16KB)
+    // [0xE000..0x12000) (4 pages): TVM Measured Guest Payload (16KB)
+    // [0x12000..0x14000)(2 pages): TVM Shared Memory Zero Pages (8KB)
+    // Remaining 6 pages: free pool for demand-zero
     let base_paddr = core::ptr::addr_of_mut!(HOST_PAGES) as usize;
     assert_eq!(base_paddr % 16384, 0, "Base paddr must be 16KB aligned");
 
@@ -383,6 +499,7 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
     let vcpu_state_paddr = base_paddr + 0x8000;
     let pt_pool_paddr = base_paddr + 0xA000;
     let guest_dst_paddr = base_paddr + 0xE000;
+    let shared_paddr = base_paddr + 0x12000;
 
     println!(
         "[HOST] Converting {} pages at 0x{:x}...",
@@ -435,6 +552,14 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
     );
     assert_eq!(err, 0, "add_tvm_measured_pages must succeed");
 
+    // 7b. Add Zero Pages for shared memory (2 pages at GPA 0x80010000)
+    println!(
+        "[HOST] Adding 2 zero pages (GPA 0x80010000 -> SPA 0x{:x})...",
+        shared_paddr
+    );
+    let (err, _) = sbi_covh_add_tvm_zero_pages(tvm_id, shared_paddr, 0, 2, 0x8001_0000);
+    assert_eq!(err, 0, "add_tvm_zero_pages must succeed");
+
     // 8. Create vCPU 0
     println!("[HOST] Creating vCPU 0 at 0x{:x}...", vcpu_state_paddr);
     let (err, _) = sbi_covh_create_tvm_vcpu(tvm_id, 0, vcpu_state_paddr);
@@ -445,18 +570,69 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
     let (err, _) = sbi_covh_finalize_tvm(tvm_id, 0x8000_0000, 0, 0);
     assert_eq!(err, 0, "finalize_tvm must succeed");
 
-    // 10. Run TVM vCPU 0
-    println!("[HOST] Running TVM vCPU 0...");
+    // 10a. Run TVM vCPU 0 (first run: guest shares memory, exits)
+    println!("[HOST] Running TVM vCPU 0 (first run: COVG share)...");
     let (err, val) = sbi_covh_run_tvm_vcpu(tvm_id, 0);
     println!("[HOST] TVM vCPU 0 exited with err={}, val={}", err, val);
     assert_eq!(err, 0, "run_tvm_vcpu must return success");
+    assert_eq!(val, 1, "First exit must be EXIT_COVG_SHARE (=1)");
 
-    // 11. Destroy TVM
+    // 10b. Host writes MAGIC to the shared SPA (Host has MPT access after COVG share)
+    println!(
+        "[HOST] Writing MAGIC 0xCAFEF00D to shared SPA 0x{:x}...",
+        shared_paddr
+    );
+    unsafe {
+        core::ptr::write_volatile(shared_paddr as *mut u64, 0xCAFE_F00D);
+    }
+
+    // 10c. Re-add shared pages to restore G-stage mapping for guest
+    println!(
+        "[HOST] Re-adding shared pages (GPA 0x80010000 -> SPA 0x{:x})...",
+        shared_paddr
+    );
+    let (err, _) =
+        sbi_covh_add_tvm_shared_pages(tvm_id, shared_paddr, shared_paddr, 2, 0x8001_0000);
+    assert_eq!(err, 0, "add_tvm_shared_pages must succeed");
+
+    // Exercise the complete fence sequence with byte lengths, as specified by COVH.
+    println!("[HOST] Invalidate + fence + validate shared pages...");
+    let (err, _) = sbi_covh_tvm_invalidate_pages(tvm_id, 0x8001_0000, 0x2000);
+    assert_eq!(err, 0, "tvm_invalidate_pages must succeed");
+    let (err, _) = sbi_covh_tvm_fence(tvm_id);
+    assert_eq!(err, 0, "tvm_fence must succeed");
+    let (err, _) = sbi_covh_tvm_validate_pages(tvm_id, 0x8001_0000, 0x2000);
+    assert_eq!(err, 0, "tvm_validate_pages must succeed");
+
+    // 10d. Run TVM vCPU 0 again (verify shared memory, demand-zero, unshare)
+    println!("[HOST] Running TVM vCPU 0 (second run: verify + demand-zero + unshare)...");
+    let (err, val) = sbi_covh_run_tvm_vcpu(tvm_id, 0);
+    println!("[HOST] TVM vCPU 0 exited with err={}, val={}", err, val);
+    assert_eq!(err, 0, "second run_tvm_vcpu must return success");
+    assert_eq!(val, 2, "Second exit must be EXIT_COVG_UNSHARE (=2)");
+
+    // 10e. Run once more after the guest returns the shared region to confidential.
+    println!("[HOST] Running TVM vCPU 0 (third run: clean exit)...");
+    let (err, val) = sbi_covh_run_tvm_vcpu(tvm_id, 0);
+    println!("[HOST] TVM vCPU 0 exited with err={}, val={}", err, val);
+    assert_eq!(err, 0, "third run_tvm_vcpu must return success");
+    assert_eq!(val, 0, "Third exit must be EXIT_CLEAN (=0)");
+
+    // 11. Remove the shared mappings, then destroy the TVM and reclaim pages.
+    println!("[HOST] Removing shared pages...");
+    let (err, _) = sbi_covh_tvm_invalidate_pages(tvm_id, 0x8001_0000, 0x2000);
+    assert_eq!(err, 0, "pre-remove invalidate must succeed");
+    let (err, _) = sbi_covh_tvm_fence(tvm_id);
+    assert_eq!(err, 0, "pre-remove fence must succeed");
+    let (err, _) = sbi_covh_tvm_remove_pages(tvm_id, 0x8001_0000, 0x2000);
+    assert_eq!(err, 0, "tvm_remove_pages must succeed");
+
+    // 12. Destroy TVM
     println!("[HOST] Destroying TVM {}...", tvm_id);
     let (err, _) = sbi_covh_destroy_tvm(tvm_id);
     assert_eq!(err, 0, "destroy_tvm must succeed");
 
-    // 12. Reclaim Pages
+    // 13. Reclaim Pages
     println!(
         "[HOST] Reclaiming {} pages at 0x{:x}...",
         NUM_PAGES, base_paddr
@@ -474,7 +650,7 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
         );
     }
 
-    println!("[HOST] PHASE 3 PASS: TVM_LIFECYCLE_OK");
+    println!("[HOST] PHASE 4 PASS: FENCE_EXIT_OK");
 
     loop {
         unsafe {

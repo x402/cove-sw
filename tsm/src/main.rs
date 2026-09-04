@@ -208,6 +208,15 @@ pub extern "C" fn tsm_dispatch(
             }
             riscv_cove::host::CREATE_TVM_VCPU => tvm_manager().create_tvm_vcpu(a0, a1, a2),
             riscv_cove::host::RUN_TVM_VCPU => tvm_manager().run_tvm_vcpu(a0, a1),
+            riscv_cove::host::ADD_TVM_SHARED_PAGES => {
+                tvm_manager().add_shared_pages(a0, a1, a2, a3, a4)
+            }
+            riscv_cove::host::TVM_FENCE => tvm_manager().tvm_fence(a0),
+            riscv_cove::host::TVM_INVALIDATE_PAGES => {
+                tvm_manager().tvm_invalidate_pages(a0, a1, a2)
+            }
+            riscv_cove::host::TVM_VALIDATE_PAGES => tvm_manager().tvm_validate_pages(a0, a1, a2),
+            riscv_cove::host::TVM_REMOVE_PAGES => tvm_manager().tvm_remove_pages(a0, a1, a2),
             _ => SbiRet::not_supported(),
         },
         _ => SbiRet::not_supported(),

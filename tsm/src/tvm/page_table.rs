@@ -80,6 +80,127 @@ impl GStagePageTable {
         Ok(())
     }
 
+    /// Walk the page table without allocating; return the SPA for a mapped 4K page.
+    pub fn lookup_4k(&self, gpa: usize) -> Result<usize, ()> {
+        if gpa % 4096 != 0 || gpa >= (1usize << 41) {
+            return Err(());
+        }
+        let vpn2 = (gpa >> 30) & 0x7FF;
+        let vpn1 = (gpa >> 21) & 0x1FF;
+        let vpn0 = (gpa >> 12) & 0x1FF;
+
+        let root = unsafe { core::slice::from_raw_parts(self.root_paddr as *const u64, 2048) };
+        if root[vpn2] & PTE_V == 0 {
+            return Err(());
+        }
+        let l1_paddr = ((root[vpn2] >> 10) << 12) as usize;
+        let l1 = unsafe { core::slice::from_raw_parts(l1_paddr as *const u64, 512) };
+        if l1[vpn1] & PTE_V == 0 {
+            return Err(());
+        }
+        let l0_paddr = ((l1[vpn1] >> 10) << 12) as usize;
+        let l0 = unsafe { core::slice::from_raw_parts(l0_paddr as *const u64, 512) };
+        if l0[vpn0] & PTE_V == 0 {
+            return Err(());
+        }
+        Ok(((l0[vpn0] >> 10) << 12) as usize)
+    }
+
+    fn raw_lookup_4k(&self, gpa: usize) -> Result<u64, ()> {
+        if gpa % 4096 != 0 || gpa >= (1usize << 41) {
+            return Err(());
+        }
+        let vpn2 = (gpa >> 30) & 0x7FF;
+        let vpn1 = (gpa >> 21) & 0x1FF;
+        let vpn0 = (gpa >> 12) & 0x1FF;
+
+        let root = unsafe { core::slice::from_raw_parts(self.root_paddr as *const u64, 2048) };
+        if root[vpn2] & PTE_V == 0 {
+            return Err(());
+        }
+        let l1_paddr = ((root[vpn2] >> 10) << 12) as usize;
+        let l1 = unsafe { core::slice::from_raw_parts(l1_paddr as *const u64, 512) };
+        if l1[vpn1] & PTE_V == 0 {
+            return Err(());
+        }
+        let l0_paddr = ((l1[vpn1] >> 10) << 12) as usize;
+        let l0 = unsafe { core::slice::from_raw_parts(l0_paddr as *const u64, 512) };
+        Ok(l0[vpn0])
+    }
+
+    /// Temporarily block a present leaf mapping while retaining its identity.
+    pub fn invalidate_4k(&self, gpa: usize) -> Result<(), ()> {
+        let vpn0 = (gpa >> 12) & 0x1FF;
+        let pte = self.raw_lookup_4k(gpa)?;
+        if pte & PTE_V == 0 {
+            return Err(());
+        }
+
+        let root = unsafe { core::slice::from_raw_parts(self.root_paddr as *const u64, 2048) };
+        let vpn2 = (gpa >> 30) & 0x7FF;
+        let vpn1 = (gpa >> 21) & 0x1FF;
+        let l1_paddr = ((root[vpn2] >> 10) << 12) as usize;
+        let l1 = unsafe { core::slice::from_raw_parts(l1_paddr as *const u64, 512) };
+        let l0_paddr = ((l1[vpn1] >> 10) << 12) as usize;
+        let l0 = unsafe { core::slice::from_raw_parts_mut(l0_paddr as *mut u64, 512) };
+        l0[vpn0] = pte & !PTE_V;
+        Ok(())
+    }
+
+    /// Restore a mapping retained by `invalidate_4k`.
+    pub fn validate_4k(&self, gpa: usize) -> Result<(), ()> {
+        let vpn0 = (gpa >> 12) & 0x1FF;
+        let pte = self.raw_lookup_4k(gpa)?;
+        if pte == 0 || pte & PTE_V != 0 {
+            return Err(());
+        }
+
+        let root = unsafe { core::slice::from_raw_parts(self.root_paddr as *const u64, 2048) };
+        let vpn2 = (gpa >> 30) & 0x7FF;
+        let vpn1 = (gpa >> 21) & 0x1FF;
+        let l1_paddr = ((root[vpn2] >> 10) << 12) as usize;
+        let l1 = unsafe { core::slice::from_raw_parts(l1_paddr as *const u64, 512) };
+        let l0_paddr = ((l1[vpn1] >> 10) << 12) as usize;
+        let l0 = unsafe { core::slice::from_raw_parts_mut(l0_paddr as *mut u64, 512) };
+        l0[vpn0] = pte | PTE_V;
+        Ok(())
+    }
+
+    /// Remove an invalidated leaf and return the SPA it had retained.
+    pub fn remove_invalid_4k(&self, gpa: usize) -> Result<usize, ()> {
+        let vpn0 = (gpa >> 12) & 0x1FF;
+        let pte = self.raw_lookup_4k(gpa)?;
+        if pte == 0 || pte & PTE_V != 0 {
+            return Err(());
+        }
+
+        let root = unsafe { core::slice::from_raw_parts(self.root_paddr as *const u64, 2048) };
+        let vpn2 = (gpa >> 30) & 0x7FF;
+        let vpn1 = (gpa >> 21) & 0x1FF;
+        let l1_paddr = ((root[vpn2] >> 10) << 12) as usize;
+        let l1 = unsafe { core::slice::from_raw_parts(l1_paddr as *const u64, 512) };
+        let l0_paddr = ((l1[vpn1] >> 10) << 12) as usize;
+        let l0 = unsafe { core::slice::from_raw_parts_mut(l0_paddr as *mut u64, 512) };
+        l0[vpn0] = 0;
+        Ok(((pte >> 10) << 12) as usize)
+    }
+
+    /// Remove a 4K mapping and return the SPA that was mapped.
+    pub fn unmap_4k(&self, gpa: usize) -> Result<usize, ()> {
+        let spa = self.lookup_4k(gpa)?;
+        let vpn2 = (gpa >> 30) & 0x7FF;
+        let vpn1 = (gpa >> 21) & 0x1FF;
+        let vpn0 = (gpa >> 12) & 0x1FF;
+
+        let root = unsafe { core::slice::from_raw_parts(self.root_paddr as *const u64, 2048) };
+        let l1_paddr = ((root[vpn2] >> 10) << 12) as usize;
+        let l1 = unsafe { core::slice::from_raw_parts(l1_paddr as *const u64, 512) };
+        let l0_paddr = ((l1[vpn1] >> 10) << 12) as usize;
+        let l0 = unsafe { core::slice::from_raw_parts_mut(l0_paddr as *mut u64, 512) };
+        l0[vpn0] = 0;
+        Ok(spa)
+    }
+
     pub fn make_hgatp(&self, vmid: usize) -> usize {
         (HGATP_MODE_SV39X4 << 60) | ((vmid & 0x3FFF) << 44) | (self.root_paddr >> 12)
     }

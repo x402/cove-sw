@@ -20,6 +20,18 @@ pub struct TvmMemoryRegion {
     pub len: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct MmioRegion {
+    pub gpa_base: usize,
+    pub len: usize,
+}
+
+#[derive(Clone, Copy)]
+pub struct SharedRegion {
+    pub gpa_base: usize,
+    pub len: usize,
+}
+
 pub struct Tvm {
     pub id: usize,
     pub state: TvmState,
@@ -28,6 +40,8 @@ pub struct Tvm {
     pub vmid: usize,
     pub page_table: GStagePageTable,
     pub memory_regions: [Option<TvmMemoryRegion>; 8],
+    pub mmio_regions: [Option<MmioRegion>; 8],
+    pub shared_regions: [Option<SharedRegion>; 8],
     pub pt_pages: [usize; 64],
     pub pt_page_count: usize,
     pub pt_page_used: usize,
@@ -48,6 +62,8 @@ impl Tvm {
             vmid: id,
             page_table,
             memory_regions: [None; 8],
+            mmio_regions: [None; 8],
+            shared_regions: [None; 8],
             pt_pages: [0; 64],
             pt_page_count: 0,
             pt_page_used: 0,
@@ -435,10 +451,328 @@ impl TvmManager {
 
         let res = vcpu.run();
         if res == 0 {
-            SbiRet::success(0)
+            let exit = vcpu::last_exit();
+            SbiRet::success(exit.reason)
         } else {
             SbiRet::failed()
         }
+    }
+
+    // ---- Phase 4: COVG internal handlers (called from vcpu trap handler) ----
+
+    pub fn add_mmio_region_internal(&mut self, gpa: usize, len: usize) -> bool {
+        let tvm = match self.active_tvm.as_mut() {
+            Some(t) => t,
+            None => return false,
+        };
+        if gpa % PAGE_SIZE != 0 || len % PAGE_SIZE != 0 || len == 0 {
+            return false;
+        }
+        for slot in tvm.mmio_regions.iter_mut() {
+            if slot.is_none() {
+                *slot = Some(MmioRegion { gpa_base: gpa, len });
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn remove_mmio_region_internal(&mut self, gpa: usize, len: usize) -> bool {
+        let tvm = match self.active_tvm.as_mut() {
+            Some(t) => t,
+            None => return false,
+        };
+        let end = match gpa.checked_add(len) {
+            Some(e) => e,
+            None => return false,
+        };
+        let mut removed = false;
+        for slot in tvm.mmio_regions.iter_mut() {
+            if let Some(r) = slot {
+                let r_end = r.gpa_base + r.len;
+                if !(end <= r.gpa_base || gpa >= r_end) {
+                    *slot = None;
+                    removed = true;
+                }
+            }
+        }
+        removed
+    }
+
+    pub fn share_memory_internal(&mut self, gpa: usize, len: usize) -> bool {
+        let tvm = match self.active_tvm.as_mut() {
+            Some(t) => t,
+            None => return false,
+        };
+        if gpa % PAGE_SIZE != 0 || len % PAGE_SIZE != 0 || len == 0 {
+            return false;
+        }
+        let num = len / PAGE_SIZE;
+        let shared_slot = match tvm.shared_regions.iter_mut().find(|slot| slot.is_none()) {
+            Some(slot) => slot,
+            None => return false,
+        };
+        let mut all_ok = true;
+        for i in 0..num {
+            let cur_gpa = gpa + i * PAGE_SIZE;
+            // Look up SPA from G-stage
+            let spa = match tvm.page_table.lookup_4k(cur_gpa) {
+                Ok(s) => s,
+                Err(_) => {
+                    all_ok = false;
+                    continue;
+                }
+            };
+            // Preserve ownership and make the yielded page visible to the tracker.
+            page_tracker().set_shared(spa, cur_gpa, tvm.id);
+            // Unmap from G-stage (guest loses access)
+            let _ = tvm.page_table.unmap_4k(cur_gpa);
+            // Grant Host (SDID=0) RW access to the SPA
+            let (err, _) = crate::rdsm::rdsm_mpt_set(0, spa, PAGE_SIZE, 3);
+            if err != 0 {
+                all_ok = false;
+            }
+        }
+        if all_ok {
+            *shared_slot = Some(SharedRegion { gpa_base: gpa, len });
+        }
+        all_ok
+    }
+
+    pub fn unshare_memory_internal(&mut self, gpa: usize, len: usize) -> bool {
+        let tvm = match self.active_tvm.as_mut() {
+            Some(t) => t,
+            None => return false,
+        };
+        if gpa % PAGE_SIZE != 0 || len % PAGE_SIZE != 0 || len == 0 {
+            return false;
+        }
+        if gpa % PAGE_SIZE != 0 || len == 0 || len % PAGE_SIZE != 0 {
+            return false;
+        }
+        let slot_index = tvm
+            .shared_regions
+            .iter()
+            .position(|region| matches!(region, Some(r) if r.gpa_base == gpa && r.len == len));
+        let slot_index = match slot_index {
+            Some(index) => index,
+            None => return false,
+        };
+        let region = tvm.shared_regions[slot_index].unwrap();
+        let num_pages = len / PAGE_SIZE;
+        let pt_pages = tvm.pt_pages;
+        let pt_page_count = tvm.pt_page_count;
+        let pt_page_used = &mut tvm.pt_page_used;
+        let page_table = &tvm.page_table;
+
+        for i in 0..num_pages {
+            let cur_gpa = region.gpa_base + i * PAGE_SIZE;
+            let spa = match page_tracker().find_shared_by_gpa(cur_gpa, tvm.id) {
+                Some(spa) => spa,
+                None => return false,
+            };
+            if crate::rdsm::rdsm_mpt_set(0, spa, PAGE_SIZE, 0).0 != 0 {
+                return false;
+            }
+            if !page_tracker().clear_shared(spa, tvm.id) {
+                return false;
+            }
+            let mut alloc_fn = || {
+                if *pt_page_used < pt_page_count {
+                    let page = pt_pages[*pt_page_used];
+                    *pt_page_used += 1;
+                    Some(page)
+                } else {
+                    None
+                }
+            };
+            if page_table.map_4k(cur_gpa, spa, &mut alloc_fn).is_err() {
+                return false;
+            }
+        }
+
+        let _ = crate::rdsm::rdsm_mfence_pa(0, 0);
+        unsafe {
+            core::arch::asm!("hfence.gvma");
+        }
+        tvm.shared_regions[slot_index] = None;
+        true
+    }
+
+    pub fn handle_demand_zero(&mut self, fault_gpa: usize) -> bool {
+        let tvm = match self.active_tvm.as_mut() {
+            Some(t) => t,
+            None => return false,
+        };
+
+        // Verify fault GPA is within a registered memory region
+        let in_region = tvm
+            .memory_regions
+            .iter()
+            .flatten()
+            .any(|r| fault_gpa >= r.gpa_base && fault_gpa < r.gpa_base + r.len);
+        if !in_region {
+            return false;
+        }
+
+        // Find a free page from the tracker
+        let tracker = page_tracker();
+        let free_page = match tracker.find_free_page() {
+            Some(p) => p,
+            None => return false,
+        };
+
+        // Assign it to this TVM
+        if !tracker.assign_page(free_page, PageState::AssignedPayload, tvm.id) {
+            return false;
+        }
+
+        // Zero-fill the page (demand-zero semantics)
+        unsafe {
+            core::ptr::write_bytes(free_page as *mut u8, 0, PAGE_SIZE);
+        }
+
+        // Map in G-stage
+        let page_table = &tvm.page_table;
+        let pt_pages = tvm.pt_pages;
+        let pt_page_count = tvm.pt_page_count;
+        let pt_page_used = &mut tvm.pt_page_used;
+
+        let mut alloc_fn = || {
+            if *pt_page_used < pt_page_count {
+                let p = pt_pages[*pt_page_used];
+                *pt_page_used += 1;
+                Some(p)
+            } else {
+                None
+            }
+        };
+        page_table
+            .map_4k(fault_gpa, free_page, &mut alloc_fn)
+            .is_ok()
+    }
+
+    // ---- Phase 4: New COVH FIDs ----
+
+    pub fn add_shared_pages(
+        &mut self,
+        tvm_id: usize,
+        src_paddr: usize,
+        dst_paddr: usize,
+        num_pages: usize,
+        gpa: usize,
+    ) -> SbiRet {
+        let tvm = match self.active_tvm.as_mut() {
+            Some(t) if t.id == tvm_id => t,
+            _ => return SbiRet::invalid_param(),
+        };
+        if gpa % PAGE_SIZE != 0 || num_pages == 0 {
+            return SbiRet::invalid_address();
+        }
+        let page_table = &tvm.page_table;
+        let pt_pages = tvm.pt_pages;
+        let pt_page_count = tvm.pt_page_count;
+        let pt_page_used = &mut tvm.pt_page_used;
+
+        for i in 0..num_pages {
+            let cur_gpa = gpa + i * PAGE_SIZE;
+            let spa = dst_paddr + i * PAGE_SIZE;
+            let mut alloc_fn = || {
+                if *pt_page_used < pt_page_count {
+                    let p = pt_pages[*pt_page_used];
+                    *pt_page_used += 1;
+                    Some(p)
+                } else {
+                    None
+                }
+            };
+            if page_table.map_4k(cur_gpa, spa, &mut alloc_fn).is_err() {
+                return SbiRet::failed();
+            }
+        }
+        let _ = src_paddr; // src is the Host-side physical addr, already accessible
+        SbiRet::success(0)
+    }
+
+    pub fn tvm_fence(&mut self, tvm_id: usize) -> SbiRet {
+        let _tvm = match self.active_tvm.as_ref() {
+            Some(t) if t.id == tvm_id => t,
+            _ => return SbiRet::invalid_param(),
+        };
+        unsafe {
+            core::arch::asm!("hfence.gvma");
+        }
+        SbiRet::success(0)
+    }
+
+    pub fn tvm_invalidate_pages(&mut self, tvm_id: usize, gpa: usize, length: usize) -> SbiRet {
+        let tvm = match self.active_tvm.as_mut() {
+            Some(t) if t.id == tvm_id => t,
+            _ => return SbiRet::invalid_param(),
+        };
+        if gpa % PAGE_SIZE != 0 || length == 0 || length % PAGE_SIZE != 0 {
+            return SbiRet::invalid_address();
+        }
+        let num_pages = length / PAGE_SIZE;
+        for i in 0..num_pages {
+            let cur_gpa = gpa + i * PAGE_SIZE;
+            if tvm.page_table.invalidate_4k(cur_gpa).is_err() {
+                return SbiRet::invalid_address();
+            }
+        }
+        unsafe {
+            core::arch::asm!("hfence.gvma");
+        }
+        SbiRet::success(0)
+    }
+
+    pub fn tvm_validate_pages(&mut self, tvm_id: usize, gpa: usize, length: usize) -> SbiRet {
+        let tvm = match self.active_tvm.as_mut() {
+            Some(t) if t.id == tvm_id => t,
+            _ => return SbiRet::invalid_param(),
+        };
+        if gpa % PAGE_SIZE != 0 || length == 0 || length % PAGE_SIZE != 0 {
+            return SbiRet::invalid_address();
+        }
+
+        let num_pages = length / PAGE_SIZE;
+        for i in 0..num_pages {
+            if tvm.page_table.validate_4k(gpa + i * PAGE_SIZE).is_err() {
+                return SbiRet::invalid_address();
+            }
+        }
+        unsafe {
+            core::arch::asm!("hfence.gvma");
+        }
+        SbiRet::success(0)
+    }
+
+    pub fn tvm_remove_pages(&mut self, tvm_id: usize, gpa: usize, length: usize) -> SbiRet {
+        let tvm = match self.active_tvm.as_mut() {
+            Some(t) if t.id == tvm_id => t,
+            _ => return SbiRet::invalid_param(),
+        };
+        if gpa % PAGE_SIZE != 0 || length == 0 || length % PAGE_SIZE != 0 {
+            return SbiRet::invalid_address();
+        }
+
+        // Find and release the SPA pages back to the free pool
+        let tracker = page_tracker();
+        let num_pages = length / PAGE_SIZE;
+        for i in 0..num_pages {
+            let cur_gpa = gpa + i * PAGE_SIZE;
+            // Removal is only legal after invalidate + fence, so require a retained PTE.
+            if let Ok(spa) = tvm.page_table.remove_invalid_4k(cur_gpa) {
+                // Return page to free pool
+                tracker.release_page(spa, tvm_id);
+            } else {
+                return SbiRet::invalid_address();
+            }
+        }
+        unsafe {
+            core::arch::asm!("hfence.gvma");
+        }
+        SbiRet::success(0)
     }
 
     pub fn destroy_tvm(&mut self, tvm_id: usize) -> SbiRet {

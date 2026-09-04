@@ -72,6 +72,33 @@ unsafe extern "C" {
 pub const TRAP_ACTION_RESUME: usize = 0;
 pub const TRAP_ACTION_EXIT: usize = 1;
 
+// Exit reasons reported to Host via sbi_covh_run_tvm_vcpu return value
+pub const EXIT_CLEAN: usize = 0;
+pub const EXIT_COVG_SHARE: usize = 1;
+pub const EXIT_COVG_UNSHARE: usize = 2;
+pub const EXIT_COVG_ADD_MMIO: usize = 3;
+pub const EXIT_COVG_REMOVE_MMIO: usize = 4;
+pub const EXIT_UNEXPECTED_TRAP: usize = 5;
+
+const EID_COVG: usize = 0x434F5647;
+
+#[repr(C)]
+pub struct ExitInfo {
+    pub reason: usize,
+    pub gpa: usize,
+    pub len: usize,
+}
+
+pub static mut LAST_EXIT: ExitInfo = ExitInfo {
+    reason: EXIT_CLEAN,
+    gpa: 0,
+    len: 0,
+};
+
+pub fn last_exit() -> &'static mut ExitInfo {
+    unsafe { &mut *core::ptr::addr_of_mut!(LAST_EXIT) }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn handle_guest_trap(ctx: *mut GuestContext) -> usize {
     let ctx_ref = unsafe { &mut *ctx };
@@ -89,29 +116,109 @@ pub extern "C" fn handle_guest_trap(ctx: *mut GuestContext) -> usize {
             let _ = sbi_rt::legacy::console_putchar(ch as usize);
             ctx_ref.sepc += 4;
             return TRAP_ACTION_RESUME;
-        } else if eid == 0x53525354 || eid == 0x434F5647 || (eid == 0 && fid == 0) || eid == 0x08 {
-            // Guest exit
+        }
+
+        if eid == 0x53525354 || (eid == 0 && fid == 0) || eid == 0x08 {
+            // Guest clean exit via SRST / shutdown (NOT COVG - handled below)
             ctx_ref.sepc += 4;
-            return TRAP_ACTION_EXIT;
-        } else {
-            crate::println!(
-                "[TSM] Unhandled guest ECALL: eid=0x{:x}, fid=0x{:x}",
-                eid,
-                fid
-            );
-            ctx_ref.sepc += 4;
+            last_exit().reason = EXIT_CLEAN;
             return TRAP_ACTION_EXIT;
         }
-    } else {
+
+        if eid == EID_COVG {
+            let gpa = ctx_ref.gprs[10]; // a0
+            let len = ctx_ref.gprs[11]; // a1
+
+            match fid {
+                0 => {
+                    // ADD_MMIO_REGION
+                    crate::tvm::tvm_manager().add_mmio_region_internal(gpa, len);
+                    ctx_ref.sepc += 4;
+                    let e = last_exit();
+                    e.reason = EXIT_COVG_ADD_MMIO;
+                    e.gpa = gpa;
+                    e.len = len;
+                    return TRAP_ACTION_EXIT;
+                }
+                1 => {
+                    // REMOVE_MMIO_REGION
+                    crate::tvm::tvm_manager().remove_mmio_region_internal(gpa, len);
+                    ctx_ref.sepc += 4;
+                    let e = last_exit();
+                    e.reason = EXIT_COVG_REMOVE_MMIO;
+                    e.gpa = gpa;
+                    e.len = len;
+                    return TRAP_ACTION_EXIT;
+                }
+                2 => {
+                    // SHARE_MEMORY_REGION: unmap G-stage, grant Host MPT access
+                    let ok = crate::tvm::tvm_manager().share_memory_internal(gpa, len);
+                    ctx_ref.sepc += 4;
+                    let e = last_exit();
+                    e.reason = EXIT_COVG_SHARE;
+                    e.gpa = gpa;
+                    e.len = len;
+                    let _ = ok; // Even if partial, still exit so host can inspect
+                    return TRAP_ACTION_EXIT;
+                }
+                3 => {
+                    // UNSHARE_MEMORY_REGION
+                    crate::tvm::tvm_manager().unshare_memory_internal(gpa, len);
+                    ctx_ref.sepc += 4;
+                    let e = last_exit();
+                    e.reason = EXIT_COVG_UNSHARE;
+                    e.gpa = gpa;
+                    e.len = len;
+                    return TRAP_ACTION_EXIT;
+                }
+                _ => {
+                    crate::println!("[TSM] Unhandled COVG FID={}", fid);
+                    ctx_ref.sepc += 4;
+                    last_exit().reason = EXIT_UNEXPECTED_TRAP;
+                    return TRAP_ACTION_EXIT;
+                }
+            }
+        }
+
         crate::println!(
-            "[TSM] Guest trap: scause=0x{:x}, sepc=0x{:x}, stval=0x{:x}, htval=0x{:x}",
-            scause,
-            ctx_ref.sepc,
-            ctx_ref.stval,
-            ctx_ref.htval
+            "[TSM] Unhandled guest ECALL: eid=0x{:x}, fid=0x{:x}",
+            eid,
+            fid
         );
+        ctx_ref.sepc += 4;
+        last_exit().reason = EXIT_UNEXPECTED_TRAP;
         return TRAP_ACTION_EXIT;
     }
+
+    // Guest page/access faults:
+    // scause 13: Guest load page fault
+    // scause 15: Guest store/AMO page fault
+    // scause 22: Guest load access fault (MPT denied at G-stage)
+    // scause 23: Guest store/AMO access fault (MPT denied at G-stage)
+    if scause == 13 || scause == 15 || scause == 22 || scause == 23 {
+        let fault_gpa = ctx_ref.htval << 2;
+        let handled = crate::tvm::tvm_manager().handle_demand_zero(fault_gpa);
+        if handled {
+            return TRAP_ACTION_RESUME;
+        }
+        crate::println!(
+            "[TSM] Unhandled guest page fault: gpa=0x{:x}, scause={}",
+            fault_gpa,
+            scause
+        );
+        last_exit().reason = EXIT_UNEXPECTED_TRAP;
+        return TRAP_ACTION_EXIT;
+    }
+
+    crate::println!(
+        "[TSM] Guest trap: scause=0x{:x}, sepc=0x{:x}, stval=0x{:x}, htval=0x{:x}",
+        scause,
+        ctx_ref.sepc,
+        ctx_ref.stval,
+        ctx_ref.htval
+    );
+    last_exit().reason = EXIT_UNEXPECTED_TRAP;
+    return TRAP_ACTION_EXIT;
 }
 
 global_asm!(
