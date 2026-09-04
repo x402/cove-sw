@@ -34,6 +34,10 @@ impl GStagePageTable {
         if gpa % 4096 != 0 || spa % 4096 != 0 {
             return Err(());
         }
+        // Sv39x4: GPA valid width is 41 bits (0 .. 1 << 41)
+        if gpa >= (1usize << 41) {
+            return Err(());
+        }
 
         let vpn2 = (gpa >> 30) & 0x7FF; // 11 bits: 0..2047
         let vpn1 = (gpa >> 21) & 0x1FF; // 9 bits: 0..511

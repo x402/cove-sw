@@ -73,6 +73,9 @@ impl TvmManager {
     }
 
     pub fn create_tvm(&mut self, params_paddr: usize, params_len: usize) -> SbiRet {
+        if self.active_tvm.is_some() {
+            return SbiRet::failed(); // A TVM is already active; destroy it first
+        }
         if params_paddr == 0 || params_len < core::mem::size_of::<TvmCreateParams>() {
             return SbiRet::invalid_param();
         }

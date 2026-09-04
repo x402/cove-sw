@@ -38,7 +38,10 @@ impl PageTracker {
             return SbiRet::invalid_param();
         }
 
-        let len = num_pages * PAGE_SIZE;
+        let len = match num_pages.checked_mul(PAGE_SIZE) {
+            Some(l) => l,
+            None => return SbiRet::invalid_param(),
+        };
 
         // Check if there is enough space in entries and no duplicates
         let mut free_count = 0;
@@ -47,7 +50,10 @@ impl PageTracker {
                 free_count += 1;
             } else if let Some(e) = slot {
                 let e_end = e.paddr + PAGE_SIZE;
-                let target_end = base_paddr + len;
+                let target_end = match base_paddr.checked_add(len) {
+                    Some(t) => t,
+                    None => return SbiRet::invalid_param(),
+                };
                 if !(target_end <= e.paddr || base_paddr >= e_end) {
                     return SbiRet::invalid_param(); // Already converted
                 }
@@ -111,6 +117,14 @@ impl PageTracker {
         }
 
         let len = num_pages * PAGE_SIZE;
+
+        // 0. Scrub confidential page contents before restoring Host access (CoVE 5.2.4)
+        for i in 0..num_pages {
+            let paddr = base_paddr + i * PAGE_SIZE;
+            unsafe {
+                core::ptr::write_bytes(paddr as *mut u8, 0, PAGE_SIZE);
+            }
+        }
 
         // 1. Restore Host access (SDID=0)
         let (err0, _) = rdsm_mpt_set(0, base_paddr, len, 7); // RWX
