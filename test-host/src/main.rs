@@ -456,6 +456,12 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
     println!("[HOST] Booting... HOST_STARTED");
 
     // 1. Check SUPD & COVH
+    let supd_probed = sbi_probe_extension(riscv_cove::supd::EID_SUPD);
+    assert_eq!(supd_probed, 1, "EXT_SUPD must be discovered via base probe");
+    let covh_probed = sbi_probe_extension(riscv_cove::host::EID_COVH);
+    assert_eq!(covh_probed, 1, "EXT_COVH must be discovered via base probe");
+    println!("[MARKER 04] HOST: Discovery passed (EXT_SUPD & EXT_COVH found).");
+
     let (err, active_domains) = sbi_supd_get_active_domains();
     assert_eq!(err, 0, "SUPD get_active_domains must succeed");
     assert_eq!(
@@ -470,6 +476,7 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
     assert_eq!(err, 0, "get_tsm_info must succeed");
     let info = unsafe { tsm_info.assume_init() };
     assert_eq!(info.tsm_state, 2, "TSM state must be READY");
+    println!("[MARKER 05] HOST: TSM capability probed, state=TSM_READY.");
 
     // 2. Prepare Guest Source Buffer in Host memory
     println!(
@@ -513,6 +520,10 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
 
     let (err, _) = sbi_covh_local_fence();
     assert_eq!(err, 0, "local_fence must succeed");
+    println!(
+        "[MARKER 06] HOST: Converted {} physical pages to confidential memory.",
+        NUM_PAGES
+    );
 
     // 4. Create TVM
     println!("[HOST] Creating TVM...");
@@ -559,16 +570,25 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
     );
     let (err, _) = sbi_covh_add_tvm_zero_pages(tvm_id, shared_paddr, 0, 2, 0x8001_0000);
     assert_eq!(err, 0, "add_tvm_zero_pages must succeed");
+    println!(
+        "[MARKER 07] HOST: TVM #{} memory regions & measured pages populated.",
+        tvm_id
+    );
 
-    // 8. Create vCPU 0
+    // 9. Create vCPU 0
     println!("[HOST] Creating vCPU 0 at 0x{:x}...", vcpu_state_paddr);
     let (err, _) = sbi_covh_create_tvm_vcpu(tvm_id, 0, vcpu_state_paddr);
     assert_eq!(err, 0, "create_tvm_vcpu must succeed");
+    println!("[MARKER 08] HOST: TVM #{} created with 1 vCPU.", tvm_id);
 
-    // 9. Finalize TVM
+    // 10. Finalize TVM
     println!("[HOST] Finalizing TVM with entry PC 0x80000000...");
     let (err, _) = sbi_covh_finalize_tvm(tvm_id, 0x8000_0000, 0, 0);
     assert_eq!(err, 0, "finalize_tvm must succeed");
+    println!(
+        "[MARKER 09] HOST: TVM #{} finalized, launching vCPU #0...",
+        tvm_id
+    );
 
     // 10a. Run TVM vCPU 0 (first run: guest shares memory, exits)
     println!("[HOST] Running TVM vCPU 0 (first run: COVG share)...");
@@ -617,6 +637,10 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
     println!("[HOST] TVM vCPU 0 exited with err={}, val={}", err, val);
     assert_eq!(err, 0, "third run_tvm_vcpu must return success");
     assert_eq!(val, 0, "Third exit must be EXIT_CLEAN (=0)");
+    println!(
+        "[MARKER 14] HOST: Received TVM exit, tearing down TVM #{}.",
+        tvm_id
+    );
 
     // 11. Remove the shared mappings, then destroy the TVM and reclaim pages.
     println!("[HOST] Removing shared pages...");
@@ -649,8 +673,10 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
             "Host memory access after reclaim must succeed"
         );
     }
+    println!("[MARKER 15] HOST: All confidential pages reclaimed successfully.");
 
     println!("[HOST] PHASE 4 PASS: FENCE_EXIT_OK");
+    println!("[MARKER 16] HOST: ALL COVE E2E TESTS PASSED!");
 
     loop {
         unsafe {

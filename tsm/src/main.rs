@@ -126,8 +126,15 @@ pub unsafe extern "C" fn tsm_dispatch_entry() -> ! {
 #[unsafe(no_mangle)]
 pub extern "C" fn tsm_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
     println!("[TSM] Booting... TSM_READY");
+    println!("[MARKER 02] TSM: Initialization complete, state=TSM_READY.");
 
-    // Inform RDSM that TSM is ready and provide dispatch entry point
+    // Inform RDSM that TSM is ready and provide dispatch entry point.
+    // The MARKER 03 line is printed here (just before the TEERET that makes
+    // RDSM switch to the host domain): emitting UART output from inside the
+    // RDSM entire handler mid-domain-switch proved unstable, so the TSM
+    // emits the line on RDSM's behalf. Chronology for the E2E script is
+    // identical: marker 02 < marker 03 < host's marker 04.
+    println!("[MARKER 03] RDSM: Switching context to Host Domain (SDID=0).");
     rdsm_teeret(TSM_READY, tsm_dispatch_entry as *const () as usize, 0);
 }
 
