@@ -119,7 +119,10 @@ impl PageTracker {
             }
         }
 
-        let len = num_pages * PAGE_SIZE;
+        let len = match num_pages.checked_mul(PAGE_SIZE) {
+            Some(l) => l,
+            None => return SbiRet::invalid_param(),
+        };
 
         // 0. Scrub confidential page contents before restoring Host access (CoVE 5.2.4)
         for i in 0..num_pages {

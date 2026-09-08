@@ -312,6 +312,9 @@ impl TvmManager {
             _ => return SbiRet::invalid_param(),
         };
 
+        if tvm.state != TvmState::Initializing {
+            return SbiRet::invalid_param();
+        }
         if page_type != 0 {
             return SbiRet::not_supported();
         }

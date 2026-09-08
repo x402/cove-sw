@@ -74,7 +74,10 @@ impl GStagePageTable {
 
         let l0_slice = unsafe { core::slice::from_raw_parts_mut(l0_paddr as *mut u64, 512) };
 
-        // Level 0 Leaf entry
+        // Level 0 Leaf entry: refuse to silently overwrite an existing mapping
+        if l0_slice[vpn0] & PTE_V != 0 {
+            return Err(());
+        }
         l0_slice[vpn0] = (((spa >> 12) as u64) << 10) | PTE_LEAF_RWX;
 
         Ok(())

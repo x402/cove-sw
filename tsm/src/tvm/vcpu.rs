@@ -118,7 +118,7 @@ pub extern "C" fn handle_guest_trap(ctx: *mut GuestContext) -> usize {
             return TRAP_ACTION_RESUME;
         }
 
-        if eid == 0x53525354 || (eid == 0 && fid == 0) || eid == 0x08 {
+        if eid == 0x53525354 || eid == 0x08 {
             // Guest clean exit via SRST / shutdown (NOT COVG - handled below)
             ctx_ref.sepc += 4;
             last_exit().reason = EXIT_CLEAN;

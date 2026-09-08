@@ -382,9 +382,8 @@ pub fn sbi_covh_tvm_invalidate_pages(tvm_id: usize, gpa: usize, length: usize) -
             in("a7") riscv_cove::host::EID_COVH,
             in("a6") riscv_cove::host::TVM_INVALIDATE_PAGES,
             inout("a0") tvm_id => error,
-            in("a1") gpa,
+            inout("a1") gpa => value,
             in("a2") length,
-            lateout("a3") value,
         );
     }
     (error, value)
@@ -399,9 +398,8 @@ pub fn sbi_covh_tvm_validate_pages(tvm_id: usize, gpa: usize, length: usize) -> 
             in("a7") riscv_cove::host::EID_COVH,
             in("a6") riscv_cove::host::TVM_VALIDATE_PAGES,
             inout("a0") tvm_id => error,
-            in("a1") gpa,
+            inout("a1") gpa => value,
             in("a2") length,
-            lateout("a3") value,
         );
     }
     (error, value)
@@ -416,9 +414,8 @@ pub fn sbi_covh_tvm_remove_pages(tvm_id: usize, gpa: usize, length: usize) -> (u
             in("a7") riscv_cove::host::EID_COVH,
             in("a6") riscv_cove::host::TVM_REMOVE_PAGES,
             inout("a0") tvm_id => error,
-            in("a1") gpa,
+            inout("a1") gpa => value,
             in("a2") length,
-            lateout("a3") value,
         );
     }
     (error, value)
