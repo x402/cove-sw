@@ -4,6 +4,53 @@ use crate::rdsm::{rdsm_mfence_pa, rdsm_mpt_set};
 pub const PAGE_SIZE: usize = 4096;
 pub const MAX_PAGES: usize = 512;
 
+// ── Host-allocatable memory whitelist (Phase 5.5) ───────────────────────
+//
+// Derived once at boot from RDSM_GET_INFO. Host-supplied physical
+// addresses are only accepted when the whole range falls inside one of
+// these regions; everything else (firmware gap, TSM image, MPT page
+// pool) is reserved and must be rejected.
+
+static mut HOST_REGIONS: [(usize, usize); 2] = [(0, 0); 2];
+static mut HOST_REGIONS_READY: bool = false;
+
+/// Populate the whitelist from the RDSM-provided platform layout.
+pub fn init_host_regions(info: &crate::rdsm::RdsmPlatformInfo) {
+    let regions: [(usize, usize); 2] = [
+        (info.tsm_region_end, info.mpt_pool_start),
+        (info.mpt_pool_end, info.ram_end),
+    ];
+    unsafe {
+        core::ptr::write_volatile(
+            core::ptr::addr_of_mut!(HOST_REGIONS),
+            regions,
+        );
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(HOST_REGIONS_READY), true);
+    }
+}
+
+/// Fail-closed check: is `[paddr, paddr+len)` entirely host-allocatable?
+/// Containment only; page alignment is the caller's concern (each COVH
+/// entry validates its own alignment requirements).
+pub fn is_host_range(paddr: usize, len: usize) -> bool {
+    if len == 0 {
+        return false;
+    }
+    let end = match paddr.checked_add(len) {
+        Some(e) => e,
+        None => return false,
+    };
+    unsafe {
+        if !core::ptr::read_volatile(core::ptr::addr_of!(HOST_REGIONS_READY)) {
+            return false;
+        }
+        let regions = core::ptr::read_volatile(core::ptr::addr_of!(HOST_REGIONS));
+        regions
+            .iter()
+            .any(|&(start, stop)| paddr >= start && end <= stop)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PageState {
     NonConfidential,
@@ -44,6 +91,12 @@ impl PageTracker {
             Some(l) => l,
             None => return SbiRet::invalid_param(),
         };
+
+        // Only host-allocatable memory may be converted (Phase 5.5):
+        // firmware, TSM image and MPT page pool must stay out of reach.
+        if !is_host_range(base_paddr, len) {
+            return SbiRet::invalid_param();
+        }
 
         // Check if there is enough space in entries and no duplicates
         let mut free_count = 0;

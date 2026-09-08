@@ -125,6 +125,21 @@ pub unsafe extern "C" fn tsm_dispatch_entry() -> ! {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn tsm_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
+    // Phase 5.5: obtain the platform reserved-region layout from RDSM and
+    // build the host-allocatable whitelist. Fail closed on error: without
+    // a known memory map, every host-supplied address would be rejected.
+    match rdsm::rdsm_get_platform_info() {
+        Some(info) => mm::init_host_regions(&info),
+        None => {
+            println!("[TSM PANIC] RDSM_GET_INFO failed, refusing to start");
+            loop {
+                unsafe {
+                    asm!("wfi");
+                }
+            }
+        }
+    }
+
     println!("[TSM] Booting... TSM_READY");
     println!("[MARKER 02] TSM: Initialization complete, state=TSM_READY.");
 
@@ -235,6 +250,13 @@ fn handle_get_tsm_info(buf_paddr: usize, buf_len: usize) -> SbiRet {
         return SbiRet::invalid_param();
     }
     if buf_paddr % core::mem::align_of::<riscv_cove::host::TsmInfo>() != 0 {
+        return SbiRet::invalid_address();
+    }
+    // Phase 5.5: the result buffer must live in host-allocatable memory.
+    if !mm::is_host_range(
+        buf_paddr,
+        core::mem::size_of::<riscv_cove::host::TsmInfo>(),
+    ) {
         return SbiRet::invalid_address();
     }
 

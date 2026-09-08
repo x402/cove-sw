@@ -2,7 +2,7 @@ pub mod page_table;
 pub mod vcpu;
 
 use crate::SbiRet;
-use crate::mm::{PAGE_SIZE, PageState, page_tracker};
+use crate::mm::{is_host_range, PAGE_SIZE, PageState, page_tracker};
 use page_table::GStagePageTable;
 use riscv_cove::host::TvmCreateParams;
 use vcpu::Vcpu;
@@ -96,6 +96,10 @@ impl TvmManager {
             return SbiRet::invalid_param();
         }
         if params_paddr % core::mem::align_of::<TvmCreateParams>() != 0 {
+            return SbiRet::invalid_address();
+        }
+        // Phase 5.5: the parameter block must live in host-allocatable memory.
+        if !is_host_range(params_paddr, core::mem::size_of::<TvmCreateParams>()) {
             return SbiRet::invalid_address();
         }
 
@@ -238,6 +242,16 @@ impl TvmManager {
             || gpa % PAGE_SIZE != 0
             || num_pages == 0
         {
+            return SbiRet::invalid_address();
+        }
+        // Phase 5.5: the source must be host-allocatable memory. Copying
+        // from TSM-private or MPT-pool pages would leak confidential data
+        // into guest-readable measured pages.
+        let copy_len = match num_pages.checked_mul(PAGE_SIZE) {
+            Some(l) => l,
+            None => return SbiRet::invalid_param(),
+        };
+        if !is_host_range(src_paddr, copy_len) {
             return SbiRet::invalid_address();
         }
 
@@ -421,6 +435,10 @@ impl TvmManager {
 
         if identity_addr != 0 {
             if identity_addr % 64 != 0 {
+                return SbiRet::invalid_address();
+            }
+            // Phase 5.5: the identity block must be host-allocatable memory.
+            if !is_host_range(identity_addr, 64) {
                 return SbiRet::invalid_address();
             }
             unsafe {
@@ -670,6 +688,16 @@ impl TvmManager {
             _ => return SbiRet::invalid_param(),
         };
         if gpa % PAGE_SIZE != 0 || num_pages == 0 {
+            return SbiRet::invalid_address();
+        }
+        // Phase 5.5: shared pages must live in host-allocatable memory.
+        // Mapping TSM-private or MPT-pool pages into the guest would grant
+        // it read/write access to confidential memory through the host MPT.
+        let shared_len = match num_pages.checked_mul(PAGE_SIZE) {
+            Some(l) => l,
+            None => return SbiRet::invalid_param(),
+        };
+        if !is_host_range(dst_paddr, shared_len) {
             return SbiRet::invalid_address();
         }
         let page_table = &tvm.page_table;

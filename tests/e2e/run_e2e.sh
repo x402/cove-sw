@@ -54,6 +54,7 @@ MARKERS=(
   'Resumed after COVG unshare'
   '\[MARKER 14\] HOST: Received TVM exit, tearing down TVM #[0-9]+\.'
   '\[MARKER 15\] HOST: All confidential pages reclaimed successfully\.'
+  'PHASE 5\.5 PASS: HOST_VALIDATION_OK'
   '\[MARKER 16\] HOST: ALL COVE E2E TESTS PASSED!'
 )
 
@@ -95,18 +96,19 @@ if grep -E -q 'PANIC|access fault' "$LOG"; then
 fi
 
 prev_line=0
+total="${#MARKERS[@]}"
 for i in "${!MARKERS[@]}"; do
   n=$((i + 1))
   line=$(grep -n -E -m1 "${MARKERS[$i]}" "$LOG" | head -n 1 | cut -d: -f1)
   if [ -z "$line" ]; then
-    fail "marker $n/16 not found: ${MARKERS[$i]}"
+    fail "marker $n/$total not found: ${MARKERS[$i]}"
   fi
   if [ "$line" -le "$prev_line" ]; then
-    fail "marker $n/16 out of order (line $line, previous marker at line $prev_line)"
+    fail "marker $n/$total out of order (line $line, previous marker at line $prev_line)"
   fi
   prev_line=$line
-  echo "  [ok] marker $(printf '%02d/16' "$n") at line $line"
+  echo "  [ok] marker $(printf '%02d/%d' "$n" "$total") at line $line"
 done
 
-echo "E2E PASS: 16/16 markers matched in order, NEMU exit 0"
+echo "E2E PASS: $total/$total markers matched in order, NEMU exit 0"
 echo "serial log: $LOG"

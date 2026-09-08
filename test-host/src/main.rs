@@ -436,6 +436,62 @@ pub fn sbi_covh_destroy_tvm(tvm_id: usize) -> (usize, usize) {
     (error, value)
 }
 
+/// Raw RDSM private-extension MPT_SET, issued from the host domain.
+/// Phase 5.5: must be rejected with SBI_ERR_DENIED by the sender check.
+pub fn sbi_rdsm_mpt_set_from_host(
+    target_sdid: usize,
+    paddr: usize,
+    len: usize,
+    perm: usize,
+) -> (usize, usize) {
+    let mut error: usize;
+    let mut value: usize;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a7") 0x5244_534D, // EID_RDSM
+            in("a6") 1,           // FID_RDSM_MPT_SET
+            inout("a0") target_sdid => error,
+            inout("a1") paddr => value,
+            in("a2") len,
+            in("a3") perm,
+        );
+    }
+    (error, value)
+}
+
+/// Raw COVH get_tsm_info with an arbitrary (possibly hostile) buffer address.
+pub fn sbi_covh_get_tsm_info_raw(paddr: usize, len: usize) -> (usize, usize) {
+    let mut error: usize;
+    let mut value: usize;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a7") riscv_cove::host::EID_COVH,
+            in("a6") riscv_cove::host::GET_TSM_INFO,
+            inout("a0") paddr => error,
+            inout("a1") len => value,
+        );
+    }
+    (error, value)
+}
+
+/// Raw COVH create_tvm with an arbitrary (possibly hostile) params address.
+pub fn sbi_covh_create_tvm_at(params_paddr: usize, params_len: usize) -> (usize, usize) {
+    let mut error: usize;
+    let mut value: usize;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a7") riscv_cove::host::EID_COVH,
+            in("a6") riscv_cove::host::CREATE_TVM,
+            inout("a0") params_paddr => error,
+            inout("a1") params_len => value,
+        );
+    }
+    (error, value)
+}
+
 const NUM_PAGES: usize = 26;
 
 #[repr(align(16384))]
@@ -673,8 +729,81 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
     println!("[MARKER 15] HOST: All confidential pages reclaimed successfully.");
 
     println!("[HOST] PHASE 4 PASS: FENCE_EXIT_OK");
-    println!("[MARKER 16] HOST: ALL COVE E2E TESTS PASSED!");
 
+    // ── Phase 5.5: hostile-host validation ──────────────────────────────
+    // Every call below must be rejected by the TSM/RDSM input validation.
+    println!("[HOST] PHASE 5.5: hostile-host validation tests...");
+
+    // N1: direct RDSM MPT_SET from the host domain must be denied.
+    let (err, _) = sbi_rdsm_mpt_set_from_host(1, 0x8040_0000, 0x1000, 7);
+    assert_eq!(
+        err,
+        (-8isize) as usize,
+        "host-domain MPT_SET must be SBI_ERR_DENIED"
+    );
+    println!("[HOST] P55-N1 OK: host-domain MPT_SET denied");
+
+    // N2: get_tsm_info into confidential (TSM image) memory.
+    let (err, _) = sbi_covh_get_tsm_info_raw(0x8040_0000, 0x40);
+    assert_ne!(err, 0, "get_tsm_info into TSM memory must fail");
+    println!("[HOST] P55-N2 OK: get_tsm_info bad buffer rejected");
+
+    // N3: converting firmware / TSM image / MPT pool pages must fail.
+    let (err, _) = sbi_covh_convert_pages(0x8040_0000, 1);
+    assert_ne!(err, 0, "converting TSM image must fail");
+    let (err, _) = sbi_covh_convert_pages(0x8090_0000, 1);
+    assert_ne!(err, 0, "converting MPT page pool must fail");
+    let (err, _) = sbi_covh_convert_pages(0x8000_0000, 1);
+    assert_ne!(err, 0, "converting firmware gap must fail");
+    println!("[HOST] P55-N3 OK: reserved-region converts rejected");
+
+    // N4: create_tvm with the parameter block in the TSM image region
+    // (never-written hostile address, page- and 8-byte-aligned).
+    let (err, _) = sbi_covh_create_tvm_at(0x8040_0100, 0x40);
+    assert_ne!(err, 0, "create_tvm with TSM-region params must fail");
+    println!("[HOST] P55-N4 OK: create_tvm hostile params rejected");
+
+    // N5: a second TVM with hostile measured-source / shared-target pages.
+    let (err, _) = sbi_covh_convert_pages(base_paddr, NUM_PAGES);
+    assert_eq!(err, 0, "reconvert for phase 5.5 TVM must succeed");
+    let (err, _) = sbi_covh_global_fence();
+    assert_eq!(err, 0);
+    let (err, _) = sbi_covh_local_fence();
+    assert_eq!(err, 0);
+    let params2 = riscv_cove::host::TvmCreateParams {
+        tvm_page_directory_addr: root_pt_paddr,
+        tvm_state_addr: tvm_state_paddr,
+    };
+    let (err, tvm2) = sbi_covh_create_tvm(&params2);
+    assert_eq!(err, 0, "phase 5.5 TVM creation must succeed");
+    let (err, _) = sbi_covh_add_tvm_memory_region(tvm2, 0x8000_0000, 0x10_0000);
+    assert_eq!(err, 0);
+    let (err, _) = sbi_covh_add_tvm_page_table_pages(tvm2, pt_pool_paddr, 4);
+    assert_eq!(err, 0);
+    // N5a: measured pages sourced from the TSM image must be rejected.
+    let (err, _) = sbi_covh_add_tvm_measured_pages(
+        tvm2,
+        0x8040_0000,
+        guest_dst_paddr,
+        0,
+        1,
+        0x8000_0000,
+    );
+    assert_ne!(err, 0, "measured pages from TSM memory must fail");
+    // N5b: shared pages targeting TSM image memory must be rejected.
+    let (err, _) =
+        sbi_covh_add_tvm_shared_pages(tvm2, 0x8040_0000, 0x8040_0000, 1, 0x8001_1000);
+    assert_ne!(err, 0, "shared pages from TSM memory must fail");
+    println!("[HOST] P55-N5 OK: hostile measured/shared pages rejected");
+
+    let (err, _) = sbi_covh_destroy_tvm(tvm2);
+    assert_eq!(err, 0);
+    let (err, _) = sbi_covh_reclaim_pages(base_paddr, NUM_PAGES);
+    assert_eq!(err, 0);
+
+    println!("[HOST] PHASE 5.5 PASS: HOST_VALIDATION_OK");
+
+    println!("[MARKER 16] HOST: ALL COVE E2E TESTS PASSED!");
     loop {
         unsafe {
             asm!("wfi");
