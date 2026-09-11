@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/rdsm-abi",
+    "crates/rdsm",
+    "crates/rdsm-fw",
     "tsm",
     "test-host",
     "test-guest",

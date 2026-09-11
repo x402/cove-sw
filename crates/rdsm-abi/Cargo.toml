@@ -1,0 +1,11 @@
+[package]
+name = "rdsm-abi"
+description = "Private ABI definitions shared by RDSM (M-mode firmware layer) and its HS-mode callers (TSM / host) in the CoVE software stack"
+version = "0.1.0"
+edition = "2024"
+license = "MulanPSL-2.0 OR MIT"
+repository = "https://github.com/x402/cove-sw"
+keywords = ["riscv", "sbi", "rdsm", "tsm", "smmtt"]
+categories = ["os", "embedded", "hardware-support", "no-std"]
+
+[dependencies]

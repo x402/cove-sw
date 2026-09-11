@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 clap = { version = "4.4", features = ["derive"] }
+rdsm-abi = { path = "../crates/rdsm-abi" }

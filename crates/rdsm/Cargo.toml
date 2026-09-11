@@ -1,0 +1,12 @@
+[package]
+name = "rdsm"
+description = "RDSM (Root Domain Security Manager) substrate for RISC-V Supervisor Domains Access Protection"
+version = "0.1.0"
+edition = "2024"
+license = "MulanPSL-2.0 OR MIT"
+repository = "https://github.com/x402/cove-sw"
+keywords = ["riscv", "sbi", "rdsm", "smmtt"]
+categories = ["os", "embedded", "hardware-support", "no-std"]
+
+[dependencies]
+rdsm-abi = { path = "../rdsm-abi" }

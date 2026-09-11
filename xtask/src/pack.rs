@@ -3,8 +3,10 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-pub const COVE_MAGIC: u32 = 0x434F5645; // "COVE"
-pub const COVE_VERSION: u32 = 1;
+// Payload format constants come from rdsm-abi (single source of truth
+// shared with the RDSM firmware layer).
+pub const COVE_MAGIC: u32 = rdsm_abi::COVE_PAYLOAD_MAGIC;
+pub const COVE_VERSION: u32 = rdsm_abi::COVE_PAYLOAD_VERSION;
 
 pub const TSM_LOAD_PADDR: u64 = 0x80400000;
 pub const TSM_ENTRY_PADDR: u64 = 0x80400000;

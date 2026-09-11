@@ -130,6 +130,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "361a90feb7004eca4019fb28352a9465666b24f840f5c3cddf0ff13920590b89"
 
 [[package]]
+name = "fast-trap"
+version = "0.1.0"
+source = "git+https://github.com/rustsbi/fast-trap?rev=8d855afa#8d855afa3bc207bb102118e41ef768214d9f6f5b"
+
+[[package]]
 name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -149,6 +154,12 @@ checksum = "224399e74b87b5f3557511d98dff8b14089b3dadafcab6bb93eab67d3aace965"
 dependencies = [
  "scopeguard",
 ]
+
+[[package]]
+name = "log"
+version = "0.4.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "once_cell_polyfill"
@@ -187,6 +198,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
 dependencies = [
  "proc-macro2",
+]
+
+[[package]]
+name = "rdsm"
+version = "0.1.0"
+dependencies = [
+ "rdsm-abi",
+]
+
+[[package]]
+name = "rdsm-abi"
+version = "0.1.0"
+
+[[package]]
+name = "rdsm-fw"
+version = "0.1.0"
+dependencies = [
+ "fast-trap",
+ "log",
+ "rdsm",
+ "rdsm-abi",
+ "riscv",
 ]
 
 [[package]]
@@ -273,7 +306,7 @@ dependencies = [
 
 [[package]]
 name = "sbi-spec"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "bitflags",
 ]
@@ -353,6 +386,7 @@ dependencies = [
 name = "test-host"
 version = "0.1.0"
 dependencies = [
+ "rdsm-abi",
  "riscv",
  "riscv-cove",
  "sbi-rt",
@@ -371,6 +405,7 @@ version = "0.1.0"
 dependencies = [
  "data-model",
  "page-tracking",
+ "rdsm-abi",
  "riscv",
  "riscv-cove",
  "riscv-page-tables",
@@ -415,4 +450,5 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "rdsm-abi",
 ]

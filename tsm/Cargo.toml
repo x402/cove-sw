@@ -16,3 +16,4 @@ s-mode-utils = { path = "../vendor/s-mode-utils" }
 riscv-cove = { path = "../../rustsbi/library/riscv-cove" }
 sbi-rt = { path = "../../rustsbi/library/sbi-rt" }
 sbi-spec = { path = "../../rustsbi/library/sbi-spec" }
+rdsm-abi = { path = "../crates/rdsm-abi" }

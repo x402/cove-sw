@@ -1,0 +1,16 @@
+[package]
+name = "rdsm-fw"
+description = "RDSM firmware layer: M-mode Supervisor Domain substrate initialization, private SBI dispatch and domain switching, embedded into the SBI firmware"
+version = "0.1.0"
+edition = "2024"
+license = "MulanPSL-2.0 OR MIT"
+repository = "https://github.com/x402/cove-sw"
+keywords = ["riscv", "sbi", "rdsm", "smmtt", "cove"]
+categories = ["os", "embedded", "hardware-support", "no-std"]
+
+[dependencies]
+rdsm = { path = "../rdsm" }
+rdsm-abi = { path = "../rdsm-abi" }
+log = "0.4"
+riscv = { version = "0.16", default-features = false }
+fast-trap = { git = "https://github.com/rustsbi/fast-trap", rev = "8d855afa", features = ["riscv-m"] }

@@ -1,28 +1,16 @@
+//! Host-side (HS-mode) call wrappers for the private RDSM SBI extension.
+//!
+//! The ABI constants and shared structures live in the `rdsm-abi` crate
+//! (the single source of truth shared with the RDSM firmware layer); this
+//! module only provides the `ecall` convenience wrappers used by the TSM.
+
 use core::arch::asm;
 
-pub const EID_RDSM: usize = 0x5244534D; // "RDSM"
-pub const FID_RDSM_GET_INFO: usize = 0;
-pub const FID_RDSM_MPT_SET: usize = 1;
-pub const FID_RDSM_MFENCE_PA: usize = 2;
-pub const FID_RDSM_TEERET: usize = 3;
+use rdsm_abi::{
+    EID_RDSM, FID_RDSM_GET_INFO, FID_RDSM_MFENCE_PA, FID_RDSM_MPT_SET, FID_RDSM_TEERET,
+};
 
-/// Platform memory layout returned by RDSM_GET_INFO (a2 = buffer).
-/// Host-allocatable whitelist: [tsm_region_end, mpt_pool_start) ∪
-/// [mpt_pool_end, ram_end); everything else is reserved.
-/// Must stay layout-compatible with the RDSM-side definition in
-/// `rustsbi/prototyper/prototyper/src/sbi/rdsm.rs`.
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct RdsmPlatformInfo {
-    pub ram_start: usize,
-    pub ram_end: usize,
-    pub tsm_region_start: usize,
-    pub tsm_region_end: usize,
-    pub mpt_pool_start: usize,
-    pub mpt_pool_end: usize,
-}
-
-const _: () = assert!(core::mem::size_of::<RdsmPlatformInfo>() == 48);
+pub use rdsm_abi::{NORMAL_RETURN, RdsmPlatformInfo, TSM_READY, TVM_EXIT};
 
 /// Query RDSM for the platform layout. Returns `None` when the extension
 /// fails or reports a nonsensical memory map (callers must then fail
@@ -53,11 +41,6 @@ pub fn rdsm_get_platform_info() -> Option<RdsmPlatformInfo> {
     }
     Some(info)
 }
-
-
-pub const NORMAL_RETURN: usize = 0;
-pub const TVM_EXIT: usize = 1;
-pub const TSM_READY: usize = 2;
 
 pub fn rdsm_teeret(reason: usize, a1: usize, a2: usize) -> ! {
     unsafe {

@@ -17,9 +17,10 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TSM_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-RUSTSBI_ROOT="${RUSTSBI_ROOT:-/home/x402/smmtt/rustsbi}"
-NEMU_BIN="${NEMU_BIN:-/home/x402/smmtt/NEMU-cove/build/riscv64-nemu-interpreter}"
-NEMU_DTB="${NEMU_DTB:-/home/x402/smmtt/NEMU-cove/build/nemu.dtb}"
+WORKSPACE_ROOT="$(cd "$TSM_ROOT/.." && pwd)"
+RUSTSBI_ROOT="${RUSTSBI_ROOT:-$WORKSPACE_ROOT/rustsbi}"
+NEMU_BIN="${NEMU_BIN:-$WORKSPACE_ROOT/NEMU/build/riscv64-nemu-interpreter}"
+NEMU_DTB="${NEMU_DTB:-$WORKSPACE_ROOT/NEMU/build/nemu.dtb}"
 NEMU_INSTRS="${NEMU_INSTRS:-10000000}"
 TIMEOUT_SECS="${TIMEOUT_SECS:-60}"
 LOG="${E2E_LOG:-/tmp/cove_e2e.log}"
@@ -72,7 +73,7 @@ echo "== [1/4] Packing cove-payload.bin =="
 [ -f "$PAYLOAD" ] || fail "payload not found at $PAYLOAD"
 
 echo "== [2/4] Building prototyper firmware =="
-(cd "$RUSTSBI_ROOT" && cargo prototyper --fdt "$NEMU_DTB" --payload "$PAYLOAD" >"$BUILD_LOG" 2>&1) || {
+(cd "$RUSTSBI_ROOT" && cargo prototyper build --fdt "$NEMU_DTB" payload "$PAYLOAD" >"$BUILD_LOG" 2>&1) || {
   tail -n 20 "$BUILD_LOG"
   fail "cargo prototyper failed"
 }

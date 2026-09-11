@@ -449,8 +449,8 @@ pub fn sbi_rdsm_mpt_set_from_host(
     unsafe {
         asm!(
             "ecall",
-            in("a7") 0x5244_534D, // EID_RDSM
-            in("a6") 1,           // FID_RDSM_MPT_SET
+            in("a7") rdsm_abi::EID_RDSM,
+            in("a6") rdsm_abi::FID_RDSM_MPT_SET,
             inout("a0") target_sdid => error,
             inout("a1") paddr => value,
             in("a2") len,
