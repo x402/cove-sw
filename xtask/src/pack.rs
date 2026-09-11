@@ -3,8 +3,10 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-// Payload format constants come from rdsm-abi (single source of truth
-// shared with the RDSM firmware layer).
+use rdsm_abi::PayloadHeader;
+
+// Payload layout constants and the header struct come from rdsm-abi
+// (single source of truth shared with the RDSM firmware layer).
 pub const COVE_MAGIC: u32 = rdsm_abi::COVE_PAYLOAD_MAGIC;
 pub const COVE_VERSION: u32 = rdsm_abi::COVE_PAYLOAD_VERSION;
 
@@ -13,48 +15,44 @@ pub const TSM_ENTRY_PADDR: u64 = 0x80400000;
 pub const HOST_LOAD_PADDR: u64 = 0x80800000;
 pub const HOST_ENTRY_PADDR: u64 = 0x80800000;
 
-#[repr(C, align(4096))]
-pub struct PayloadHeader {
-    pub magic: u32,
-    pub version: u32,
-    pub tsm_offset: u64,
-    pub tsm_size: u64,
-    pub tsm_load_paddr: u64,
-    pub tsm_entry_paddr: u64,
-    pub host_offset: u64,
-    pub host_size: u64,
-    pub host_load_paddr: u64,
-    pub host_entry_paddr: u64,
-    pub reserved: [u8; 4024],
+// The payload image leads with one 4 KiB page: the 72-byte payload
+// header followed by zero padding.
+const HEADER_PAGE_SIZE: usize = 4096;
+
+const _: () = assert!(core::mem::size_of::<PayloadHeader>() == 72);
+
+fn build_header(
+    tsm_offset: u64,
+    tsm_size: u64,
+    host_offset: u64,
+    host_size: u64,
+) -> PayloadHeader {
+    PayloadHeader {
+        magic: COVE_MAGIC,
+        version: COVE_VERSION,
+        tsm_offset,
+        tsm_size,
+        tsm_load_paddr: TSM_LOAD_PADDR,
+        tsm_entry_paddr: TSM_ENTRY_PADDR,
+        host_offset,
+        host_size,
+        host_load_paddr: HOST_LOAD_PADDR,
+        host_entry_paddr: HOST_ENTRY_PADDR,
+    }
 }
 
-const _: () = assert!(core::mem::size_of::<PayloadHeader>() == 4096);
-
-impl PayloadHeader {
-    pub fn new(tsm_offset: u64, tsm_size: u64, host_offset: u64, host_size: u64) -> Self {
-        Self {
-            magic: COVE_MAGIC,
-            version: COVE_VERSION,
-            tsm_offset,
-            tsm_size,
-            tsm_load_paddr: TSM_LOAD_PADDR,
-            tsm_entry_paddr: TSM_ENTRY_PADDR,
-            host_offset,
-            host_size,
-            host_load_paddr: HOST_LOAD_PADDR,
-            host_entry_paddr: HOST_ENTRY_PADDR,
-            reserved: [0u8; 4024],
-        }
-    }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        unsafe {
-            core::slice::from_raw_parts(
-                self as *const Self as *const u8,
-                core::mem::size_of::<Self>(),
-            )
-        }
-    }
+fn header_page(header: &PayloadHeader) -> [u8; HEADER_PAGE_SIZE] {
+    // SAFETY: `PayloadHeader` is `repr(C)` with no interior padding (two
+    // u32 followed by eight u64), so its 72 bytes may be read as bytes.
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            header as *const PayloadHeader as *const u8,
+            core::mem::size_of::<PayloadHeader>(),
+        )
+    };
+    let mut page = [0u8; HEADER_PAGE_SIZE];
+    page[..bytes.len()].copy_from_slice(bytes);
+    page
 }
 
 fn align_up(val: u64, align: u64) -> u64 {
@@ -62,15 +60,15 @@ fn align_up(val: u64, align: u64) -> u64 {
 }
 
 pub fn run_pack(output_path: Option<PathBuf>) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let tsm_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-    let target_dir = tsm_root
+    let cove_sw_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let target_dir = cove_sw_root
         .join("target")
         .join("riscv64gc-unknown-none-elf")
         .join("release");
 
     println!("[xtask] Building test-guest...");
     let status = Command::new("cargo")
-        .current_dir(tsm_root)
+        .current_dir(cove_sw_root)
         .args([
             "build",
             "-p",
@@ -101,7 +99,7 @@ pub fn run_pack(output_path: Option<PathBuf>) -> Result<PathBuf, Box<dyn std::er
 
     println!("[xtask] Building test-host...");
     let status = Command::new("cargo")
-        .current_dir(tsm_root)
+        .current_dir(cove_sw_root)
         .args([
             "build",
             "-p",
@@ -132,7 +130,7 @@ pub fn run_pack(output_path: Option<PathBuf>) -> Result<PathBuf, Box<dyn std::er
 
     println!("[xtask] Building tsm...");
     let status = Command::new("cargo")
-        .current_dir(tsm_root)
+        .current_dir(cove_sw_root)
         .args([
             "build",
             "-p",
@@ -169,7 +167,7 @@ pub fn run_pack(output_path: Option<PathBuf>) -> Result<PathBuf, Box<dyn std::er
     let host_offset = align_up(tsm_offset + tsm_size, 4096);
     let host_size = host_data.len() as u64;
 
-    let header = PayloadHeader::new(tsm_offset, tsm_size, host_offset, host_size);
+    let header = build_header(tsm_offset, tsm_size, host_offset, host_size);
 
     let out_file_path = output_path.unwrap_or_else(|| target_dir.join("cove-payload.bin"));
     if let Some(parent) = out_file_path.parent() {
@@ -177,7 +175,7 @@ pub fn run_pack(output_path: Option<PathBuf>) -> Result<PathBuf, Box<dyn std::er
     }
 
     let mut out_file = File::create(&out_file_path)?;
-    out_file.write_all(header.as_bytes())?;
+    out_file.write_all(&header_page(&header))?;
 
     // Write TSM
     out_file.seek(SeekFrom::Start(tsm_offset))?;
