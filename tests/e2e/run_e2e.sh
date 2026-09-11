@@ -2,7 +2,7 @@
 # CoVE end-to-end test runner (Phase 5).
 #
 # Builds the full stack (test-guest/test-host/tsm -> cove-payload.bin ->
-# rustsbi-prototyper firmware), boots it under NEMU, and verifies the 16
+# rustsbi-prototyper firmware), boots it under NEMU, and verifies the 17
 # canonical serial markers appear in order without panics or access faults.
 #
 # Usage:
@@ -10,14 +10,14 @@
 #   NEMU_BIN=... NEMU_DTB=... ./run_e2e.sh   # override tool paths
 #   TIMEOUT_SECS=120 ./run_e2e.sh    # longer NEMU timeout
 #
-# Exit codes: 0 = all 16 markers matched in order; 1 = build/run/marker failure.
+# Exit codes: 0 = all 17 markers matched in order; 1 = build/run/marker failure.
 # Serial log is kept at /tmp/cove_e2e.log (override with E2E_LOG).
 
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TSM_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-WORKSPACE_ROOT="$(cd "$TSM_ROOT/.." && pwd)"
+COVE_SW_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+WORKSPACE_ROOT="$(cd "$COVE_SW_ROOT/.." && pwd)"
 RUSTSBI_ROOT="${RUSTSBI_ROOT:-$WORKSPACE_ROOT/rustsbi}"
 NEMU_BIN="${NEMU_BIN:-$WORKSPACE_ROOT/NEMU/build/riscv64-nemu-interpreter}"
 NEMU_DTB="${NEMU_DTB:-$WORKSPACE_ROOT/NEMU/build/nemu.dtb}"
@@ -26,7 +26,7 @@ TIMEOUT_SECS="${TIMEOUT_SECS:-60}"
 LOG="${E2E_LOG:-/tmp/cove_e2e.log}"
 BUILD_LOG="${BUILD_LOG:-/tmp/cove_e2e_build.log}"
 
-PAYLOAD="$TSM_ROOT/target/riscv64gc-unknown-none-elf/release/cove-payload.bin"
+PAYLOAD="$COVE_SW_ROOT/target/riscv64gc-unknown-none-elf/release/cove-payload.bin"
 FIRMWARE="$RUSTSBI_ROOT/target/riscv64gc-unknown-none-elf/release/rustsbi-prototyper-payload.bin"
 
 # Canonical E2E markers (extended-regex), must appear in this exact order.
@@ -66,7 +66,7 @@ fail() {
 }
 
 echo "== [1/4] Packing cove-payload.bin =="
-(cd "$TSM_ROOT" && cargo xtask pack >"$BUILD_LOG" 2>&1) || {
+(cd "$COVE_SW_ROOT" && cargo xtask pack >"$BUILD_LOG" 2>&1) || {
   tail -n 20 "$BUILD_LOG"
   fail "cargo xtask pack failed"
 }

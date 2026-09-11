@@ -549,7 +549,7 @@ impl TvmManager {
             // Unmap from G-stage (guest loses access)
             let _ = tvm.page_table.unmap_4k(cur_gpa);
             // Grant Host (SDID=0) RW access to the SPA
-            let (err, _) = crate::rdsm::rdsm_mpt_set(0, spa, PAGE_SIZE, 3);
+            let (err, _) = crate::rdsm_shim::rdsm_mpt_set(0, spa, PAGE_SIZE, 3);
             if err != 0 {
                 all_ok = false;
             }
@@ -592,7 +592,7 @@ impl TvmManager {
                 Some(spa) => spa,
                 None => return false,
             };
-            if crate::rdsm::rdsm_mpt_set(0, spa, PAGE_SIZE, 0).0 != 0 {
+            if crate::rdsm_shim::rdsm_mpt_set(0, spa, PAGE_SIZE, 0).0 != 0 {
                 return false;
             }
             if !page_tracker().clear_shared(spa, tvm.id) {
@@ -612,7 +612,7 @@ impl TvmManager {
             }
         }
 
-        let _ = crate::rdsm::rdsm_mfence_pa(0, 0);
+        let _ = crate::rdsm_shim::rdsm_mfence_pa(0, 0);
         unsafe {
             core::arch::asm!("hfence.gvma");
         }

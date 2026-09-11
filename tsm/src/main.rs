@@ -4,7 +4,7 @@
 extern crate alloc;
 
 pub mod mm;
-pub mod rdsm;
+pub mod rdsm_shim;
 pub mod tvm;
 
 use core::arch::{asm, naked_asm};
@@ -12,7 +12,7 @@ use core::fmt::{self, Write};
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use mm::page_tracker;
-use rdsm::{NORMAL_RETURN, TSM_READY, rdsm_mfence_pa, rdsm_teeret};
+use rdsm_shim::{NORMAL_RETURN, TSM_READY, rdsm_mfence_pa, rdsm_teeret};
 use tvm::tvm_manager;
 
 pub const TSM_IMPL_CUSTOM: u32 = 0x54534D31; // "TSM1"
@@ -128,7 +128,7 @@ pub extern "C" fn tsm_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
     // Phase 5.5: obtain the platform reserved-region layout from RDSM and
     // build the host-allocatable whitelist. Fail closed on error: without
     // a known memory map, every host-supplied address would be rejected.
-    match rdsm::rdsm_get_platform_info() {
+    match rdsm_shim::rdsm_get_platform_info() {
         Some(info) => mm::init_host_regions(&info),
         None => {
             println!("[TSM PANIC] RDSM_GET_INFO failed, refusing to start");

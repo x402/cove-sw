@@ -20,7 +20,7 @@ SBI 协议是私有的、不受其他组件影响，因此合并为本仓库统�
 - `tsm/`、`test-host/`、`test-guest/` — HS-mode TSM 内核与测试 VMM/负载。
 - `xtask/` — `cargo xtask pack` 打包 cove-payload.bin（TSM@0x80400000, Host@0x80800000）。
 - `vendor/` — vendored 依赖（data-model、riscv-page-tables 等，来自 Rivos salus 系）。
-- `tests/e2e/run_e2e.sh` — 一键端到端回归（16 个串行 marker 顺序校验）。
+- `tests/e2e/run_e2e.sh` — 一键端到端回归（17 个串行 marker 顺序校验）。
 
 ## 构建与验证
 

@@ -1,5 +1,5 @@
 use crate::SbiRet;
-use crate::rdsm::{rdsm_mfence_pa, rdsm_mpt_set};
+use crate::rdsm_shim::{rdsm_mfence_pa, rdsm_mpt_set};
 
 pub const PAGE_SIZE: usize = 4096;
 pub const MAX_PAGES: usize = 512;
@@ -15,7 +15,7 @@ static mut HOST_REGIONS: [(usize, usize); 2] = [(0, 0); 2];
 static mut HOST_REGIONS_READY: bool = false;
 
 /// Populate the whitelist from the RDSM-provided platform layout.
-pub fn init_host_regions(info: &crate::rdsm::RdsmPlatformInfo) {
+pub fn init_host_regions(info: &crate::rdsm_shim::RdsmPlatformInfo) {
     let regions: [(usize, usize); 2] = [
         (info.tsm_region_end, info.mpt_pool_start),
         (info.mpt_pool_end, info.ram_end),
