@@ -220,6 +220,7 @@ dependencies = [
  "rdsm",
  "rdsm-abi",
  "riscv",
+ "riscv-cove",
 ]
 
 [[package]]
@@ -379,7 +380,6 @@ version = "0.1.0"
 dependencies = [
  "riscv",
  "sbi-rt",
- "sbi-spec",
 ]
 
 [[package]]
@@ -390,7 +390,6 @@ dependencies = [
  "riscv",
  "riscv-cove",
  "sbi-rt",
- "sbi-spec",
 ]
 
 [[package]]
@@ -413,7 +412,6 @@ dependencies = [
  "riscv-regs",
  "s-mode-utils",
  "sbi-rt",
- "sbi-spec",
  "spin",
  "sync",
 ]

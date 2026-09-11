@@ -37,16 +37,10 @@ pub const TVM_EXIT: usize = 1;
 /// Parameter a0 value for TSM_READY: 2.
 pub const TSM_READY: usize = 2;
 
-// ── CoVE Extension ID constants handled by the RDSM forwarding path ────
-
-/// Extension ID for Supervisor Domains Enumeration Extension: 0x53555044 ("SUPD").
-pub const EID_SUPD: usize = 0x53555044;
-
-/// Extension ID for CoVE Host Extension: 0x434F5648 ("COVH").
-pub const EID_COVH: usize = 0x434F5648;
-
-/// Extension ID for CoVE Interrupt Extension: 0x434F5649 ("COVI").
-pub const EID_COVI: usize = 0x434F5649;
+// ── Standard CoVE extension IDs (SUPD / COVH / COVI) are deliberately
+// NOT defined here: their single source is the upstream `riscv-cove`
+// crate, re-exported through rdsm-fw. This crate only owns the private
+// RDSM↔TSM contract. ────────────────────────────────────────────────────
 
 // ── CoVE payload image format ──────────────────────────────────────────
 

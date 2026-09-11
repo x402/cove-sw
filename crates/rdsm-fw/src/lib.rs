@@ -37,9 +37,14 @@ use rdsm::mpt::MptPageAlloc;
 // Re-export the substrate and the shared ABI so embedders only need to
 // depend on this crate.
 pub use rdsm;
+// Standard CoVE extension IDs: single source is the upstream riscv-cove
+// crate; re-exported here so embedders keep one import site.
+pub use riscv_cove::host::EID_COVH;
+pub use riscv_cove::interrupt::EID_COVI;
+pub use riscv_cove::supd::EID_SUPD;
 pub use rdsm_abi::{
-    COVE_PAYLOAD_MAGIC, COVE_PAYLOAD_VERSION, EID_COVH, EID_COVI, EID_RDSM, EID_SUPD,
-    FID_RDSM_GET_INFO, FID_RDSM_MFENCE_PA, FID_RDSM_MPT_SET, FID_RDSM_TEERET, NORMAL_RETURN,
+    COVE_PAYLOAD_MAGIC, COVE_PAYLOAD_VERSION, EID_RDSM, FID_RDSM_GET_INFO,
+    FID_RDSM_MFENCE_PA, FID_RDSM_MPT_SET, FID_RDSM_TEERET, NORMAL_RETURN,
     PayloadHeader, RdsmPlatformInfo, TSM_READY, TVM_EXIT,
 };
 
@@ -981,7 +986,7 @@ pub extern "C" fn handle_rdsm_entire(ctx: fast_trap::EntireContext) -> fast_trap
     {
         let caller_sdid = rdsm::csr::Mmpt::read().sdid();
         if caller_sdid != rdsm_context().conf_sdid {
-            regs.a[0] = (-8isize) as usize; // SBI_ERR_DENIED
+            regs.a[0] = (-8isize) as usize; // private error code; non-zero only (SBI DENIED is -4)
             regs.a[1] = 0;
             let epc = riscv::register::mepc::read();
             unsafe {
@@ -1275,7 +1280,7 @@ pub extern "C" fn handle_rdsm_entire(ctx: fast_trap::EntireContext) -> fast_trap
                 }
                 _ => {
                     error!("RDSM: Unsupported TEERET reason: {}", reason);
-                    regs.a[0] = (-1isize) as usize; // SBI_ERR_NOT_SUPPORTED
+                    regs.a[0] = (-1isize) as usize; // private error code; non-zero only (SBI NOT_SUPPORTED is -2)
                     regs.a[1] = 0;
                     let epc = riscv::register::mepc::read();
                     unsafe {
@@ -1286,7 +1291,7 @@ pub extern "C" fn handle_rdsm_entire(ctx: fast_trap::EntireContext) -> fast_trap
             }
         }
         _ => {
-            regs.a[0] = (-1isize) as usize; // SBI_ERR_NOT_SUPPORTED
+            regs.a[0] = (-1isize) as usize; // private error code; non-zero only (SBI NOT_SUPPORTED is -2)
             regs.a[1] = 0;
             let epc = riscv::register::mepc::read();
             unsafe {

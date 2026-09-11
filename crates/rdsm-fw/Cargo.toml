@@ -11,6 +11,9 @@ categories = ["os", "embedded", "hardware-support", "no-std"]
 [dependencies]
 rdsm = { path = "../rdsm" }
 rdsm-abi = { path = "../rdsm-abi" }
+# Standard CoVE ABI (SUPD / COVH / COVI EIDs and shared layout types);
+# single source for the constants rdsm-fw re-exports.
+riscv-cove = { path = "../../../rustsbi/library/riscv-cove" }
 log = "0.4"
 riscv = { version = "0.16", default-features = false }
 fast-trap = { git = "https://github.com/rustsbi/fast-trap", rev = "8d855afa", features = ["riscv-m"] }
