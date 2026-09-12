@@ -5,6 +5,7 @@ use crate::SbiRet;
 use crate::mm::{is_host_range, PAGE_SIZE, PageState, page_tracker};
 use page_table::GStagePageTable;
 use riscv_cove::host::TvmCreateParams;
+use spin::{Mutex, MutexGuard};
 use vcpu::Vcpu;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,7 +113,7 @@ impl TvmManager {
             return SbiRet::invalid_address();
         }
 
-        let tracker = page_tracker();
+        let mut tracker = page_tracker();
         if !tracker.is_converted_and_free(params.tvm_page_directory_addr, 4) {
             return SbiRet::invalid_param();
         }
@@ -194,7 +195,7 @@ impl TvmManager {
             return SbiRet::invalid_address();
         }
 
-        let tracker = page_tracker();
+        let mut tracker = page_tracker();
         if !tracker.is_converted_and_free(base_paddr, num_pages) {
             return SbiRet::invalid_param();
         }
@@ -273,7 +274,7 @@ impl TvmManager {
             return SbiRet::invalid_param();
         }
 
-        let tracker = page_tracker();
+        let mut tracker = page_tracker();
         if !tracker.is_converted_and_free(dst_paddr, num_pages) {
             return SbiRet::invalid_param();
         }
@@ -336,7 +337,7 @@ impl TvmManager {
             return SbiRet::invalid_address();
         }
 
-        let tracker = page_tracker();
+        let mut tracker = page_tracker();
         if !tracker.is_converted_and_free(dst_paddr, num_pages) {
             return SbiRet::invalid_param();
         }
@@ -389,7 +390,7 @@ impl TvmManager {
             return SbiRet::invalid_address();
         }
 
-        let tracker = page_tracker();
+        let mut tracker = page_tracker();
         if !tracker.is_converted_and_free(state_paddr, 2) {
             return SbiRet::invalid_param();
         }
@@ -453,30 +454,6 @@ impl TvmManager {
         tvm.state = TvmState::Runnable;
 
         SbiRet::success(0)
-    }
-
-    pub fn run_tvm_vcpu(&mut self, tvm_id: usize, vcpu_id: usize) -> SbiRet {
-        let tvm = match self.active_tvm.as_mut() {
-            Some(t) if t.id == tvm_id => t,
-            _ => return SbiRet::invalid_param(),
-        };
-
-        if tvm.state != TvmState::Runnable {
-            return SbiRet::invalid_param();
-        }
-
-        let vcpu = match tvm.vcpu.as_mut() {
-            Some(v) if v.id == vcpu_id => v,
-            _ => return SbiRet::invalid_param(),
-        };
-
-        let res = vcpu.run();
-        if res == 0 {
-            let exit = vcpu::last_exit();
-            SbiRet::success(exit.reason)
-        } else {
-            SbiRet::failed()
-        }
     }
 
     // ---- Phase 4: COVG internal handlers (called from vcpu trap handler) ----
@@ -637,7 +614,7 @@ impl TvmManager {
         }
 
         // Find a free page from the tracker
-        let tracker = page_tracker();
+        let mut tracker = page_tracker();
         let free_page = match tracker.find_free_page() {
             Some(p) => p,
             None => return false,
@@ -788,7 +765,7 @@ impl TvmManager {
         }
 
         // Find and release the SPA pages back to the free pool
-        let tracker = page_tracker();
+        let mut tracker = page_tracker();
         let num_pages = length / PAGE_SIZE;
         for i in 0..num_pages {
             let cur_gpa = gpa + i * PAGE_SIZE;
@@ -812,7 +789,7 @@ impl TvmManager {
             _ => return SbiRet::invalid_param(),
         };
 
-        let tracker = page_tracker();
+        let mut tracker = page_tracker();
         tracker.release_tvm_pages(tvm_id);
 
         self.active_tvm = None;
@@ -821,8 +798,56 @@ impl TvmManager {
     }
 }
 
-pub static mut TVM_MANAGER: TvmManager = TvmManager::new();
+/// Shared TVM manager.
+///
+/// The mutex is only ever held for short configuration operations
+/// (create/finalize/destroy/map/unmap …). It must **never** be held across
+/// the vCPU run loop: a guest trap re-enters [`tvm_manager`] from the same
+/// hart and would self-deadlock (see [`run_tvm_vcpu`]).
+static TVM_MANAGER: Mutex<TvmManager> = Mutex::new(TvmManager::new());
 
-pub fn tvm_manager() -> &'static mut TvmManager {
-    unsafe { &mut *core::ptr::addr_of_mut!(TVM_MANAGER) }
+/// Locks and returns the shared TVM manager.
+pub fn tvm_manager() -> MutexGuard<'static, TvmManager> {
+    TVM_MANAGER.lock()
+}
+
+/// Runs a TVM vCPU until its next exit.
+///
+/// Phase 5.6 lock-boundary red line: no lock may be held while the guest
+/// runs, so the vCPU is detached from the manager for the duration of the
+/// run and re-attached after the exit. Guest-exit state lives in the
+/// vCPU's own context (per-hart state), not in shared globals.
+pub fn run_tvm_vcpu(tvm_id: usize, vcpu_id: usize) -> SbiRet {
+    let mut vcpu = {
+        let mut mgr = tvm_manager();
+        let tvm = match mgr.active_tvm.as_mut() {
+            Some(t) if t.id == tvm_id => t,
+            _ => return SbiRet::invalid_param(),
+        };
+        if tvm.state != TvmState::Runnable {
+            return SbiRet::invalid_param();
+        }
+        match tvm.vcpu.as_ref() {
+            Some(v) if v.id == vcpu_id => {}
+            _ => return SbiRet::invalid_param(),
+        }
+        tvm.vcpu.take().expect("vcpu presence checked above")
+    };
+
+    let res = vcpu.run();
+    let exit_reason = vcpu.ctx.last_exit.reason;
+
+    let mut mgr = tvm_manager();
+    match mgr.active_tvm.as_mut() {
+        // The TVM must still be the one the vCPU was detached from; a
+        // concurrent destroy while detached is a torn state, reported as
+        // a failed run.
+        Some(t) if t.id == tvm_id => t.vcpu = Some(vcpu),
+        _ => return SbiRet::failed(),
+    }
+    if res == 0 {
+        SbiRet::success(exit_reason)
+    } else {
+        SbiRet::failed()
+    }
 }

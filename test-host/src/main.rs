@@ -476,6 +476,22 @@ pub fn sbi_covh_get_tsm_info_raw(paddr: usize, len: usize) -> (usize, usize) {
     (error, value)
 }
 
+/// Raw COVH ecall with an arbitrary (possibly hostile) function id.
+pub fn sbi_covh_raw_fid(fid: usize) -> (usize, usize) {
+    let mut error: usize;
+    let mut value: usize;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a7") riscv_cove::host::EID_COVH,
+            in("a6") fid,
+            lateout("a0") error,
+            lateout("a1") value,
+        );
+    }
+    (error, value)
+}
+
 /// Raw COVH create_tvm with an arbitrary (possibly hostile) params address.
 pub fn sbi_covh_create_tvm_at(params_paddr: usize, params_len: usize) -> (usize, usize) {
     let mut error: usize;
@@ -795,6 +811,60 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
         sbi_covh_add_tvm_shared_pages(tvm2, 0x8040_0000, 0x8040_0000, 1, 0x8001_1000);
     assert_ne!(err, 0, "shared pages from TSM memory must fail");
     println!("[HOST] P55-N5 OK: hostile measured/shared pages rejected");
+
+    // N8: running a vCPU of a not-yet-finalized TVM must be rejected
+    // (tvm2 is still in the Initializing state at this point).
+    let (err, _) = sbi_covh_run_tvm_vcpu(tvm2, 0);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "run_tvm_vcpu before finalize must be SBI_ERR_INVALID_PARAM"
+    );
+    println!("[HOST] P55-N8 OK: run of unfinalized TVM rejected");
+
+    // Give tvm2 a vCPU and finalize it once so that the repeat-finalize
+    // rejection (N6) can be exercised against a legally finalized TVM.
+    let (err, _) = sbi_covh_create_tvm_vcpu(tvm2, 0, vcpu_state_paddr);
+    assert_eq!(err, 0, "phase 5.5 vcpu creation must succeed");
+    let (err, _) = sbi_covh_finalize_tvm(tvm2, 0x8000_0000, 0, 0);
+    assert_eq!(err, 0, "phase 5.5 TVM finalize must succeed");
+
+    // N6: finalizing an already-finalized TVM must be rejected.
+    let (err, _) = sbi_covh_finalize_tvm(tvm2, 0x8000_0000, 0, 0);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "repeat finalize_tvm must be SBI_ERR_INVALID_PARAM"
+    );
+    println!("[HOST] P55-N6 OK: repeat finalize rejected");
+
+    // N7: destroying a TVM id that does not exist must be rejected.
+    let (err, _) = sbi_covh_destroy_tvm(0xDEAD);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "destroy_tvm of unknown id must be SBI_ERR_INVALID_PARAM"
+    );
+    println!("[HOST] P55-N7 OK: destroy of unknown TVM id rejected");
+
+    // N9: converting a page already owned by the live TVM (part of its page
+    // table pool) must be rejected by the page-state machine.
+    let (err, _) = sbi_covh_convert_pages(pt_pool_paddr, 1);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "convert of TVM-owned page must be SBI_ERR_INVALID_PARAM"
+    );
+    println!("[HOST] P55-N9 OK: convert of TVM-owned page rejected");
+
+    // N10: an unknown COVH function id must be reported as not supported.
+    let (err, _) = sbi_covh_raw_fid(0xFF);
+    assert_eq!(
+        err,
+        (-2isize) as usize,
+        "unknown COVH FID must be SBI_ERR_NOT_SUPPORTED"
+    );
+    println!("[HOST] P55-N10 OK: unknown COVH FID rejected");
 
     let (err, _) = sbi_covh_destroy_tvm(tvm2);
     assert_eq!(err, 0);

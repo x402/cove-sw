@@ -13,7 +13,7 @@ use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use mm::page_tracker;
 use rdsm_shim::{NORMAL_RETURN, TSM_READY, rdsm_mfence_pa, rdsm_teeret};
-use tvm::tvm_manager;
+use tvm::{run_tvm_vcpu, tvm_manager};
 
 pub const TSM_IMPL_CUSTOM: u32 = 0x54534D31; // "TSM1"
 pub const TSM_VERSION: u32 = 1;
@@ -63,13 +63,24 @@ unsafe impl core::alloc::GlobalAlloc for BumpAlloc {
     unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
         let align = layout.align();
         let size = layout.size();
-        let current = self.next.load(Ordering::Relaxed);
-        let aligned = (current + align - 1) & !(align - 1);
-        if aligned + size > self.heap.len() {
-            return core::ptr::null_mut();
+        // CAS loop: a plain load/store pair would let two harts both
+        // succeed on the same bump offset.
+        let mut current = self.next.load(Ordering::Relaxed);
+        loop {
+            let aligned = (current + align - 1) & !(align - 1);
+            if aligned + size > self.heap.len() {
+                return core::ptr::null_mut();
+            }
+            match self.next.compare_exchange_weak(
+                current,
+                aligned + size,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return unsafe { self.heap.as_ptr().add(aligned) as *mut u8 },
+                Err(next) => current = next,
+            }
         }
-        self.next.store(aligned + size, Ordering::Relaxed);
-        unsafe { self.heap.as_ptr().add(aligned) as *mut u8 }
     }
     unsafe fn dealloc(&self, _ptr: *mut u8, _layout: core::alloc::Layout) {}
 }
@@ -105,11 +116,32 @@ pub unsafe extern "C" fn _start() -> ! {
     )
 }
 
+/// Maximum harts the TSM keeps dispatch stacks for (matches rdsm-fw's
+/// `NUM_HARTS_MAX` convention).
+pub const NUM_HARTS_MAX: usize = 8;
+
+/// 64 KiB per hart, same size as the boot stack.
+const DISPATCH_STACK_SIZE: usize = 0x10000;
+
+/// Per-hart dispatch stacks (phase 5.6): concurrent harts must not share
+/// one stack, since a dispatch may span the whole vCPU run loop.
+#[repr(C, align(16))]
+struct DispatchStacks([u8; DISPATCH_STACK_SIZE * NUM_HARTS_MAX]);
+
+#[unsafe(no_mangle)]
+static mut DISPATCH_STACKS: DispatchStacks =
+    DispatchStacks([0; DISPATCH_STACK_SIZE * NUM_HARTS_MAX]);
+
 #[unsafe(naked)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tsm_dispatch_entry() -> ! {
     naked_asm!(
-        "la sp, boot_stack_top",
+        // Stack indexed by the hart id kept in `scontext` (0x5a8) since
+        // TSM boot; `mhartid` is not readable in HS-mode.
+        "csrr t0, 0x5a8",
+        "la t1, DISPATCH_STACKS",
+        "slli t0, t0, 16",
+        "add sp, t1, t0",
         "call tsm_dispatch",
         // tsm_dispatch returns (error, value) in a0, a1
         // Forward back to RDSM: rdsm_teeret(NORMAL_RETURN, error, value)
@@ -124,7 +156,16 @@ pub unsafe extern "C" fn tsm_dispatch_entry() -> ! {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn tsm_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
+pub extern "C" fn tsm_main(hart_id: usize, _fdt_paddr: usize) -> ! {
+    // Keep the hart id in `scontext` (0x5a8), the privileged spec's
+    // recommended hart-id scratch. RDSM saves/restores S-mode CSRs across
+    // domain switches, so the value survives TEECALL/TEERET and gives the
+    // HS-mode dispatch entry its per-hart stack index (`mhartid` itself is
+    // not readable in HS-mode).
+    unsafe {
+        asm!("csrw 0x5a8, {}", in(reg) hart_id);
+    }
+
     // Phase 5.5: obtain the platform reserved-region layout from RDSM and
     // build the host-allocatable whitelist. Fail closed on error: without
     // a known memory map, every host-supplied address would be rejected.
@@ -229,7 +270,7 @@ pub extern "C" fn tsm_dispatch(
                 tvm_manager().add_zero_pages(a0, a1, a2, a3, a4)
             }
             riscv_cove::host::CREATE_TVM_VCPU => tvm_manager().create_tvm_vcpu(a0, a1, a2),
-            riscv_cove::host::RUN_TVM_VCPU => tvm_manager().run_tvm_vcpu(a0, a1),
+            riscv_cove::host::RUN_TVM_VCPU => run_tvm_vcpu(a0, a1),
             riscv_cove::host::ADD_TVM_SHARED_PAGES => {
                 tvm_manager().add_shared_pages(a0, a1, a2, a3, a4)
             }

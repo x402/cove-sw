@@ -24,11 +24,12 @@
 //! 4. Access check order: page table -> PMP -> MPT -> all must pass.
 
 #![no_std]
-// The ported firmware layer keeps the upstream prototyper's `static mut`
-// single-hart globals (THCS, RDSM context, ID allocators).
-#![allow(static_mut_refs)]
+// Remaining `static mut` uses (per-hart THCS / RDSM context arrays) are only
+// ever touched through `addr_of_mut!` from the owning hart, never through
+// shared references.
 
 use log::{error, info, warn};
+use spin::Once;
 
 use rdsm::domain::SdidAllocator;
 use rdsm::interrupt::SidnAllocator;
@@ -65,7 +66,7 @@ pub struct RdsmHooks {
     pub write_tp: fn(usize),
 }
 
-static mut HOOKS: Option<RdsmHooks> = None;
+static HOOKS: Once<RdsmHooks> = Once::new();
 
 /// Returns the firmware hooks registered during [`init`].
 ///
@@ -74,7 +75,7 @@ static mut HOOKS: Option<RdsmHooks> = None;
 /// Panics if called before [`init`].
 #[inline]
 pub fn hooks() -> &'static RdsmHooks {
-    unsafe { HOOKS.as_ref().expect("RDSM hooks not initialized") }
+    HOOKS.get().expect("RDSM hooks not initialized")
 }
 
 /// Everything the embedding firmware must provide once, at boot.
@@ -204,24 +205,64 @@ impl Thcs {
     }
 }
 
-pub static mut THCS: Thcs = Thcs::new();
+/// Maximum number of harts supported by the per-hart RDSM state.
+///
+/// Mirrors the RustSBI Prototyper's `cfg::NUM_HART_MAX` convention
+/// (platform configs currently allow up to 8).
+pub const NUM_HARTS_MAX: usize = 8;
 
+/// Hardware hart ID of the calling hart (M-mode only; this crate's globals
+/// are only accessed from M-mode trap handlers and boot code).
+#[inline]
+pub fn current_hart_id() -> usize {
+    #[cfg(target_arch = "riscv64")]
+    {
+        riscv::register::mhartid::read()
+    }
+    #[cfg(not(target_arch = "riscv64"))]
+    {
+        0
+    }
+}
+
+/// Per-hart Thread / Hart Context Structure.
+///
+/// Domain-switch saved contexts are inherently per-hart state: each hart
+/// saves its host context into its own `hssa` and resumes its own `tssa`.
+/// Indexing is by `mhartid`; a hart only touches its own slot, so no
+/// locking is required.
+static mut THCS: [Thcs; NUM_HARTS_MAX] = [const { Thcs::new() }; NUM_HARTS_MAX];
+
+/// Returns the calling hart's THCS slot.
+///
+/// # Panics
+///
+/// Panics if the hart id is out of range (`>= [`NUM_HARTS_MAX`]`).
 #[inline]
 #[allow(dead_code)]
 pub fn thcs() -> &'static Thcs {
-    unsafe { &THCS }
+    let hart = current_hart_id();
+    assert!(hart < NUM_HARTS_MAX, "hart id out of range");
+    unsafe { &*core::ptr::addr_of!(THCS[hart]) }
 }
 
+/// Returns the calling hart's THCS slot for mutation.
+///
+/// # Panics
+///
+/// Panics if the hart id is out of range (`>= [`NUM_HARTS_MAX`]`).
 #[inline]
 #[allow(dead_code)]
 pub unsafe fn thcs_mut() -> &'static mut Thcs {
-    unsafe { &mut THCS }
+    let hart = current_hart_id();
+    assert!(hart < NUM_HARTS_MAX, "hart id out of range");
+    unsafe { &mut *core::ptr::addr_of_mut!(THCS[hart]) }
 }
 
 #[inline]
 #[allow(dead_code)]
 pub fn is_tsm_ready() -> bool {
-    unsafe { THCS.tsm_ready }
+    thcs().tsm_ready
 }
 
 /// Save all S-mode, HS-mode and VS-mode CSRs of the current domain into `ctx`.
@@ -414,48 +455,69 @@ impl RdsmContext {
     }
 }
 
-static mut RDSM_CONTEXT: RdsmContext = RdsmContext::new();
+/// Per-hart RDSM context (dual-MPT state, payload header info, FDT address).
+///
+/// Each hart that participates in domain switching keeps its own copy: the
+/// boot hart populates it during [`init`], and a secondary hart's copy is
+/// populated by its own RDSM bring-up (pending NEMU multi-hart execution,
+/// see phase-5.6 Track 3b — `TODO(multi-hart)`).
+static mut RDSM_CONTEXT: [RdsmContext; NUM_HARTS_MAX] =
+    [const { RdsmContext::new() }; NUM_HARTS_MAX];
 
+/// Returns the calling hart's RDSM context.
+///
+/// # Panics
+///
+/// Panics if the hart id is out of range (`>= [`NUM_HARTS_MAX`]`).
 #[inline]
 pub fn rdsm_context() -> &'static RdsmContext {
-    unsafe { &RDSM_CONTEXT }
+    let hart = current_hart_id();
+    assert!(hart < NUM_HARTS_MAX, "hart id out of range");
+    unsafe { &*core::ptr::addr_of!(RDSM_CONTEXT[hart]) }
 }
 
+/// Returns the calling hart's RDSM context for mutation.
+///
+/// # Panics
+///
+/// Panics if the hart id is out of range (`>= [`NUM_HARTS_MAX`]`).
 #[inline]
 pub unsafe fn rdsm_context_mut() -> &'static mut RdsmContext {
-    unsafe { &mut RDSM_CONTEXT }
+    let hart = current_hart_id();
+    assert!(hart < NUM_HARTS_MAX, "hart id out of range");
+    unsafe { &mut *core::ptr::addr_of_mut!(RDSM_CONTEXT[hart]) }
 }
 
 #[inline]
 #[allow(dead_code)]
 pub fn is_cove_payload() -> bool {
-    unsafe { RDSM_CONTEXT.is_cove }
+    rdsm_context().is_cove
 }
 
 #[inline]
 #[allow(dead_code)]
 pub fn get_tsm_entry() -> usize {
-    unsafe { RDSM_CONTEXT.tsm_entry_paddr }
+    rdsm_context().tsm_entry_paddr
 }
 
 #[inline]
 #[allow(dead_code)]
 pub fn get_host_entry() -> usize {
-    unsafe { RDSM_CONTEXT.host_entry_paddr }
+    rdsm_context().host_entry_paddr
 }
 
 #[inline]
 #[allow(dead_code)]
 pub fn set_fdt_address(fdt: usize) {
     unsafe {
-        RDSM_CONTEXT.fdt_address = fdt;
+        rdsm_context_mut().fdt_address = fdt;
     }
 }
 
 #[inline]
 #[allow(dead_code)]
 pub fn get_fdt_address() -> usize {
-    unsafe { RDSM_CONTEXT.fdt_address }
+    rdsm_context().fdt_address
 }
 
 // ── CoVE Payload parsing & loading ─────────────────────────────────────
@@ -635,34 +697,37 @@ impl MptPageAlloc for MptBumpAlloc {
 
 /// Global SDID allocator, initialized once on the boot hart.
 ///
-/// Only the boot hart allocates SDIDs in Phase 1.  Future phases may
-/// need synchronization if non-boot harts also allocate.
-static mut SDID_ALLOCATOR: SdidAllocator = SdidAllocator::new();
+/// SDID allocation is a low-frequency configuration operation; the mutex
+/// keeps short critical sections (id alloc/free only).
+static SDID_ALLOCATOR: spin::Mutex<SdidAllocator> = spin::Mutex::new(SdidAllocator::new());
 
 /// Global SIDN allocator, initialized once on the boot hart.
-static mut SIDN_ALLOCATOR: SidnAllocator = SidnAllocator::new();
+static SIDN_ALLOCATOR: spin::Mutex<SidnAllocator> = spin::Mutex::new(SidnAllocator::new());
 
-/// Returns a mutable reference to the global SDID allocator.
+/// Returns a handle to the global SDID allocator.
 ///
-/// # Safety
-///
-/// Only the boot hart should call this in Phase 1.  Future phases must
-/// add synchronization for concurrent access from multiple harts.
+/// The returned guard holds the allocator lock; keep critical sections
+/// short (id allocation only, no nested locks).
 #[allow(dead_code)]
-pub unsafe fn rdsm_sdid_allocator() -> &'static mut SdidAllocator {
-    unsafe { &mut SDID_ALLOCATOR }
+pub fn rdsm_sdid_allocator() -> spin::MutexGuard<'static, SdidAllocator> {
+    SDID_ALLOCATOR.lock()
 }
 
-/// Returns a mutable reference to the global SIDN allocator.
+/// Returns a handle to the global SIDN allocator.
 ///
-/// # Safety
-///
-/// Only the boot hart should call this in Phase 1.  Future phases must
-/// add synchronization for concurrent access from multiple harts.
+/// The returned guard holds the allocator lock; keep critical sections
+/// short (id allocation only, no nested locks).
 #[allow(dead_code)]
-pub unsafe fn rdsm_sidn_allocator() -> &'static mut SidnAllocator {
-    unsafe { &mut SIDN_ALLOCATOR }
+pub fn rdsm_sidn_allocator() -> spin::MutexGuard<'static, SidnAllocator> {
+    SIDN_ALLOCATOR.lock()
 }
+
+/// Serializes MPT tree updates through the shared page pool.
+///
+/// [`MptBumpAlloc`] instances handed to `MptTree::set_perm` carve pages
+/// from the reserved pool; two concurrent updates (e.g. MPT_SET from two
+/// harts) must not interleave their allocations.
+static MPT_UPDATE_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 
 // ── RDSM initialization ────────────────────────────────────────────────
 
@@ -698,7 +763,7 @@ pub fn init<P: rdsm::probe::TrapSafeCsr>(env: InitEnv<'_, P>) {
 
     // Bind the firmware hooks and capture the environment before anything
     // else can rely on them.
-    unsafe { HOOKS = Some(env.hooks) };
+    HOOKS.call_once(|| env.hooks);
     unsafe {
         let r_ctx = rdsm_context_mut();
         r_ctx.hart_id = env.hart_id;
@@ -717,6 +782,15 @@ pub fn init<P: rdsm::probe::TrapSafeCsr>(env: InitEnv<'_, P>) {
     info!("RDSM: Initializing Supervisor Domain substrate");
 
     let probe = env.probe;
+
+    // Enable Smstateen CTX (mstateen0 bit 57) so that the HS-mode TSM can
+    // keep its per-hart id in `scontext` (0x5a8): mstateen-gated state is
+    // denied to modes below M while the bit is zero, and a supervisor
+    // domain cannot set mstateen itself. Probed trap-safely: skipped
+    // silently on platforms without mstateen0.
+    if let Some(v) = probe.read_csr(0x30c) {
+        probe.write_csr(0x30c, v | (1usize << 57));
+    }
 
     // Probe hardware support via CSR access.
     if !probe_smsdid(probe) {
@@ -744,20 +818,20 @@ pub fn init<P: rdsm::probe::TrapSafeCsr>(env: InitEnv<'_, P>) {
 
     // Allocate SDID 0 for the host supervisor domain using the global
     // allocator so the state persists after init returns.
-    let host_sdid = unsafe { SDID_ALLOCATOR.alloc() }.expect("SDID allocation for host failed");
+    let host_sdid = SDID_ALLOCATOR.lock().alloc().expect("SDID allocation for host failed");
     assert_eq!(host_sdid, 0, "Host SDID must be 0");
 
     // Allocate SDID 1 for the confidential supervisor domain.
-    let conf_sdid = unsafe { SDID_ALLOCATOR.alloc() }.expect("SDID allocation for conf failed");
+    let conf_sdid = SDID_ALLOCATOR.lock().alloc().expect("SDID allocation for conf failed");
     assert_eq!(conf_sdid, 1, "Confidential SDID must be 1");
 
     // Allocate SIDN 0 for the host interrupt domain using the global
     // allocator so the state persists after init returns.
-    let host_sidn = unsafe { SIDN_ALLOCATOR.alloc() }.expect("SIDN allocation for host failed");
+    let host_sidn = SIDN_ALLOCATOR.lock().alloc().expect("SIDN allocation for host failed");
     assert_eq!(host_sidn, 0, "Host SIDN must be 0");
 
     // Allocate SIDN 1 for the confidential interrupt domain.
-    let conf_sidn = unsafe { SIDN_ALLOCATOR.alloc() }.expect("SIDN allocation for conf failed");
+    let conf_sidn = SIDN_ALLOCATOR.lock().alloc().expect("SIDN allocation for conf failed");
     assert_eq!(conf_sidn, 1, "Confidential SIDN must be 1");
 
     // Create MPT page allocator from the reserved pool.
@@ -1105,6 +1179,10 @@ pub extern "C" fn handle_rdsm_entire(ctx: fast_trap::EntireContext) -> fast_trap
                 return ctx.restore();
             }
 
+            // The tree update draws pages from the shared MPT pool; hold
+            // the update lock so concurrent harts cannot interleave their
+            // pool allocations.
+            let _mpt_guard = MPT_UPDATE_LOCK.lock();
             let mut tree = rdsm::mpt::MptTree::from_root(mode, root_ppn);
             let mut alloc = MptBumpAlloc::from_pool();
             tree.set_perm(paddr, len, perm, &mut alloc);

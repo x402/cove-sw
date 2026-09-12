@@ -221,6 +221,7 @@ dependencies = [
  "rdsm-abi",
  "riscv",
  "riscv-cove",
+ "spin",
 ]
 
 [[package]]

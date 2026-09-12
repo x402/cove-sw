@@ -1,5 +1,23 @@
 use core::arch::global_asm;
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ExitInfo {
+    pub reason: usize,
+    pub gpa: usize,
+    pub len: usize,
+}
+
+impl ExitInfo {
+    pub const fn new() -> Self {
+        Self {
+            reason: 0,
+            gpa: 0,
+            len: 0,
+        }
+    }
+}
+
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug)]
 pub struct GuestContext {
@@ -12,6 +30,14 @@ pub struct GuestContext {
     pub htval: usize,
     pub htinst: usize,
     pub hgatp: usize,
+    /// HS-mode stack pointer saved across the guest run (offset 320 in the
+    /// asm below). Per-hart state kept with the vCPU context instead of a
+    /// shared global: each hart runs at most one vCPU at a time.
+    pub host_sp: usize,
+    /// Exit reason/state of the most recent guest exit (offsets 328..352 in
+    /// the asm below). Written by the guest trap handler on the hart that
+    /// ran the vCPU and read back by its run loop.
+    pub last_exit: ExitInfo,
 }
 
 impl GuestContext {
@@ -26,6 +52,8 @@ impl GuestContext {
             htval: 0,
             htinst: 0,
             hgatp: 0,
+            host_sp: 0,
+            last_exit: ExitInfo::new(),
         }
     }
 }
@@ -59,12 +87,6 @@ impl Vcpu {
     }
 }
 
-#[unsafe(no_mangle)]
-pub static mut TSM_SAVED_SP: usize = 0;
-
-#[unsafe(no_mangle)]
-pub static mut CURRENT_GUEST_CTX: usize = 0;
-
 unsafe extern "C" {
     pub fn tsm_enter_guest(ctx: *mut GuestContext) -> usize;
 }
@@ -81,23 +103,6 @@ pub const EXIT_COVG_REMOVE_MMIO: usize = 4;
 pub const EXIT_UNEXPECTED_TRAP: usize = 5;
 
 const EID_COVG: usize = 0x434F5647;
-
-#[repr(C)]
-pub struct ExitInfo {
-    pub reason: usize,
-    pub gpa: usize,
-    pub len: usize,
-}
-
-pub static mut LAST_EXIT: ExitInfo = ExitInfo {
-    reason: EXIT_CLEAN,
-    gpa: 0,
-    len: 0,
-};
-
-pub fn last_exit() -> &'static mut ExitInfo {
-    unsafe { &mut *core::ptr::addr_of_mut!(LAST_EXIT) }
-}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn handle_guest_trap(ctx: *mut GuestContext) -> usize {
@@ -121,7 +126,7 @@ pub extern "C" fn handle_guest_trap(ctx: *mut GuestContext) -> usize {
         if eid == 0x53525354 || eid == 0x08 {
             // Guest clean exit via SRST / shutdown (NOT COVG - handled below)
             ctx_ref.sepc += 4;
-            last_exit().reason = EXIT_CLEAN;
+            ctx_ref.last_exit.reason = EXIT_CLEAN;
             return TRAP_ACTION_EXIT;
         }
 
@@ -134,7 +139,7 @@ pub extern "C" fn handle_guest_trap(ctx: *mut GuestContext) -> usize {
                     // ADD_MMIO_REGION
                     crate::tvm::tvm_manager().add_mmio_region_internal(gpa, len);
                     ctx_ref.sepc += 4;
-                    let e = last_exit();
+                    let e = &mut ctx_ref.last_exit;
                     e.reason = EXIT_COVG_ADD_MMIO;
                     e.gpa = gpa;
                     e.len = len;
@@ -144,7 +149,7 @@ pub extern "C" fn handle_guest_trap(ctx: *mut GuestContext) -> usize {
                     // REMOVE_MMIO_REGION
                     crate::tvm::tvm_manager().remove_mmio_region_internal(gpa, len);
                     ctx_ref.sepc += 4;
-                    let e = last_exit();
+                    let e = &mut ctx_ref.last_exit;
                     e.reason = EXIT_COVG_REMOVE_MMIO;
                     e.gpa = gpa;
                     e.len = len;
@@ -154,7 +159,7 @@ pub extern "C" fn handle_guest_trap(ctx: *mut GuestContext) -> usize {
                     // SHARE_MEMORY_REGION: unmap G-stage, grant Host MPT access
                     let ok = crate::tvm::tvm_manager().share_memory_internal(gpa, len);
                     ctx_ref.sepc += 4;
-                    let e = last_exit();
+                    let e = &mut ctx_ref.last_exit;
                     e.reason = EXIT_COVG_SHARE;
                     e.gpa = gpa;
                     e.len = len;
@@ -165,7 +170,7 @@ pub extern "C" fn handle_guest_trap(ctx: *mut GuestContext) -> usize {
                     // UNSHARE_MEMORY_REGION
                     crate::tvm::tvm_manager().unshare_memory_internal(gpa, len);
                     ctx_ref.sepc += 4;
-                    let e = last_exit();
+                    let e = &mut ctx_ref.last_exit;
                     e.reason = EXIT_COVG_UNSHARE;
                     e.gpa = gpa;
                     e.len = len;
@@ -174,7 +179,7 @@ pub extern "C" fn handle_guest_trap(ctx: *mut GuestContext) -> usize {
                 _ => {
                     crate::println!("[TSM] Unhandled COVG FID={}", fid);
                     ctx_ref.sepc += 4;
-                    last_exit().reason = EXIT_UNEXPECTED_TRAP;
+                    ctx_ref.last_exit.reason = EXIT_UNEXPECTED_TRAP;
                     return TRAP_ACTION_EXIT;
                 }
             }
@@ -186,7 +191,7 @@ pub extern "C" fn handle_guest_trap(ctx: *mut GuestContext) -> usize {
             fid
         );
         ctx_ref.sepc += 4;
-        last_exit().reason = EXIT_UNEXPECTED_TRAP;
+        ctx_ref.last_exit.reason = EXIT_UNEXPECTED_TRAP;
         return TRAP_ACTION_EXIT;
     }
 
@@ -206,7 +211,7 @@ pub extern "C" fn handle_guest_trap(ctx: *mut GuestContext) -> usize {
             fault_gpa,
             scause
         );
-        last_exit().reason = EXIT_UNEXPECTED_TRAP;
+        ctx_ref.last_exit.reason = EXIT_UNEXPECTED_TRAP;
         return TRAP_ACTION_EXIT;
     }
 
@@ -217,7 +222,7 @@ pub extern "C" fn handle_guest_trap(ctx: *mut GuestContext) -> usize {
         ctx_ref.stval,
         ctx_ref.htval
     );
-    last_exit().reason = EXIT_UNEXPECTED_TRAP;
+    ctx_ref.last_exit.reason = EXIT_UNEXPECTED_TRAP;
     return TRAP_ACTION_EXIT;
 }
 
@@ -251,11 +256,7 @@ tsm_enter_guest:
     csrr t2, hstatus
     sd t2, 120(sp)
 
-    la t0, TSM_SAVED_SP
-    sd sp, 0(t0)
-
-    la t0, CURRENT_GUEST_CTX
-    sd a0, 0(t0)
+    sd sp, 320(a0)
 
     ld t0, 312(a0)
     csrw hgatp, t0
@@ -363,16 +364,15 @@ tsm_guest_trap_vector:
     csrr t6, htinst
     sd t6, 304(a0)
 
-    la t0, TSM_SAVED_SP
-    ld sp, 0(t0)
+    ld sp, 320(a0)
+
+    csrw sscratch, a0
 
     call handle_guest_trap
 
     bnez a0, tsm_exit_guest_restore
 
-    la t0, CURRENT_GUEST_CTX
-    ld a0, 0(t0)
-    csrw sscratch, a0
+    csrr a0, sscratch
 
     ld t0, 256(a0)
     csrw sepc, t0
@@ -416,8 +416,8 @@ tsm_guest_trap_vector:
     sret
 
 tsm_exit_guest_restore:
-    la t0, TSM_SAVED_SP
-    ld sp, 0(t0)
+    csrr t0, sscratch
+    ld sp, 320(t0)
 
     csrw hgatp, zero
     hfence.gvma

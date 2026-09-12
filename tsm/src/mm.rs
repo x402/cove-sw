@@ -1,5 +1,6 @@
 use crate::SbiRet;
 use crate::rdsm_shim::{rdsm_mfence_pa, rdsm_mpt_set};
+use spin::{Mutex, MutexGuard, Once};
 
 pub const PAGE_SIZE: usize = 4096;
 pub const MAX_PAGES: usize = 512;
@@ -11,22 +12,16 @@ pub const MAX_PAGES: usize = 512;
 // these regions; everything else (firmware gap, TSM image, MPT page
 // pool) is reserved and must be rejected.
 
-static mut HOST_REGIONS: [(usize, usize); 2] = [(0, 0); 2];
-static mut HOST_REGIONS_READY: bool = false;
+static HOST_REGIONS: Once<[(usize, usize); 2]> = Once::new();
 
 /// Populate the whitelist from the RDSM-provided platform layout.
 pub fn init_host_regions(info: &crate::rdsm_shim::RdsmPlatformInfo) {
-    let regions: [(usize, usize); 2] = [
-        (info.tsm_region_end, info.mpt_pool_start),
-        (info.mpt_pool_end, info.ram_end),
-    ];
-    unsafe {
-        core::ptr::write_volatile(
-            core::ptr::addr_of_mut!(HOST_REGIONS),
-            regions,
-        );
-        core::ptr::write_volatile(core::ptr::addr_of_mut!(HOST_REGIONS_READY), true);
-    }
+    HOST_REGIONS.call_once(|| {
+        [
+            (info.tsm_region_end, info.mpt_pool_start),
+            (info.mpt_pool_end, info.ram_end),
+        ]
+    });
 }
 
 /// Fail-closed check: is `[paddr, paddr+len)` entirely host-allocatable?
@@ -40,15 +35,11 @@ pub fn is_host_range(paddr: usize, len: usize) -> bool {
         Some(e) => e,
         None => return false,
     };
-    unsafe {
-        if !core::ptr::read_volatile(core::ptr::addr_of!(HOST_REGIONS_READY)) {
-            return false;
-        }
-        let regions = core::ptr::read_volatile(core::ptr::addr_of!(HOST_REGIONS));
+    HOST_REGIONS.get().map_or(false, |regions| {
         regions
             .iter()
             .any(|&(start, stop)| paddr >= start && end <= stop)
-    }
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -333,8 +324,16 @@ impl PageTracker {
     }
 }
 
-pub static mut PAGE_TRACKER: PageTracker = PageTracker::new();
+/// Shared page-state machine.
+///
+/// Page convert/reclaim/assign are short configuration operations, so the
+/// tracker is guarded by a single mutex. Callers may hold the TVM manager
+/// lock while locking this one (lock order: `TVM_MANAGER` → `PAGE_TRACKER`);
+/// the reverse order never occurs because the tracker never calls into the
+/// manager.
+static PAGE_TRACKER: Mutex<PageTracker> = Mutex::new(PageTracker::new());
 
-pub fn page_tracker() -> &'static mut PageTracker {
-    unsafe { &mut *core::ptr::addr_of_mut!(PAGE_TRACKER) }
+/// Locks and returns the shared page tracker.
+pub fn page_tracker() -> MutexGuard<'static, PageTracker> {
+    PAGE_TRACKER.lock()
 }

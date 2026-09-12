@@ -16,4 +16,7 @@ rdsm-abi = { path = "../rdsm-abi" }
 riscv-cove = { path = "../../../rustsbi/library/riscv-cove" }
 log = "0.4"
 riscv = { version = "0.16", default-features = false }
+# Multi-hart-safe global state: Once for the init-once firmware hooks,
+# Mutex for the domain ID allocators and the MPT tree update path.
+spin = "0.9"
 fast-trap = { git = "https://github.com/rustsbi/fast-trap", rev = "8d855afa", features = ["riscv-m"] }
