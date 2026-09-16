@@ -1,0 +1,21 @@
+[package]
+name = "rdsm-policy"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rdsm = { path = "../rdsm" }
+rdsm-mech = { path = "../rdsm-mech" }
+# Private RDSM↔TSM contract (EID_RDSM + FIDs, TEERET reasons, payload header,
+# platform info layout); single source of the private ABI.
+rdsm-abi = { path = "../rdsm-abi" }
+# Standard CoVE extension IDs (SUPD / COVH / COVI): single source is the
+# upstream riscv-cove crate, re-exported so embedders keep one import site.
+riscv-cove = { path = "../../../rustsbi/library/riscv-cove" }
+# SbiRet for the extension dispatch surface the embedding firmware consumes.
+sbi-spec = { version = "0.0.10", path = "../../../rustsbi/library/sbi-spec" }
+log = "0.4"
+riscv = { version = "0.16", default-features = false }
+# Multi-hart-safe global state: Once for the init-once substrate decision,
+# Mutex for the domain ID allocators and the MPT tree update path.
+spin = "0.9"

@@ -1,0 +1,11 @@
+[package]
+name = "rdsm-mech"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rdsm = { path = "../rdsm" }
+# Private payload-image contract (header layout, platform info layout);
+# owned by rdsm-abi, consumed here for the physical load path.
+rdsm-abi = { path = "../rdsm-abi" }
+riscv = { version = "0.16", default-features = false }

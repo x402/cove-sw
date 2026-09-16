@@ -3,7 +3,8 @@ resolver = "2"
 members = [
     "crates/rdsm-abi",
     "crates/rdsm",
-    "crates/rdsm-fw",
+    "crates/rdsm-mech",
+    "crates/rdsm-policy",
     "tsm",
     "test-host",
     "test-guest",

@@ -116,7 +116,7 @@ pub unsafe extern "C" fn _start() -> ! {
     )
 }
 
-/// Maximum harts the TSM keeps dispatch stacks for (matches rdsm-fw's
+/// Maximum harts the TSM keeps dispatch stacks for (matches rdsm-mech's
 /// `NUM_HARTS_MAX` convention).
 pub const NUM_HARTS_MAX: usize = 8;
 

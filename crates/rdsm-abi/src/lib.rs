@@ -39,7 +39,7 @@ pub const TSM_READY: usize = 2;
 
 // ── Standard CoVE extension IDs (SUPD / COVH / COVI) are deliberately
 // NOT defined here: their single source is the upstream `riscv-cove`
-// crate, re-exported through rdsm-fw. This crate only owns the private
+// crate, re-exported through rdsm-policy. This crate only owns the private
 // RDSM↔TSM contract. ────────────────────────────────────────────────────
 
 // ── CoVE payload image format ──────────────────────────────────────────

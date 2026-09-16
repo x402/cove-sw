@@ -130,11 +130,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "361a90feb7004eca4019fb28352a9465666b24f840f5c3cddf0ff13920590b89"
 
 [[package]]
-name = "fast-trap"
-version = "0.1.0"
-source = "git+https://github.com/rustsbi/fast-trap?rev=8d855afa#8d855afa3bc207bb102118e41ef768214d9f6f5b"
-
-[[package]]
 name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -212,15 +207,25 @@ name = "rdsm-abi"
 version = "0.1.0"
 
 [[package]]
-name = "rdsm-fw"
+name = "rdsm-mech"
 version = "0.1.0"
 dependencies = [
- "fast-trap",
- "log",
  "rdsm",
  "rdsm-abi",
  "riscv",
+]
+
+[[package]]
+name = "rdsm-policy"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "rdsm",
+ "rdsm-abi",
+ "rdsm-mech",
+ "riscv",
  "riscv-cove",
+ "sbi-spec",
  "spin",
 ]
 
