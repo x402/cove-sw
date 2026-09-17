@@ -23,8 +23,7 @@ pub struct SbiConsole;
 impl Write for SbiConsole {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         for b in s.bytes() {
-            #[allow(deprecated)]
-            let _ = sbi_rt::legacy::console_putchar(b as usize);
+            let _ = sbi_rt::console_write_byte(b);
         }
         Ok(())
     }
@@ -191,7 +190,18 @@ pub extern "C" fn tsm_main(hart_id: usize, _fdt_paddr: usize) -> ! {
     // emits the line on RDSM's behalf. Chronology for the E2E script is
     // identical: marker 02 < marker 03 < host's marker 04.
     println!("[MARKER 03] RDSM: Switching context to Host Domain (SDID=0).");
-    rdsm_teeret(TSM_READY, tsm_dispatch_entry as *const () as usize, 0);
+    let (err, _val) = rdsm_teeret(TSM_READY, tsm_dispatch_entry as *const () as usize, 0);
+    // INTERIM (upstream rustsbi#286 pending): a returning TEERET means the
+    // retentive switch was rejected; park this hart instead of falling off
+    // the end of the ecall shim.
+    println!(
+        "[RDSM-INTERIM] TEERET rejected (err={:#x}); parking hart (rustsbi#286 pending).",
+        err
+    );
+    loop {
+        // SAFETY: `wfi` is a privileged hint instruction with no memory effect.
+        unsafe { core::arch::asm!("wfi") };
+    }
 }
 
 #[repr(C)]

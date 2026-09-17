@@ -39,25 +39,49 @@ FIRMWARE="$RUSTSBI_ROOT/target/riscv64gc-unknown-none-elf/release/rustsbi-protot
 #   guest/firmware interaction (see phase-5.5 follow-up), so the guest
 #   binary is kept byte-identical to the phase-4 baseline and its existing
 #   lifecycle lines are matched instead.
-MARKERS=(
-  '\[RDSM\] Booting\.\.\.'
-  '\[MARKER 02\] TSM: Initialization complete, state=TSM_READY\.'
-  '\[MARKER 03\] RDSM: Switching context to Host Domain \(SDID=0\)\.'
-  '\[MARKER 04\] HOST: Discovery passed \(EXT_SUPD & EXT_COVH found\)\.'
-  '\[MARKER 05\] HOST: TSM capability probed, state=TSM_READY\.'
-  '\[MARKER 06\] HOST: Converted [0-9]+ physical pages to confidential memory\.'
-  '\[MARKER 07\] HOST: TVM #[0-9]+ memory regions & measured pages populated\.'
-  '\[MARKER 08\] HOST: TVM #[0-9]+ created with 1 vCPU\.'
-  '\[MARKER 09\] HOST: TVM #[0-9]+ finalized, launching vCPU #0\.\.\.'
-  '\[GUEST\] Hello from Confidential TVM!'
-  'Wrote 0xDEADBEEF to shared page GPA 0x80010000'
-  'PHASE4: SHARED_MEMORY_OK \(read 0x[0-9a-f]+\)'
-  'Resumed after COVG unshare'
-  '\[MARKER 14\] HOST: Received TVM exit, tearing down TVM #[0-9]+\.'
-  '\[MARKER 15\] HOST: All confidential pages reclaimed successfully\.'
-  'PHASE 5\.5 PASS: HOST_VALIDATION_OK'
-  '\[MARKER 16\] HOST: ALL COVE E2E TESTS PASSED!'
-)
+#
+# MARKER_PROFILE selects the marker set:
+#   full    (default) all 17 markers — complete TEECALL/TEERET lifecycle.
+#   interim phase-6.5 port profile: the substrate boots and the TSM runs,
+#           but the retentive TEERET is rejected (upstream rustsbi#286
+#           pending); the last marker is the TSM's interim parking line.
+MARKER_PROFILE="${MARKER_PROFILE:-full}"
+
+case "$MARKER_PROFILE" in
+full)
+    MARKERS=(
+      '\[RDSM\] Booting\.\.\.'
+      '\[MARKER 02\] TSM: Initialization complete, state=TSM_READY\.'
+      '\[MARKER 03\] RDSM: Switching context to Host Domain \(SDID=0\)\.'
+      '\[MARKER 04\] HOST: Discovery passed \(EXT_SUPD & EXT_COVH found\)\.'
+      '\[MARKER 05\] HOST: TSM capability probed, state=TSM_READY\.'
+      '\[MARKER 06\] HOST: Converted [0-9]+ physical pages to confidential memory\.'
+      '\[MARKER 07\] HOST: TVM #[0-9]+ memory regions & measured pages populated\.'
+      '\[MARKER 08\] HOST: TVM #[0-9]+ created with 1 vCPU\.'
+      '\[MARKER 09\] HOST: TVM #[0-9]+ finalized, launching vCPU #0\.\.\.'
+      '\[GUEST\] Hello from Confidential TVM!'
+      'Wrote 0xDEADBEEF to shared page GPA 0x80010000'
+      'PHASE4: SHARED_MEMORY_OK \(read 0x[0-9a-f]+\)'
+      'Resumed after COVG unshare'
+      '\[MARKER 14\] HOST: Received TVM exit, tearing down TVM #[0-9]+\.'
+      '\[MARKER 15\] HOST: All confidential pages reclaimed successfully\.'
+      'PHASE 5\.5 PASS: HOST_VALIDATION_OK'
+      '\[MARKER 16\] HOST: ALL COVE E2E TESTS PASSED!'
+    )
+    ;;
+interim)
+    MARKERS=(
+      '\[RDSM\] Booting\.\.\.'
+      '\[MARKER 02\] TSM: Initialization complete, state=TSM_READY\.'
+      '\[MARKER 03\] RDSM: Switching context to Host Domain \(SDID=0\)\.'
+      '\[RDSM-INTERIM\] TEERET rejected \(err=0x[0-9a-f]+\); parking hart \(rustsbi#286 pending\)\.'
+    )
+    ;;
+*)
+    echo "E2E FAIL: unknown MARKER_PROFILE '$MARKER_PROFILE' (full|interim)" >&2
+    exit 1
+    ;;
+esac
 
 fail() {
   echo "E2E FAIL: $1" >&2

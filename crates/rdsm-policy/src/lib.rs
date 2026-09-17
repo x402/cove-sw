@@ -45,6 +45,10 @@ pub use rdsm_abi::{
     FID_RDSM_TEERET, NORMAL_RETURN, TSM_READY, TVM_EXIT,
 };
 
+// The substrate, re-exported so embedders keep one dependency surface
+// (probe trait, CSR wrappers) without depending on `rdsm` directly.
+pub use rdsm;
+
 use rdsm_abi::{COVE_PAYLOAD_VERSION, RdsmPlatformInfo};
 use sbi_spec::binary::SbiRet;
 
@@ -79,6 +83,10 @@ pub struct InitEnv<'a, P: rdsm::probe::TrapSafeCsr> {
 /// Global RDSM context recording dual-MPT state, payload header info, and FDT address.
 #[derive(Clone, Copy, Debug)]
 pub struct RdsmContext {
+    /// Set once [`init`] completed successfully; guards the ecall paths
+    /// against touching `mmpt`/`msdcfg` on substrates that were never
+    /// brought up (no `smsdid` in the device tree, hardware absent).
+    pub substrate_active: bool,
     pub is_cove: bool,
     pub mpt_mode: Option<rdsm::csr::MptMode>,
     pub host_sdid: usize,
@@ -103,6 +111,7 @@ pub struct RdsmContext {
 impl RdsmContext {
     pub const fn new() -> Self {
         Self {
+            substrate_active: false,
             is_cove: false,
             mpt_mode: None,
             host_sdid: 0,
@@ -175,6 +184,14 @@ pub fn get_fdt_address() -> usize {
 #[inline]
 pub fn is_tsm_ready() -> bool {
     THCS.get().tsm_ready
+}
+
+/// BASE probe value for the private RDSM extension: nonzero once the
+/// substrate is up. The dispatcher derive gates `handle` on this, so the
+/// extension must advertise itself here (unlike the legacy fast_handler
+/// probe semantics where RDSM reported zero).
+pub fn rdsm_probe() -> usize {
+    context().substrate_active as usize
 }
 
 /// SDID of the supervisor domain the calling hart currently executes in.
@@ -543,6 +560,7 @@ pub fn init<P: rdsm::probe::TrapSafeCsr>(env: InitEnv<'_, P>) {
     core::mem::forget(host_tree);
     core::mem::forget(conf_tree);
 
+    context_mut().substrate_active = true;
     info!("RDSM: Initialization complete");
 }
 
@@ -555,6 +573,12 @@ pub fn init<P: rdsm::probe::TrapSafeCsr>(env: InitEnv<'_, P>) {
 /// confidential domain. A host-domain ecall must never be able to program
 /// MPT entries or drive the TEERET machinery directly.
 pub fn handle_rdsm(function: usize, args: [usize; 6]) -> SbiRet {
+    // Guard before any `mmpt` access: an uninitialized substrate must reject
+    // instead of trapping on the CSR read.
+    if !context().substrate_active {
+        return SbiRet { error: ERR_DENIED, value: 0 };
+    }
+
     #[cfg(target_arch = "riscv64")]
     if sender_sdid() != context().conf_sdid {
         return SbiRet { error: ERR_DENIED, value: 0 };
@@ -695,6 +719,10 @@ pub const COVI_PROBE: usize = 0;
 /// call, and only after the TSM has announced readiness. The retentive
 /// host→TSM switch itself is pending upstream rustsbi#286.
 pub fn handle_teecall(function: usize, args: [usize; 6]) -> SbiRet {
+    // Guard before any `mmpt` access (see [`handle_rdsm`]).
+    if !context().substrate_active {
+        return SbiRet { error: ERR_DENIED, value: 0 };
+    }
     if sender_sdid() != context().host_sdid {
         return SbiRet { error: ERR_DENIED, value: 0 };
     }

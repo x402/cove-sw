@@ -42,18 +42,27 @@ pub fn rdsm_get_platform_info() -> Option<RdsmPlatformInfo> {
     Some(info)
 }
 
-pub fn rdsm_teeret(reason: usize, a1: usize, a2: usize) -> ! {
+/// Issues TEERET to the RDSM.
+///
+/// A successful TEERET never returns (the hart resumes in the host domain
+/// without the switch code ever coming back). It only returns when the
+/// switch was rejected — currently the interim port profile while upstream
+/// rustsbi#286 (Runtime trap-frame access for the retentive switch) is
+/// pending; callers must park in that case instead of falling off the ecall.
+pub fn rdsm_teeret(reason: usize, a1: usize, a2: usize) -> (usize, usize) {
+    let err: usize;
+    let val: usize;
     unsafe {
         asm!(
             "ecall",
             in("a7") EID_RDSM,
             in("a6") FID_RDSM_TEERET,
-            in("a0") reason,
-            in("a1") a1,
+            inout("a0") reason => err,
+            inout("a1") a1 => val,
             in("a2") a2,
-            options(noreturn)
         );
     }
+    (err, val)
 }
 
 pub fn rdsm_mpt_set(target_sdid: usize, paddr: usize, len: usize, perm: u8) -> (usize, usize) {

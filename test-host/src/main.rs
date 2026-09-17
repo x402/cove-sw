@@ -13,8 +13,7 @@ struct SbiConsole;
 impl Write for SbiConsole {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         for b in s.bytes() {
-            #[allow(deprecated)]
-            let _ = sbi_rt::legacy::console_putchar(b as usize);
+            let _ = sbi_rt::console_write_byte(b);
         }
         Ok(())
     }

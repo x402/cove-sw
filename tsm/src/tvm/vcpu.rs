@@ -118,7 +118,7 @@ pub extern "C" fn handle_guest_trap(ctx: *mut GuestContext) -> usize {
             // SBI legacy console_putchar
             let ch = ctx_ref.gprs[10] as u8; // a0
             #[allow(deprecated)]
-            let _ = sbi_rt::legacy::console_putchar(ch as usize);
+            let _ = sbi_rt::console_write_byte(ch);
             ctx_ref.sepc += 4;
             return TRAP_ACTION_RESUME;
         }
