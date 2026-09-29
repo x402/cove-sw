@@ -129,6 +129,16 @@ impl MsdeiTrap {
         }
     }
 
+    /// Decode the MSDEI state as of *now*, straight from
+    /// `msideip & msideie`, without an `mcause` to check first.  Intended
+    /// for handlers already entered because of an MSDEI (the cause was
+    /// reported by the trap machinery itself).
+    pub fn current() -> Self {
+        Self {
+            pending_mask: Self::read_pending_mask(),
+        }
+    }
+
     /// Read the pending SID mask: `msideip & msideie`.
     #[cfg(target_arch = "riscv64")]
     fn read_pending_mask() -> usize {
@@ -285,6 +295,13 @@ mod tests {
         // mcause = 14 (exception, not interrupt → bit 63 = 0)
         let mcause = 14;
         assert!(MsdeiTrap::from_trap(mcause).is_none());
+    }
+
+    #[test]
+    fn msdei_current_host_reads_zero() {
+        // On the host the pending mask is a stub returning 0; `current()`
+        // must never touch `mcause` (it has none to read).
+        assert_eq!(MsdeiTrap::current().pending_mask(), 0);
     }
 
     #[test]

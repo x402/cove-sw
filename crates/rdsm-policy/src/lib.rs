@@ -26,6 +26,11 @@
 
 #![no_std]
 #![forbid(unsafe_code)]
+#![cfg_attr(test, allow(unused_extern_crates))]
+#[cfg(test)]
+extern crate std;
+
+mod machine_irq;
 
 use log::{error, info, warn};
 use spin::Mutex;
@@ -48,6 +53,10 @@ pub use rdsm_abi::{
 // The substrate, re-exported so embedders keep one dependency surface
 // (probe trait, CSR wrappers) without depending on `rdsm` directly.
 pub use rdsm;
+
+// Machine-interrupt claim policy (MSDEI), installed by the embedding
+// firmware during boot.
+pub use machine_irq::{RdsmMachineIrq, RDSM_MACHINE_IRQ};
 
 use rdsm_abi::{COVE_PAYLOAD_VERSION, RdsmPlatformInfo};
 use sbi_spec::binary::SbiRet;

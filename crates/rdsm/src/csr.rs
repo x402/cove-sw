@@ -324,6 +324,22 @@ pub fn write_msideie(mask: usize) {
     }
 }
 
+/// Host-safe stub (reads as "no SIDs pending").
+#[cfg(not(target_arch = "riscv64"))]
+pub fn read_msideip() -> usize {
+    0
+}
+
+/// Host-safe stub (reads as "no SIDs enabled").
+#[cfg(not(target_arch = "riscv64"))]
+pub fn read_msideie() -> usize {
+    0
+}
+
+/// Host-safe no-op stub.
+#[cfg(not(target_arch = "riscv64"))]
+pub fn write_msideie(_mask: usize) {}
+
 // ── Unit tests ─────────────────────────────────────────────────────────
 
 #[cfg(test)]

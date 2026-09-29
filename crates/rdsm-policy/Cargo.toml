@@ -14,6 +14,9 @@ rdsm-abi = { path = "../rdsm-abi" }
 riscv-cove = { path = "../../../rustsbi/library/riscv-cove" }
 # SbiRet for the extension dispatch surface the embedding firmware consumes.
 sbi-spec = { version = "0.0.10", path = "../../../rustsbi/library/sbi-spec" }
+# Machine-interrupt claim policy trait (MSDEI): single source is the
+# embedding firmware's Runtime (rustsbi/firmware/runtime).
+runtime = { package = "rustsbi-firmware-runtime", version = "0.0.0", path = "../../../rustsbi/firmware/runtime" }
 log = "0.4"
 riscv = { version = "0.16", default-features = false }
 # Multi-hart-safe global state: Once for the init-once substrate decision,
