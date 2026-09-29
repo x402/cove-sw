@@ -37,7 +37,7 @@ use spin::Mutex;
 
 use rdsm::domain::SdidAllocator;
 use rdsm::interrupt::SidnAllocator;
-use rdsm_mech::{PerHart, Thcs};
+use rdsm_mech::{PerHart, PerHartCell, Thcs};
 
 // Standard CoVE extension IDs: single source is the upstream riscv-cove
 // crate; re-exported here so embedders keep one import site.
@@ -46,8 +46,8 @@ pub use riscv_cove::interrupt::EID_COVI;
 pub use riscv_cove::supd::EID_SUPD;
 // Private RDSM↔TSM contract: single source is rdsm-abi.
 pub use rdsm_abi::{
-    EID_RDSM, FID_RDSM_GET_INFO, FID_RDSM_MFENCE_PA, FID_RDSM_MPT_SET,
-    FID_RDSM_TEERET, NORMAL_RETURN, TSM_READY, TVM_EXIT,
+    EID_RDSM, FID_RDSM_GET_INFO, FID_RDSM_MFENCE_PA, FID_RDSM_MPT_SET, FID_RDSM_TEERET,
+    NORMAL_RETURN, TSM_READY, TVM_EXIT,
 };
 
 // The substrate, re-exported so embedders keep one dependency surface
@@ -56,7 +56,7 @@ pub use rdsm;
 
 // Machine-interrupt claim policy (MSDEI), installed by the embedding
 // firmware during boot.
-pub use machine_irq::{RdsmMachineIrq, RDSM_MACHINE_IRQ};
+pub use machine_irq::{RDSM_MACHINE_IRQ, RdsmMachineIrq};
 
 use rdsm_abi::{COVE_PAYLOAD_VERSION, RdsmPlatformInfo};
 use sbi_spec::binary::SbiRet;
@@ -115,6 +115,10 @@ pub struct RdsmContext {
     pub ram_range: Option<(usize, usize)>,
     /// Boot hart ID captured from [`InitEnv`].
     pub hart_id: usize,
+    /// Dispatch entry the TSM registered with its TSM_READY TEERET, consumed
+    /// by the first host TEECALL (later TEECALLs resume at the TSM's parked
+    /// breakpoint instead).
+    pub dispatch_entry: Option<usize>,
 }
 
 impl RdsmContext {
@@ -138,6 +142,7 @@ impl RdsmContext {
             fdt_address: 0,
             ram_range: None,
             hart_id: 0,
+            dispatch_entry: None,
         }
     }
 }
@@ -150,8 +155,32 @@ impl RdsmContext {
 /// — `TODO(multi-hart)`).
 static RDSM_CONTEXT: PerHart<RdsmContext> = PerHart::new(RdsmContext::new());
 
-/// Per-hart domain save areas (`hssa`/`tssa`/`tsm_ready`).
+/// Per-hart domain save areas (`host_csrs`/`tsm_csrs`/`tsm_ready`).
 static THCS: PerHart<Thcs> = PerHart::new(Thcs::new());
+
+/// Per-hart pair of Runtime execution contexts for retentive domain
+/// switching: `host` snapshots the host (VMM) execution, `tsm` the TSM's.
+/// GPRs, resume PC and `satp` live here and are exchanged by the Runtime's
+/// transfer ceremony; only the CSR half is handled through [`rdsm_mech`].
+struct HartCtx {
+    host: runtime::context::ExecutionContext,
+    tsm: runtime::context::ExecutionContext,
+}
+
+impl HartCtx {
+    const fn new() -> Self {
+        Self {
+            host: runtime::context::ExecutionContext::new(),
+            tsm: runtime::context::ExecutionContext::new(),
+        }
+    }
+}
+
+impl rdsm_mech::ConstInit for HartCtx {
+    const INIT: HartCtx = HartCtx::new();
+}
+
+static CONTEXTS: PerHartCell<HartCtx> = PerHartCell::new();
 
 /// Returns the calling hart's RDSM context.
 pub fn context() -> &'static RdsmContext {
@@ -418,20 +447,32 @@ pub fn init<P: rdsm::probe::TrapSafeCsr>(env: InitEnv<'_, P>) {
 
     // Allocate SDID 0 for the host supervisor domain using the global
     // allocator so the state persists after init returns.
-    let host_sdid = SDID_ALLOCATOR.lock().alloc().expect("SDID allocation for host failed");
+    let host_sdid = SDID_ALLOCATOR
+        .lock()
+        .alloc()
+        .expect("SDID allocation for host failed");
     assert_eq!(host_sdid, 0, "Host SDID must be 0");
 
     // Allocate SDID 1 for the confidential supervisor domain.
-    let conf_sdid = SDID_ALLOCATOR.lock().alloc().expect("SDID allocation for conf failed");
+    let conf_sdid = SDID_ALLOCATOR
+        .lock()
+        .alloc()
+        .expect("SDID allocation for conf failed");
     assert_eq!(conf_sdid, 1, "Confidential SDID must be 1");
 
     // Allocate SIDN 0 for the host interrupt domain using the global
     // allocator so the state persists after init returns.
-    let host_sidn = SIDN_ALLOCATOR.lock().alloc().expect("SIDN allocation for host failed");
+    let host_sidn = SIDN_ALLOCATOR
+        .lock()
+        .alloc()
+        .expect("SIDN allocation for host failed");
     assert_eq!(host_sidn, 0, "Host SIDN must be 0");
 
     // Allocate SIDN 1 for the confidential interrupt domain.
-    let conf_sidn = SIDN_ALLOCATOR.lock().alloc().expect("SIDN allocation for conf failed");
+    let conf_sidn = SIDN_ALLOCATOR
+        .lock()
+        .alloc()
+        .expect("SIDN allocation for conf failed");
     assert_eq!(conf_sidn, 1, "Confidential SIDN must be 1");
 
     // Create MPT page allocator from the reserved pool.
@@ -585,12 +626,18 @@ pub fn handle_rdsm(function: usize, args: [usize; 6]) -> SbiRet {
     // Guard before any `mmpt` access: an uninitialized substrate must reject
     // instead of trapping on the CSR read.
     if !context().substrate_active {
-        return SbiRet { error: ERR_DENIED, value: 0 };
+        return SbiRet {
+            error: ERR_DENIED,
+            value: 0,
+        };
     }
 
     #[cfg(target_arch = "riscv64")]
     if sender_sdid() != context().conf_sdid {
-        return SbiRet { error: ERR_DENIED, value: 0 };
+        return SbiRet {
+            error: ERR_DENIED,
+            value: 0,
+        };
     }
 
     match function {
@@ -599,17 +646,16 @@ pub fn handle_rdsm(function: usize, args: [usize; 6]) -> SbiRet {
         FID_RDSM_MFENCE_PA => {
             #[cfg(target_arch = "riscv64")]
             rdsm::fence::mfence_pa(args[0], args[1]);
-            SbiRet { error: SBI_SUCCESS, value: 0 }
+            SbiRet {
+                error: SBI_SUCCESS,
+                value: 0,
+            }
         }
-        FID_RDSM_TEERET => {
-            // Pending upstream rustsbi#286: the retentive TSM→host switch
-            // stages its effect through the Runtime trap frame, which custom
-            // extension dispatch cannot reach. The sequenced implementation
-            // is kept in [`switch`].
-            error!("RDSM: TEERET requires runtime frame access (rustsbi#286); rejecting");
-            SbiRet { error: ERR_FAILED, value: 0 }
-        }
-        _ => SbiRet { error: ERR_FAILED, value: 0 },
+        FID_RDSM_TEERET => switch::teeret(args),
+        _ => SbiRet {
+            error: ERR_FAILED,
+            value: 0,
+        },
     }
 }
 
@@ -633,7 +679,10 @@ fn get_info(info_buf: usize) -> SbiRet {
             },
         );
     }
-    SbiRet { error: SBI_SUCCESS, value: mode_val }
+    SbiRet {
+        error: SBI_SUCCESS,
+        value: mode_val,
+    }
 }
 
 /// FID 1 MPT_SET: validates and applies a permission update to the target
@@ -646,13 +695,23 @@ fn mpt_set(args: [usize; 6]) -> SbiRet {
 
     let perm = match rdsm::mpt::MptPerm::from_bits(perm_bits) {
         Some(p) => p,
-        None => return SbiRet { error: ERR_INVALID_PARAM, value: 0 },
+        None => {
+            return SbiRet {
+                error: ERR_INVALID_PARAM,
+                value: 0,
+            };
+        }
     };
 
     let r_ctx = context();
     let mode = match r_ctx.mpt_mode {
         Some(m) => m,
-        None => return SbiRet { error: ERR_FAILED, value: 0 },
+        None => {
+            return SbiRet {
+                error: ERR_FAILED,
+                value: 0,
+            };
+        }
     };
 
     let root_ppn = if target_sdid == r_ctx.host_sdid {
@@ -660,7 +719,10 @@ fn mpt_set(args: [usize; 6]) -> SbiRet {
     } else if target_sdid == r_ctx.conf_sdid {
         r_ctx.conf_root_ppn
     } else {
-        return SbiRet { error: ERR_INVALID_PARAM, value: 0 };
+        return SbiRet {
+            error: ERR_INVALID_PARAM,
+            value: 0,
+        };
     };
 
     // Alignment + reserved-region validation:
@@ -686,7 +748,10 @@ fn mpt_set(args: [usize; 6]) -> SbiRet {
         }
     };
     if paddr % 4096 != 0 || len % 4096 != 0 || len == 0 || !range_ok {
-        return SbiRet { error: ERR_INVALID_PARAM, value: 0 };
+        return SbiRet {
+            error: ERR_INVALID_PARAM,
+            value: 0,
+        };
     }
 
     // The tree update draws pages from the shared MPT pool; hold the update
@@ -697,16 +762,25 @@ fn mpt_set(args: [usize; 6]) -> SbiRet {
     tree.set_perm(paddr, len, perm, &mut alloc);
     core::mem::forget(tree);
 
-    SbiRet { error: SBI_SUCCESS, value: 0 }
+    SbiRet {
+        error: SBI_SUCCESS,
+        value: 0,
+    }
 }
 
 /// Handles the SUPD discovery extension (EID 0x53555044): FID 0 reports the
 /// supported domain kinds (host bit 0 + confidential bit 1).
 pub fn handle_supd(function: usize) -> SbiRet {
     if function == 0 {
-        SbiRet { error: SBI_SUCCESS, value: 0b11 }
+        SbiRet {
+            error: SBI_SUCCESS,
+            value: 0b11,
+        }
     } else {
-        SbiRet { error: ERR_FAILED, value: 0 }
+        SbiRet {
+            error: ERR_FAILED,
+            value: 0,
+        }
     }
 }
 
@@ -725,193 +799,350 @@ pub const COVI_PROBE: usize = 0;
 /// Handles a COVH / COVI call (TEECALL) from the host domain.
 ///
 /// Sender validation mirrors the RDSM extension: only the host domain may
-/// call, and only after the TSM has announced readiness. The retentive
-/// host→TSM switch itself is pending upstream rustsbi#286.
-pub fn handle_teecall(function: usize, args: [usize; 6]) -> SbiRet {
+/// call, and only after the TSM has announced readiness. On success the
+/// retentive host→TSM switch never returns to the host here — the hart
+/// resumes inside the TSM and the call result is delivered by the TSM's
+/// TEERET (NORMal_RETURN injects it into the host's parked snapshot).
+pub fn handle_teecall(eid: usize, function: usize, args: [usize; 6]) -> SbiRet {
     // Guard before any `mmpt` access (see [`handle_rdsm`]).
     if !context().substrate_active {
-        return SbiRet { error: ERR_DENIED, value: 0 };
+        return SbiRet {
+            error: ERR_DENIED,
+            value: 0,
+        };
     }
     if sender_sdid() != context().host_sdid {
-        return SbiRet { error: ERR_DENIED, value: 0 };
+        return SbiRet {
+            error: ERR_DENIED,
+            value: 0,
+        };
     }
     if !is_tsm_ready() {
-        return SbiRet { error: ERR_FAILED, value: 0 };
+        return SbiRet {
+            error: ERR_FAILED,
+            value: 0,
+        };
     }
-    // Pending upstream rustsbi#286: the sequenced implementation is kept in
-    // [`switch::teecall_enter`].
-    error!(
-        "RDSM: TEECALL (EID function {function}) requires runtime frame access (rustsbi#286); rejecting"
-    );
-    let _ = (function, args);
-    SbiRet { error: ERR_FAILED, value: 0 }
+    switch::teecall(eid, function, args)
 }
 
-// ── Retentive domain switching (pending upstream rustsbi#286) ──────────
+// ── Retentive domain switching ─────────────────────────────────────────
 
-/// Retentive domain switching, sequenced end-to-end on top of the
-/// [`rdsm_mech`] primitives but not yet wired: reaching these functions
-/// requires reading and rewriting the Runtime's trap frame, which is
-/// `pub(crate)` upstream (proposal: rustsbi#286). Once that lands, the
-/// embedding firmware bridges its frame to [`FrameRegs`] and calls into
-/// this module from its dispatch path.
+/// Retentive host↔TSM domain switching, sequenced end-to-end on top of the
+/// [`rdsm_mech`] primitives and the Runtime's declarative execution
+/// contexts held in the per-hart `CONTEXTS` slots.
 ///
-/// Unlike the fast-trap era these functions never touch `mscratch` (the
-/// Runtime's sentinel is private) and never advance `mepc` by instruction
-/// length (ecalls are always 4 bytes; the resume `pc` values here are the
-/// other domain's saved or entry PCs).
-#[allow(dead_code)] // pending upstream rustsbi#286
+/// Every entry follows the same shape (CoVE ABI v0.7 §5.3):
+///
+/// 1. Guards — every predictable failure is checked before any state
+///    changes, because a failed retentive transfer does not unwind the
+///    adjacent ceremony that has already run (the transfer's own failure
+///    boundary sits at staging time).
+/// 2. Snapshot patch — the resume source's saved GPR snapshot is updated
+///    through the context data API (call arguments in, return values out).
+/// 3. Adjacent ceremony — save the outgoing CSR half, restore the incoming
+///    CSR half, program the incoming domain (`mmpt` + `MFENCE.PA` + SIDN).
+/// 4. Stage — hand both contexts to the Runtime; its ceremony on this
+///    hart's ecall return path saves the outgoing GPR/PC/`satp` state,
+///    installs the incoming one, and `mret`s. A successful stage never
+///    returns to the caller.
+///
+/// On non-RISC-V targets (host unit tests) the CSR half and the domain
+/// programming are no-ops and the staging step is compiled out, so the
+/// guard and snapshot data flow is exercised without hardware.
 pub mod switch {
-    use log::info;
+    use log::{error, info};
 
-    use rdsm_mech::{
-        FrameRegs, Thcs, program_domain, restore_domain_csrs, save_domain_csrs,
-        stage_domain_return, stage_first_domain_entry,
-    };
     use rdsm_abi::{NORMAL_RETURN, TSM_READY};
+    use rdsm_mech::{DomainCsrs, program_domain, restore_domain_csrs, save_domain_csrs};
+    use runtime::context::{ContextState, ProtectionState};
+    use sbi_spec::binary::SbiRet;
 
-    use super::{THCS, context};
+    use super::{CONTEXTS, THCS, context, context_mut};
 
-    /// Host→TSM TEECALL: saves the host context into `hssa`, switches the
-    /// hart to the confidential domain, and restores the TSM's saved state
-    /// into `frame`. The host call arguments arrive in `frame.a` and are
-    /// passed through to the TSM.
-    pub fn teecall_enter(frame: &mut FrameRegs) {
-        let epc = riscv::register::mepc::read();
-        let host_a = frame.a;
-
-        // 1. Save Host context to THCS.hssa
-        {
-            let th = THCS.get_mut();
-            let h = &mut th.hssa;
-            h.ra = frame.ra;
-            h.sp = frame.sp;
-            h.gp = frame.gp;
-            h.tp = frame.tp;
-            h.t = frame.t;
-            h.s = frame.s;
-            h.a = host_a;
-            h.pc = epc + 4;
-            save_domain_csrs(h);
+    /// Maps a context/transfer failure onto the private error channel. The
+    /// error value's only contractual property is non-zero-ness (TSM and
+    /// host park or report on any failure).
+    fn err_after(reason: &str, e: runtime::context::TransferError) -> SbiRet {
+        error!("RDSM: retentive transfer failed ({reason}): {e:?}");
+        SbiRet {
+            error: super::ERR_FAILED,
+            value: 0,
         }
-
-        // 2. Switch the MPT view to the confidential domain
-        let r_ctx = context();
-        let mpt_mode = r_ctx.mpt_mode.unwrap_or(rdsm::csr::MptMode::Bare);
-        program_domain(mpt_mode, r_ctx.conf_sdid, r_ctx.conf_root_ppn, r_ctx.conf_sidn);
-
-        // 3. Restore the TSM's saved CSRs and registers; the host call
-        //    arguments ride through in a0..a7
-        let th: &Thcs = THCS.get();
-        restore_domain_csrs(&th.tssa);
-
-        let tsm_pc = th.tssa.pc;
-        frame.a = host_a;
-        frame.ra = th.tssa.ra;
-        frame.t = th.tssa.t;
-        frame.s = th.tssa.s;
-        frame.sp = th.tssa.sp;
-        frame.gp = th.tssa.gp;
-        frame.tp = th.tssa.tp;
-        stage_domain_return(tsm_pc);
     }
 
-    /// TSM→host TEERET. `Ok(())` means the switch staged successfully and
-    /// the hart must resume into the host domain (no SBI return reaches the
-    /// TSM); `Err(reason)` reports an unsupported TEERET reason for the
-    /// caller to encode.
-    pub fn teeret(frame: &mut FrameRegs, reason: usize) -> Result<(), usize> {
-        match reason {
-            TSM_READY => {
-                let requested_entry = frame.a[1];
-                let r_ctx = context();
-                let tsm_entry = if requested_entry != 0 {
-                    requested_entry
-                } else {
-                    r_ctx.tsm_entry_paddr
-                };
+    fn failed(reason: &str) -> SbiRet {
+        error!("RDSM: retentive transfer rejected: {reason}");
+        SbiRet {
+            error: super::ERR_FAILED,
+            value: 0,
+        }
+    }
 
-                // 1. Save the TSM's first-boot context into tssa and mark
-                //    the TSM ready
-                {
-                    let th = THCS.get_mut();
-                    let t = &mut th.tssa;
-                    t.pc = tsm_entry;
-                    t.sp = frame.sp;
-                    t.gp = frame.gp;
-                    t.tp = frame.tp;
-                    t.ra = frame.ra;
-                    t.t = frame.t;
-                    t.s = frame.s;
-                    t.a = frame.a;
-                    save_domain_csrs(t);
-                    th.tsm_ready = true;
+    /// FID3 TEERET from the confidential domain. `args[0]` is the reason,
+    /// the remaining parameters are reason-specific.
+    pub fn teeret(args: [usize; 6]) -> SbiRet {
+        match args[0] {
+            TSM_READY => teeret_tsm_ready(args[1]),
+            NORMAL_RETURN => teeret_normal_return(args[1], args[2]),
+            other => {
+                error!("RDSM: TEERET reason {other:#x} not supported");
+                SbiRet {
+                    error: super::ERR_FAILED,
+                    value: 0,
                 }
-
-                info!("[RDSM] Switching to Host Domain (SDID=0)...");
-
-                // 2. Switch the MPT view to the host domain
-                let mpt_mode = r_ctx.mpt_mode.unwrap_or(rdsm::csr::MptMode::Bare);
-                program_domain(mpt_mode, r_ctx.host_sdid, r_ctx.host_root_ppn, r_ctx.host_sidn);
-
-                // 3. Fabricate the first (non-retentive) host entry state
-                let host_entry_paddr = r_ctx.host_entry_paddr;
-                let fdt_address = r_ctx.fdt_address;
-                stage_first_domain_entry(host_entry_paddr);
-
-                frame.a[0] = r_ctx.hart_id;
-                frame.a[1] = fdt_address;
-                Ok(())
             }
-            NORMAL_RETURN => {
-                let epc = riscv::register::mepc::read();
-                let tsm_err = frame.a[1];
-                let tsm_val = frame.a[2];
+        }
+    }
 
-                // 1. Save TSM context to THCS.tssa
-                {
-                    let th = THCS.get_mut();
-                    let t = &mut th.tssa;
-                    t.ra = frame.ra;
-                    t.sp = frame.sp;
-                    t.gp = frame.gp;
-                    t.tp = frame.tp;
-                    t.t = frame.t;
-                    t.s = frame.s;
-                    t.a = frame.a;
-                    t.pc = epc + 4;
-                    save_domain_csrs(t);
-                }
+    /// TEERET(TSM_READY): the TSM announces readiness and hands the hart to
+    /// the host. The host context is fabricated fresh (the "initialized by
+    /// the TSM-driver" case of the ABI's THCS model), the running TSM
+    /// execution is adopted by its context at staging time.
+    fn teeret_tsm_ready(requested_entry: usize) -> SbiRet {
+        let hart = CONTEXTS.get();
+        // Only the first TSM_READY may enter: afterwards the host context
+        // holds either a parked snapshot or the running execution.
+        if hart.host.state() != ContextState::Empty {
+            return failed("TSM_READY but the host context is not fresh");
+        }
 
-                // 2. Switch the MPT view to the host domain
-                let r_ctx = context();
-                let mpt_mode = r_ctx.mpt_mode.unwrap_or(rdsm::csr::MptMode::Bare);
-                program_domain(mpt_mode, r_ctx.host_sdid, r_ctx.host_root_ppn, r_ctx.host_sidn);
+        let r_ctx = context();
+        let entry = if requested_entry != 0 {
+            requested_entry
+        } else {
+            r_ctx.tsm_entry_paddr
+        };
+        let (hart_id, fdt_address, host_entry_paddr) =
+            (r_ctx.hart_id, r_ctx.fdt_address, r_ctx.host_entry_paddr);
+        let (mpt_mode, host_sdid, host_root_ppn, host_sidn) = (
+            r_ctx.mpt_mode.unwrap_or(rdsm::csr::MptMode::Bare),
+            r_ctx.host_sdid,
+            r_ctx.host_root_ppn,
+            r_ctx.host_sidn,
+        );
 
-                // 3. Restore Host saved CSRs and registers; the TSM's
-                //    returned error/value land in host a0/a1
-                let th: &Thcs = THCS.get();
-                restore_domain_csrs(&th.hssa);
+        // Fabricate the first host entry snapshot with the non-retentive
+        // next-stage convention: a0 = hart id, a1 = FDT address, everything
+        // else zero, bare translation.
+        let mut gprs = [0usize; 32];
+        gprs[10] = hart_id;
+        gprs[11] = fdt_address;
+        if let Err(e) = hart
+            .host
+            .fill(gprs, host_entry_paddr, ProtectionState::Bare)
+        {
+            return err_after("fill of the fresh host context", e);
+        }
+        if let Err(e) = hart.host.park() {
+            return err_after("park of the fresh host context", e);
+        }
 
-                let h = &th.hssa;
-                frame.ra = h.ra;
-                frame.t = h.t;
-                frame.s = h.s;
-                frame.a[0] = tsm_err;
-                frame.a[1] = tsm_val;
-                frame.a[2] = h.a[2];
-                frame.a[3] = h.a[3];
-                frame.a[4] = h.a[4];
-                frame.a[5] = h.a[5];
-                frame.a[6] = h.a[6];
-                frame.a[7] = h.a[7];
-                frame.gp = h.gp;
-                frame.tp = h.tp;
-                frame.sp = h.sp;
-                stage_domain_return(h.pc);
-                Ok(())
+        let th = THCS.get_mut();
+        th.tsm_ready = true;
+        // Preserve the TSM's boot-time CSR half (notably `scontext`, which
+        // carries the per-hart dispatch-stack index) for the first TEECALL.
+        save_domain_csrs(&mut th.tsm_csrs);
+        context_mut().dispatch_entry = Some(entry);
+
+        info!("[RDSM] Switching to Host Domain (SDID=0)...");
+
+        // Adjacent ceremony: the host has no CSR history to restore, so its
+        // half comes up zeroed (fresh-boot semantics); then activate the
+        // host domain and stage the transfer.
+        restore_domain_csrs(&DomainCsrs::new());
+        program_domain(mpt_mode, host_sdid, host_root_ppn, host_sidn);
+        #[cfg(target_arch = "riscv64")]
+        if let Err(e) = runtime::trap::stage_retentive_transfer(&hart.tsm, &hart.host) {
+            return err_after("staging the transfer into the host", e);
+        }
+        // Unreachable on the hart: the staged transfer rewrites this call's
+        // trap frame and the hart resumes inside the host domain. On host
+        // tests the success value reports the staged data flow.
+        SbiRet {
+            error: super::SBI_SUCCESS,
+            value: 0,
+        }
+    }
+
+    /// TEERET(NORMAL_RETURN): the TSM hands the hart back to the host,
+    /// delivering `(error, value)` in the host's a0/a1 (the ABI requires
+    /// the TSM to always set both).
+    fn teeret_normal_return(err: usize, val: usize) -> SbiRet {
+        let hart = CONTEXTS.get();
+        // The host snapshot must be parked mid-ecall from its TEECALL.
+        if hart.host.state() != ContextState::Suspended {
+            return failed("NORMAL_RETURN but the host context holds no parked snapshot");
+        }
+
+        // Patch the return values into the suspended host snapshot.
+        let mut snap = hart.host.snapshot();
+        snap.gprs[10] = err;
+        snap.gprs[11] = val;
+        if let Err(e) = hart.host.fill(snap.gprs, snap.pc, snap.protection) {
+            return err_after("patching the host snapshot", e);
+        }
+
+        // Adjacent ceremony: swap the CSR half back to the host and activate
+        // the host domain.
+        let th = THCS.get_mut();
+        save_domain_csrs(&mut th.tsm_csrs);
+        restore_domain_csrs(&th.host_csrs);
+        let r_ctx = context();
+        program_domain(
+            r_ctx.mpt_mode.unwrap_or(rdsm::csr::MptMode::Bare),
+            r_ctx.host_sdid,
+            r_ctx.host_root_ppn,
+            r_ctx.host_sidn,
+        );
+        #[cfg(target_arch = "riscv64")]
+        if let Err(e) = runtime::trap::stage_retentive_transfer(&hart.tsm, &hart.host) {
+            return err_after("staging the transfer into the host", e);
+        }
+        SbiRet {
+            error: super::SBI_SUCCESS,
+            value: 0,
+        }
+    }
+
+    /// TEECALL from the host domain (COVH / COVI): parks the host mid-ecall
+    /// and resumes the TSM at its dispatch entry (first call) or parked
+    /// breakpoint (subsequent calls), with the call packed into a0–a7.
+    pub fn teecall(eid: usize, function: usize, args: [usize; 6]) -> SbiRet {
+        let hart = CONTEXTS.get();
+        // The TSM snapshot is suspended after its TSM_READY transfer; an
+        // empty snapshot is admissible as a cold dispatch (its data is fully
+        // rewritten below). Any other state means the TSM is mid-transfer.
+        match hart.tsm.state() {
+            ContextState::Suspended | ContextState::Empty => {}
+            _ => return failed("TEECALL but the TSM context is not resumable"),
+        }
+
+        // Patch the call into the TSM snapshot: a0–a5 = parameters,
+        // a6 = function, a7 = extension id; resume at the registered
+        // dispatch entry the first time and at the parked breakpoint after.
+        let mut snap = hart.tsm.snapshot();
+        snap.gprs[10..16].copy_from_slice(&args);
+        snap.gprs[16] = function;
+        snap.gprs[17] = eid;
+        let resume_pc = context_mut().dispatch_entry.take().unwrap_or(snap.pc);
+        if let Err(e) = hart.tsm.fill(snap.gprs, resume_pc, snap.protection) {
+            return err_after("patching the TSM snapshot", e);
+        }
+
+        // Adjacent ceremony: park the host's CSR half, restore the TSM's,
+        // and activate the confidential domain.
+        let th = THCS.get_mut();
+        save_domain_csrs(&mut th.host_csrs);
+        restore_domain_csrs(&th.tsm_csrs);
+        let r_ctx = context();
+        program_domain(
+            r_ctx.mpt_mode.unwrap_or(rdsm::csr::MptMode::Bare),
+            r_ctx.conf_sdid,
+            r_ctx.conf_root_ppn,
+            r_ctx.conf_sidn,
+        );
+        #[cfg(target_arch = "riscv64")]
+        if let Err(e) = runtime::trap::stage_retentive_transfer(&hart.host, &hart.tsm) {
+            return err_after("staging the transfer into the TSM", e);
+        }
+        SbiRet {
+            error: super::SBI_SUCCESS,
+            value: 0,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use runtime::context::{ContextState, ProtectionState};
+
+        use super::CONTEXTS;
+        use crate::{
+            EID_COVH, ERR_DENIED, ERR_FAILED, FID_RDSM_TEERET, NORMAL_RETURN, SBI_SUCCESS,
+            TSM_READY, context, context_mut, handle_rdsm, handle_teecall, is_tsm_ready,
+        };
+        use riscv_cove::host::CONVERT_PAGES;
+
+        // The switch state lives in process-global per-hart slots and cannot
+        // be reset from outside a transfer, so the whole lifecycle runs as
+        // one ordered scenario (host tests execute on slot 0).
+        #[test]
+        fn retentive_transfer_lifecycle_and_guards() {
+            // Guards with the substrate down: both handlers deny and leave
+            // every context untouched.
+            assert_eq!(
+                handle_rdsm(FID_RDSM_TEERET, [TSM_READY, 0, 0, 0, 0, 0]).error,
+                ERR_DENIED
+            );
+            assert_eq!(handle_teecall(EID_COVH, 0, [0; 6]).error, ERR_DENIED);
+            assert_eq!(CONTEXTS.get().host.state(), ContextState::Empty);
+            assert_eq!(CONTEXTS.get().tsm.state(), ContextState::Empty);
+
+            // Simulated bring-up on the fake hart.
+            {
+                let ctx = context_mut();
+                ctx.substrate_active = true;
+                ctx.hart_id = 3;
+                ctx.fdt_address = 0xf000_0000;
+                ctx.host_entry_paddr = 0x8080_0100;
+                ctx.tsm_entry_paddr = 0x8040_0000;
             }
-            other => Err(other),
+
+            // A TEECALL before TSM_READY is rejected without side effects.
+            assert_eq!(handle_teecall(EID_COVH, 0, [0; 6]).error, ERR_FAILED);
+            assert_eq!(CONTEXTS.get().tsm.state(), ContextState::Empty);
+            assert_eq!(context().dispatch_entry, None);
+
+            // TSM_READY fabricates and parks the first host snapshot.
+            let ret = handle_rdsm(FID_RDSM_TEERET, [TSM_READY, 0x8040_2000, 0, 0, 0, 0]);
+            assert_eq!(ret.error, SBI_SUCCESS);
+            assert_eq!(CONTEXTS.get().host.state(), ContextState::Suspended);
+            let snap = CONTEXTS.get().host.snapshot();
+            assert_eq!(snap.gprs[10], 3, "a0 carries the hart id");
+            assert_eq!(snap.gprs[11], 0xf000_0000, "a1 carries the FDT address");
+            assert_eq!(snap.pc, 0x8080_0100, "resume at the host entry");
+            assert_eq!(snap.protection, ProtectionState::Bare);
+            assert_eq!(context().dispatch_entry, Some(0x8040_2000));
+            assert!(is_tsm_ready());
+
+            // A second TSM_READY is refused: the host context is no longer
+            // fresh (host snapshot parked).
+            assert_eq!(
+                handle_rdsm(FID_RDSM_TEERET, [TSM_READY, 0x8040_2000, 0, 0, 0, 0]).error,
+                ERR_FAILED
+            );
+
+            // First TEECALL: dispatch entry consumed, call packed into a0-a7.
+            let ret = handle_teecall(EID_COVH, CONVERT_PAGES, [0x8000_1000, 0x2000, 0, 0, 0, 0]);
+            assert_eq!(ret.error, SBI_SUCCESS);
+            let snap = CONTEXTS.get().tsm.snapshot();
+            assert_eq!(&snap.gprs[10..16], &[0x8000_1000, 0x2000, 0, 0, 0, 0]);
+            assert_eq!(snap.gprs[16], CONVERT_PAGES, "a6 carries the function id");
+            assert_eq!(snap.gprs[17], EID_COVH, "a7 carries the extension id");
+            assert_eq!(
+                snap.pc, 0x8040_2000,
+                "first dispatch uses the registered entry"
+            );
+            assert_eq!(context().dispatch_entry, None);
+
+            // Second TEECALL resumes at the parked snapshot's breakpoint.
+            let ret = handle_teecall(EID_COVH, CONVERT_PAGES, [0x8000_3000, 0x1000, 0, 0, 0, 0]);
+            assert_eq!(ret.error, SBI_SUCCESS);
+            let snap = CONTEXTS.get().tsm.snapshot();
+            assert_eq!(&snap.gprs[10..16], &[0x8000_3000, 0x1000, 0, 0, 0, 0]);
+            assert_eq!(snap.pc, 0x8040_2000, "resume at the parked breakpoint");
+
+            // NORMAL_RETURN injects the TSM's result into the host's a0/a1
+            // and keeps the host's own resume point.
+            let ret = handle_rdsm(FID_RDSM_TEERET, [NORMAL_RETURN, 5, 0xdead_beef, 0, 0, 0]);
+            assert_eq!(ret.error, SBI_SUCCESS);
+            let snap = CONTEXTS.get().host.snapshot();
+            assert_eq!(snap.gprs[10], 5, "a0 carries the TSM error");
+            assert_eq!(snap.gprs[11], 0xdead_beef, "a1 carries the TSM value");
+            assert_eq!(snap.pc, 0x8080_0100, "host resume point preserved");
+
+            // Leave the substrate down for the rest of the test binary.
+            context_mut().substrate_active = false;
         }
     }
 }
