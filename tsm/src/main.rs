@@ -122,7 +122,7 @@ pub const NUM_HARTS_MAX: usize = 8;
 /// 64 KiB per hart, same size as the boot stack.
 const DISPATCH_STACK_SIZE: usize = 0x10000;
 
-/// Per-hart dispatch stacks (phase 5.6): concurrent harts must not share
+/// Per-hart dispatch stacks: concurrent harts must not share
 /// one stack, since a dispatch may span the whole vCPU run loop.
 #[repr(C, align(16))]
 struct DispatchStacks([u8; DISPATCH_STACK_SIZE * NUM_HARTS_MAX]);
@@ -165,7 +165,7 @@ pub extern "C" fn tsm_main(hart_id: usize, _fdt_paddr: usize) -> ! {
         asm!("csrw 0x5a8, {}", in(reg) hart_id);
     }
 
-    // Phase 5.5: obtain the platform reserved-region layout from RDSM and
+    // Obtain the platform reserved-region layout from RDSM and
     // build the host-allocatable whitelist. Fail closed on error: without
     // a known memory map, every host-supplied address would be rejected.
     match rdsm_shim::rdsm_get_platform_info() {
@@ -303,7 +303,7 @@ fn handle_get_tsm_info(buf_paddr: usize, buf_len: usize) -> SbiRet {
     if buf_paddr % core::mem::align_of::<riscv_cove::host::TsmInfo>() != 0 {
         return SbiRet::invalid_address();
     }
-    // Phase 5.5: the result buffer must live in host-allocatable memory.
+    // The result buffer must live in host-allocatable memory.
     if !mm::is_host_range(
         buf_paddr,
         core::mem::size_of::<riscv_cove::host::TsmInfo>(),

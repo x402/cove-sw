@@ -53,7 +53,7 @@ use rdsm_abi::{COVE_PAYLOAD_VERSION, RdsmPlatformInfo};
 use sbi_spec::binary::SbiRet;
 
 // Private error codes: only non-zero-ness is contractual across the private
-// interface (see plans/TODO.zh.md Issue 2; the standard SBI DENIED is -4 and
+// interface (the standard SBI DENIED is -4 and
 // NOT_SUPPORTED is -2, which these are deliberately not). Encoded in the
 // register representation (`usize` two's complement), as the caller writes
 // them straight into the trap frame.
@@ -137,8 +137,8 @@ impl RdsmContext {
 ///
 /// Each hart that participates in domain switching keeps its own copy: the
 /// boot hart populates it during [`init`], and a secondary hart's copy is
-/// populated by its own RDSM bring-up (pending NEMU multi-hart execution,
-/// see phase-5.6 Track 3b — `TODO(multi-hart)`).
+/// populated by its own RDSM bring-up (pending NEMU multi-hart execution
+/// — `TODO(multi-hart)`).
 static RDSM_CONTEXT: PerHart<RdsmContext> = PerHart::new(RdsmContext::new());
 
 /// Per-hart domain save areas (`hssa`/`tssa`/`tsm_ready`).
@@ -448,9 +448,9 @@ pub fn init<P: rdsm::probe::TrapSafeCsr>(env: InitEnv<'_, P>) {
 
     // Set permissive permissions for the platform address range.
     //
-    // Phase 1 covers only the platform's memory region to keep page-pool
+    // Only the platform's memory region is covered to keep page-pool
     // usage bounded.  Full address-space coverage (0 ... usize::MAX) requires
-    // NAPOT support and is deferred to a future phase.
+    // NAPOT support and is deferred.
     let (ram_start, ram_end) = match env.ram_range {
         Some(range) => range,
         None => {
@@ -654,7 +654,7 @@ fn mpt_set(args: [usize; 6]) -> SbiRet {
         return SbiRet { error: ERR_INVALID_PARAM, value: 0 };
     };
 
-    // Alignment + reserved-region validation (plan 4.4):
+    // Alignment + reserved-region validation:
     // - paddr / len must be 4 KiB aligned, len nonzero, range in RAM
     // - host-domain updates must stay inside host-allocatable memory
     //   ([host_load, mpt_pool) ∪ [mpt_pool_end, ram_end))

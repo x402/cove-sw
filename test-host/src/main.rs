@@ -436,7 +436,7 @@ pub fn sbi_covh_destroy_tvm(tvm_id: usize) -> (usize, usize) {
 }
 
 /// Raw RDSM private-extension MPT_SET, issued from the host domain.
-/// Phase 5.5: must be rejected with SBI_ERR_DENIED by the sender check.
+/// Must be rejected with SBI_ERR_DENIED by the sender check.
 pub fn sbi_rdsm_mpt_set_from_host(
     target_sdid: usize,
     paddr: usize,
@@ -745,7 +745,7 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
 
     println!("[HOST] PHASE 4 PASS: FENCE_EXIT_OK");
 
-    // ── Phase 5.5: hostile-host validation ──────────────────────────────
+    // ── Hostile-host validation ──────────────────────────────
     // Every call below must be rejected by the TSM/RDSM input validation.
     println!("[HOST] PHASE 5.5: hostile-host validation tests...");
 

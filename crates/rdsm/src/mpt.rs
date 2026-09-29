@@ -89,7 +89,7 @@ const V_BIT: u64 = 1;
 /// Leaf bit position (bit 1). 0 = non-leaf, 1 = leaf.
 const L_BIT: u64 = 1 << 1;
 
-/// NAPOT bit position (bit 2). 0 = non-NAPOT, 1 = NAPOT (not used in Phase 1).
+/// NAPOT bit position (bit 2). 0 = non-NAPOT, 1 = NAPOT (currently unused).
 #[allow(dead_code)]
 const N_BIT: u64 = 1 << 2;
 
@@ -156,7 +156,7 @@ fn page_index_in_leaf(pa: usize) -> usize {
 /// Trait for allocating and freeing 4 KiB pages by physical page number.
 ///
 /// `alloc_page` returns a PPN (physical page number, not a byte address)
-/// of a zeroed or caller-initialized 4 KiB page. For Phase 1 bump-allocator
+/// of a zeroed or caller-initialized 4 KiB page. For bump-allocator
 /// implementations, `free_page` may be a no-op.
 pub trait MptPageAlloc {
     /// Allocate a 4 KiB page and return its PPN, or `None` if exhausted.
@@ -368,7 +368,7 @@ impl MptTree {
     /// Walks the radix tree from the root, allocating intermediate tables as
     /// needed. At the leaf level, sets the XWR field for the page within the
     /// leaf entry. If a higher-level leaf already covers this address, the
-    /// operation is silently skipped (Phase 1 limitation).
+    /// operation is silently skipped (current limitation).
     fn set_perm_single(&mut self, pa: usize, perm: MptPerm, alloc: &mut impl MptPageAlloc) {
         let levels = self.mode.levels();
         let mut current_ppn = self.root_ppn;
@@ -391,12 +391,12 @@ impl MptTree {
                     }
                     current_ppn = new_ppn;
                 } else {
-                    return; // Allocation failure — skip (Phase 1).
+                    return; // Allocation failure — skip.
                 }
             } else if !is_leaf(entry) {
                 current_ppn = decode_non_leaf_ppn(entry);
             } else {
-                return; // Already a leaf at a higher level — skip (Phase 1).
+                return; // Already a leaf at a higher level — skip.
             }
         }
 

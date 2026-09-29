@@ -5,7 +5,7 @@ use spin::{Mutex, MutexGuard, Once};
 pub const PAGE_SIZE: usize = 4096;
 pub const MAX_PAGES: usize = 512;
 
-// ── Host-allocatable memory whitelist (Phase 5.5) ───────────────────────
+// ── Host-allocatable memory whitelist ───────────────────────
 //
 // Derived once at boot from RDSM_GET_INFO. Host-supplied physical
 // addresses are only accepted when the whole range falls inside one of
@@ -83,7 +83,7 @@ impl PageTracker {
             None => return SbiRet::invalid_param(),
         };
 
-        // Only host-allocatable memory may be converted (Phase 5.5):
+        // Only host-allocatable memory may be converted:
         // firmware, TSM image and MPT page pool must stay out of reach.
         if !is_host_range(base_paddr, len) {
             return SbiRet::invalid_param();

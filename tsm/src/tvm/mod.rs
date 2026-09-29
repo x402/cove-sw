@@ -99,7 +99,7 @@ impl TvmManager {
         if params_paddr % core::mem::align_of::<TvmCreateParams>() != 0 {
             return SbiRet::invalid_address();
         }
-        // Phase 5.5: the parameter block must live in host-allocatable memory.
+        // The parameter block must live in host-allocatable memory.
         if !is_host_range(params_paddr, core::mem::size_of::<TvmCreateParams>()) {
             return SbiRet::invalid_address();
         }
@@ -245,7 +245,7 @@ impl TvmManager {
         {
             return SbiRet::invalid_address();
         }
-        // Phase 5.5: the source must be host-allocatable memory. Copying
+        // The source must be host-allocatable memory. Copying
         // from TSM-private or MPT-pool pages would leak confidential data
         // into guest-readable measured pages.
         let copy_len = match num_pages.checked_mul(PAGE_SIZE) {
@@ -438,7 +438,7 @@ impl TvmManager {
             if identity_addr % 64 != 0 {
                 return SbiRet::invalid_address();
             }
-            // Phase 5.5: the identity block must be host-allocatable memory.
+            // The identity block must be host-allocatable memory.
             if !is_host_range(identity_addr, 64) {
                 return SbiRet::invalid_address();
             }
@@ -456,7 +456,7 @@ impl TvmManager {
         SbiRet::success(0)
     }
 
-    // ---- Phase 4: COVG internal handlers (called from vcpu trap handler) ----
+    // ---- COVG internal handlers (called from vcpu trap handler) ----
 
     pub fn add_mmio_region_internal(&mut self, gpa: usize, len: usize) -> bool {
         let tvm = match self.active_tvm.as_mut() {
@@ -650,7 +650,7 @@ impl TvmManager {
             .is_ok()
     }
 
-    // ---- Phase 4: New COVH FIDs ----
+    // ---- New COVH FIDs ----
 
     pub fn add_shared_pages(
         &mut self,
@@ -667,7 +667,7 @@ impl TvmManager {
         if gpa % PAGE_SIZE != 0 || num_pages == 0 {
             return SbiRet::invalid_address();
         }
-        // Phase 5.5: shared pages must live in host-allocatable memory.
+        // Shared pages must live in host-allocatable memory.
         // Mapping TSM-private or MPT-pool pages into the guest would grant
         // it read/write access to confidential memory through the host MPT.
         let shared_len = match num_pages.checked_mul(PAGE_SIZE) {
@@ -813,7 +813,7 @@ pub fn tvm_manager() -> MutexGuard<'static, TvmManager> {
 
 /// Runs a TVM vCPU until its next exit.
 ///
-/// Phase 5.6 lock-boundary red line: no lock may be held while the guest
+/// Lock-boundary red line: no lock may be held while the guest
 /// runs, so the vCPU is detached from the manager for the duration of the
 /// run and re-attached after the exit. Guest-exit state lives in the
 /// vCPU's own context (per-hart state), not in shared globals.
