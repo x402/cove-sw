@@ -855,7 +855,7 @@ pub mod switch {
 
     use rdsm_abi::{NORMAL_RETURN, TSM_READY};
     use rdsm_mech::{DomainCsrs, program_domain, restore_domain_csrs, save_domain_csrs};
-    use runtime::context::{ContextState, ProtectionState};
+    use runtime::context::{ContextState, Satp};
     use sbi_spec::binary::SbiRet;
 
     use super::{CONTEXTS, THCS, context, context_mut};
@@ -925,13 +925,10 @@ pub mod switch {
         // Fabricate the first host entry snapshot with the non-retentive
         // next-stage convention: a0 = hart id, a1 = FDT address, everything
         // else zero, bare translation.
-        let mut gprs = [0usize; 32];
-        gprs[10] = hart_id;
-        gprs[11] = fdt_address;
-        if let Err(e) = hart
-            .host
-            .fill(gprs, host_entry_paddr, ProtectionState::Bare)
-        {
+        let mut x1_x31 = [0usize; 31];
+        x1_x31[9] = hart_id;
+        x1_x31[10] = fdt_address;
+        if let Err(e) = hart.host.fill(x1_x31, host_entry_paddr, Satp::from_bits(0)) {
             return err_after("fill of the fresh host context", e);
         }
         if let Err(e) = hart.host.park() {
@@ -977,9 +974,9 @@ pub mod switch {
 
         // Patch the return values into the suspended host snapshot.
         let mut snap = hart.host.snapshot();
-        snap.gprs[10] = err;
-        snap.gprs[11] = val;
-        if let Err(e) = hart.host.fill(snap.gprs, snap.pc, snap.protection) {
+        snap.x1_x31[9] = err;
+        snap.x1_x31[10] = val;
+        if let Err(e) = hart.host.fill(snap.x1_x31, snap.pc, snap.satp) {
             return err_after("patching the host snapshot", e);
         }
 
@@ -1022,11 +1019,11 @@ pub mod switch {
         // a6 = function, a7 = extension id; resume at the registered
         // dispatch entry the first time and at the parked breakpoint after.
         let mut snap = hart.tsm.snapshot();
-        snap.gprs[10..16].copy_from_slice(&args);
-        snap.gprs[16] = function;
-        snap.gprs[17] = eid;
+        snap.x1_x31[9..15].copy_from_slice(&args);
+        snap.x1_x31[15] = function;
+        snap.x1_x31[16] = eid;
         let resume_pc = context_mut().dispatch_entry.take().unwrap_or(snap.pc);
-        if let Err(e) = hart.tsm.fill(snap.gprs, resume_pc, snap.protection) {
+        if let Err(e) = hart.tsm.fill(snap.x1_x31, resume_pc, snap.satp) {
             return err_after("patching the TSM snapshot", e);
         }
 
@@ -1054,7 +1051,7 @@ pub mod switch {
 
     #[cfg(test)]
     mod tests {
-        use runtime::context::{ContextState, ProtectionState};
+        use runtime::context::{ContextState, Satp};
 
         use super::CONTEXTS;
         use crate::{
@@ -1098,10 +1095,10 @@ pub mod switch {
             assert_eq!(ret.error, SBI_SUCCESS);
             assert_eq!(CONTEXTS.get().host.state(), ContextState::Suspended);
             let snap = CONTEXTS.get().host.snapshot();
-            assert_eq!(snap.gprs[10], 3, "a0 carries the hart id");
-            assert_eq!(snap.gprs[11], 0xf000_0000, "a1 carries the FDT address");
+            assert_eq!(snap.x1_x31[9], 3, "a0 carries the hart id");
+            assert_eq!(snap.x1_x31[10], 0xf000_0000, "a1 carries the FDT address");
             assert_eq!(snap.pc, 0x8080_0100, "resume at the host entry");
-            assert_eq!(snap.protection, ProtectionState::Bare);
+            assert_eq!(snap.satp, Satp::from_bits(0));
             assert_eq!(context().dispatch_entry, Some(0x8040_2000));
             assert!(is_tsm_ready());
 
@@ -1116,9 +1113,9 @@ pub mod switch {
             let ret = handle_teecall(EID_COVH, CONVERT_PAGES, [0x8000_1000, 0x2000, 0, 0, 0, 0]);
             assert_eq!(ret.error, SBI_SUCCESS);
             let snap = CONTEXTS.get().tsm.snapshot();
-            assert_eq!(&snap.gprs[10..16], &[0x8000_1000, 0x2000, 0, 0, 0, 0]);
-            assert_eq!(snap.gprs[16], CONVERT_PAGES, "a6 carries the function id");
-            assert_eq!(snap.gprs[17], EID_COVH, "a7 carries the extension id");
+            assert_eq!(&snap.x1_x31[9..15], &[0x8000_1000, 0x2000, 0, 0, 0, 0]);
+            assert_eq!(snap.x1_x31[15], CONVERT_PAGES, "a6 carries the function id");
+            assert_eq!(snap.x1_x31[16], EID_COVH, "a7 carries the extension id");
             assert_eq!(
                 snap.pc, 0x8040_2000,
                 "first dispatch uses the registered entry"
@@ -1129,7 +1126,7 @@ pub mod switch {
             let ret = handle_teecall(EID_COVH, CONVERT_PAGES, [0x8000_3000, 0x1000, 0, 0, 0, 0]);
             assert_eq!(ret.error, SBI_SUCCESS);
             let snap = CONTEXTS.get().tsm.snapshot();
-            assert_eq!(&snap.gprs[10..16], &[0x8000_3000, 0x1000, 0, 0, 0, 0]);
+            assert_eq!(&snap.x1_x31[9..15], &[0x8000_3000, 0x1000, 0, 0, 0, 0]);
             assert_eq!(snap.pc, 0x8040_2000, "resume at the parked breakpoint");
 
             // NORMAL_RETURN injects the TSM's result into the host's a0/a1
@@ -1137,8 +1134,8 @@ pub mod switch {
             let ret = handle_rdsm(FID_RDSM_TEERET, [NORMAL_RETURN, 5, 0xdead_beef, 0, 0, 0]);
             assert_eq!(ret.error, SBI_SUCCESS);
             let snap = CONTEXTS.get().host.snapshot();
-            assert_eq!(snap.gprs[10], 5, "a0 carries the TSM error");
-            assert_eq!(snap.gprs[11], 0xdead_beef, "a1 carries the TSM value");
+            assert_eq!(snap.x1_x31[9], 5, "a0 carries the TSM error");
+            assert_eq!(snap.x1_x31[10], 0xdead_beef, "a1 carries the TSM value");
             assert_eq!(snap.pc, 0x8080_0100, "host resume point preserved");
 
             // Leave the substrate down for the rest of the test binary.
