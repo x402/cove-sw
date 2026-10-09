@@ -2,7 +2,7 @@
 
 ## 1. Overview and Architecture
 
-This document defines the interface and control transfer protocol between the **Root Domain Security Manager (RDSM)** operating in M-mode and the **Trusted Security Manager (TSM)** operating in HS-mode in the confidential domain (SDID=1), on a RISC-V platform equipped with Smmtt (Supervisor Domains Access Protection, v0.49) and CoVE (Confidential VM Extension, v0.7).
+This document defines the interface and control transfer protocol between the **Root Domain Security Manager (RDSM)** operating in M-mode and the **TEE Security Manager (TSM)** operating in HS-mode in the confidential domain (SDID=1), on a RISC-V platform equipped with Smmtt (Supervisor Domains Access Protection, v0.49) and CoVE (Confidential VM Extension, v0.7).
 
 ### Domain Layout
 
@@ -43,27 +43,32 @@ This document defines the interface and control transfer protocol between the **
 | TSM Reserved RAM    | (Accessible only in SDID=1; inaccessible to SDID=0)
 +---------------------+ 0x8080_0000 - Host Base Address
 | Host System Memory  | (Accessible in SDID=0 and SDID=1)
++---------------------+ 0x8090_0000 - MPT Page Pool (4 MiB)
+| MPT page pool       | (Reserved for RDSM; excluded from host-allocatable memory)
 +---------------------+ 0x9000_0000 (or platform RAM end)
 ```
 
-### 2.2 Standard PayloadHeader (4096 bytes)
+### 2.2 Standard PayloadHeader (72 bytes; canonical definition in `crates/rdsm-abi`)
 
 ```rust
-#[repr(C, align(4096))]
+#[repr(C)]
 pub struct PayloadHeader {
     pub magic: u32,             // 0x434F5645 ("COVE" in ASCII)
     pub version: u32,           // 1
     pub tsm_offset: u64,        // Byte offset of TSM.bin from start of payload
     pub tsm_size: u64,          // Size of TSM.bin in bytes
     pub tsm_load_paddr: u64,    // Physical target address to copy TSM.bin (0x80400000)
-    pub tsm_entry_paddr: u64,   // Entry point physical address for TSM (0x80400000)
+    pub tsm_entry_paddr: u64,   // Entry point physical address for TSM
     pub host_offset: u64,       // Byte offset of host.bin from start of payload
     pub host_size: u64,         // Size of host.bin in bytes
     pub host_load_paddr: u64,   // Physical target address to copy host.bin (0x80800000)
-    pub host_entry_paddr: u64,  // Entry point physical address for host (0x80800000)
-    pub reserved: [u8; 4024],
+    pub host_entry_paddr: u64,  // Entry point physical address for host
 }
 ```
+
+The header occupies the first 72 bytes of the payload image (layout asserted by
+`rdsm-abi` unit tests); the packer (`xtask pack`) pads the first page out to a
+full 4 KiB after this header.
 
 ---
 
@@ -75,16 +80,20 @@ pub struct PayloadHeader {
 
 | FID | Name | Arguments | Returns | Description |
 |---|---|---|---|---|
-| `0` | `RDSM_GET_INFO` | None | `sbiret { error, value: *const RdsmInfo }` | Returns RDSM capabilities and domain info |
+| `0` | `RDSM_GET_INFO` | `a2` = confidential-domain buffer address (optional) | `sbiret { error, value: MPT mode }` | Returns the active MPT mode; when `a2 != 0`, also writes `RdsmPlatformInfo` (RAM range, TSM region, MPT pool) into the buffer, from which the TSM derives its host-allocatable whitelist |
 | `1` | `RDSM_MPT_SET` | `a0=target_sdid`, `a1=paddr`, `a2=len`, `a3=xwr_perm` | `sbiret { error, value }` | Updates MPT entry for specified SDID |
 | `2` | `RDSM_MFENCE_PA`| `a0=paddr`, `a1=sdid` | `sbiret { error, value }` | Issues `MFENCE.PA` (and multi-hart broadcast) |
 | `3` | `RDSM_TEERET` | `a0=reason`, `a1=arg1`, `a2=arg2` | Does not return directly to caller | Transfers control back to RDSM |
 
 ### 3.2 TEERET Reasons (`a0`)
 
-- `TSM_SHUTDOWN = 0`: TSM shutdown / halt.
-- `TSM_SWITCH = 1`: Context switch / COVH call handling return.
-- `TSM_READY = 2`: Initial TSM boot complete; signal RDSM to switch to Host domain (`SDID=0`).
+- `NORMAL_RETURN = 0`: return to the host; `a1`/`a2` carry the `sbiret`
+  error/value pair that RDSM injects into the host's resumed `a0`/`a1`.
+- `TVM_EXIT = 1`: defined in `rdsm-abi` for forced TVM-exit notification;
+  not exercised by the current TSM flow.
+- `TSM_READY = 2`: initial TSM boot complete; `a1` optionally registers the
+  TSM's dispatch entry point (`0` = use the payload header entry), after which
+  RDSM performs the first host entry (`SDID=0`).
 
 ---
 
@@ -113,13 +122,15 @@ pub struct PayloadHeader {
        v
 [TSM (SDID=1): Boot]
   - Clear BSS, setup stack
-  - Console: "[TSM] Booting... TSM_READY"
-  - ecall RDSM_TEERET(TSM_READY)
+  - Console: "[TSM] Booting... TSM_READY" (+ "[MARKER 02]" completion line)
+  - Console: "[MARKER 03] RDSM: Switching context to Host Domain (SDID=0)."
+    (emitted by the TSM on RDSM's behalf, just before the TEERET — UART output
+    from inside the RDSM handler mid-domain-switch is unstable)
+  - ecall RDSM_TEERET(TSM_READY, a1=dispatch entry)
        |
        v
 [RDSM Trap Handler (EID=0x5244534D, FID=3, a0=TSM_READY)]
   - Save TSM context in THCS
-  - Console: "[RDSM] Switching to Host Domain (SDID=0)..."
   - mmpt = {MODE=Smmpt, SDID=0, PPN=MPT_HOST_ROOT}
   - MFENCE.PA x0, x0
   - MRET to Host Entry (0x80800000)
