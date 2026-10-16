@@ -855,7 +855,7 @@ pub mod switch {
 
     use rdsm_abi::{NORMAL_RETURN, TSM_READY};
     use rdsm_mech::{DomainCsrs, program_domain, restore_domain_csrs, save_domain_csrs};
-    use runtime::context::{ContextState, Satp};
+    use runtime::context::{ContextState, InterruptSet, Satp, StatusWriteValue, TargetPrivilege};
     use sbi_spec::binary::SbiRet;
 
     use super::{CONTEXTS, THCS, context, context_mut};
@@ -924,11 +924,18 @@ pub mod switch {
 
         // Fabricate the first host entry snapshot with the non-retentive
         // next-stage convention: a0 = hart id, a1 = FDT address, everything
-        // else zero, bare translation.
+        // else zero, bare translation, no interrupt sources, and the
+        // supervisor return state cleared (fresh-boot semantics).
         let mut x1_x31 = [0usize; 31];
         x1_x31[9] = hart_id;
         x1_x31[10] = fdt_address;
-        if let Err(e) = hart.host.fill(x1_x31, host_entry_paddr, Satp::from_bits(0)) {
+        if let Err(e) = hart.host.fill(
+            x1_x31,
+            host_entry_paddr,
+            Satp::from_bits(0),
+            InterruptSet::empty(),
+            StatusWriteValue::for_return(TargetPrivilege::Supervisor),
+        ) {
             return err_after("fill of the fresh host context", e);
         }
         if let Err(e) = hart.host.park() {
@@ -976,7 +983,7 @@ pub mod switch {
         let mut snap = hart.host.snapshot();
         snap.x1_x31[9] = err;
         snap.x1_x31[10] = val;
-        if let Err(e) = hart.host.fill(snap.x1_x31, snap.pc, snap.satp) {
+        if let Err(e) = hart.host.fill(snap.x1_x31, snap.pc, snap.satp, snap.sie, snap.status) {
             return err_after("patching the host snapshot", e);
         }
 
@@ -1023,7 +1030,7 @@ pub mod switch {
         snap.x1_x31[15] = function;
         snap.x1_x31[16] = eid;
         let resume_pc = context_mut().dispatch_entry.take().unwrap_or(snap.pc);
-        if let Err(e) = hart.tsm.fill(snap.x1_x31, resume_pc, snap.satp) {
+        if let Err(e) = hart.tsm.fill(snap.x1_x31, resume_pc, snap.satp, snap.sie, snap.status) {
             return err_after("patching the TSM snapshot", e);
         }
 
@@ -1051,7 +1058,7 @@ pub mod switch {
 
     #[cfg(test)]
     mod tests {
-        use runtime::context::{ContextState, Satp};
+        use runtime::context::{ContextState, InterruptSet, Satp, StatusWriteValue, TargetPrivilege};
 
         use super::CONTEXTS;
         use crate::{
@@ -1099,6 +1106,16 @@ pub mod switch {
             assert_eq!(snap.x1_x31[10], 0xf000_0000, "a1 carries the FDT address");
             assert_eq!(snap.pc, 0x8080_0100, "resume at the host entry");
             assert_eq!(snap.satp, Satp::from_bits(0));
+            assert_eq!(
+                snap.sie,
+                InterruptSet::empty(),
+                "fresh host starts with no interrupt sources"
+            );
+            assert_eq!(
+                snap.status,
+                StatusWriteValue::for_return(TargetPrivilege::Supervisor),
+                "fresh host return state is the cleared supervisor entry"
+            );
             assert_eq!(context().dispatch_entry, Some(0x8040_2000));
             assert!(is_tsm_ready());
 
@@ -1137,6 +1154,12 @@ pub mod switch {
             assert_eq!(snap.x1_x31[9], 5, "a0 carries the TSM error");
             assert_eq!(snap.x1_x31[10], 0xdead_beef, "a1 carries the TSM value");
             assert_eq!(snap.pc, 0x8080_0100, "host resume point preserved");
+            assert_eq!(snap.sie, InterruptSet::empty());
+            assert_eq!(
+                snap.status,
+                StatusWriteValue::for_return(TargetPrivilege::Supervisor),
+                "the patch cycle preserves the host's CSR half"
+            );
 
             // Leave the substrate down for the rest of the test binary.
             context_mut().substrate_active = false;

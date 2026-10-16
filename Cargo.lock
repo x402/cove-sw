@@ -313,6 +313,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustsbi-csr"
+version = "0.0.0"
+dependencies = [
+ "pastey",
+]
+
+[[package]]
 name = "rustsbi-firmware-runtime"
 version = "0.0.0"
 dependencies = [
@@ -320,12 +327,23 @@ dependencies = [
  "riscv",
  "riscv-decode",
  "rustsbi",
+ "rustsbi-csr",
+ "rustsbi-runtime-macros",
  "spin",
 ]
 
 [[package]]
 name = "rustsbi-macros"
 version = "0.0.2"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "rustsbi-runtime-macros"
+version = "0.0.0"
 dependencies = [
  "proc-macro2",
  "quote",
