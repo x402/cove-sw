@@ -1,0 +1,23 @@
+# Prototyper firmware configuration for the NEMU e2e flow.
+#
+# NEMU loads the firmware bare at 0x80000000 and passes no incoming FDT in
+# a1, so the firmware needs an explicit writable DTB handoff destination
+# (totalsize + 1 KiB of in-place patching slack). 0x82000000 sits beyond the
+# linked image and its per-hart stack extension.
+heap_size = 0x15000
+page_size = 4096
+log_level = "INFO"
+link_start_address = 0x80000000
+payload_address = 0x80200000
+jump_address = 0x80200000
+tlb_flush_limit = 16384
+fdt_handoff_address = 0x82000000
+fdt_handoff_capacity = 4096
+
+[[next_addr]]
+start = 0x20000000
+end = 0x24000000
+
+[[next_addr]]
+start = 0x80000000
+end = 0x90000000

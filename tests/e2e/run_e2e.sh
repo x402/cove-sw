@@ -97,7 +97,7 @@ echo "== [1/4] Packing cove-payload.bin =="
 [ -f "$PAYLOAD" ] || fail "payload not found at $PAYLOAD"
 
 echo "== [2/4] Building prototyper firmware =="
-(cd "$RUSTSBI_ROOT" && cargo prototyper build --fdt "$NEMU_DTB" payload "$PAYLOAD" >"$BUILD_LOG" 2>&1) || {
+(cd "$RUSTSBI_ROOT" && cargo prototyper build -f rdsm -c "$SCRIPT_DIR/nemu-prototyper.toml" --fdt "$NEMU_DTB" payload "$PAYLOAD" >"$BUILD_LOG" 2>&1) || {
   tail -n 20 "$BUILD_LOG"
   fail "cargo prototyper failed"
 }
