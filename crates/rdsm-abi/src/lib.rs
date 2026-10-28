@@ -26,6 +26,20 @@ pub const FID_RDSM_MFENCE_PA: usize = 2;
 /// Function ID for RDSM_TEERET: 3.
 pub const FID_RDSM_TEERET: usize = 3;
 
+/// Function ID for RDSM_SET_SIDN: 4.
+///
+/// Assigns the calling supervisor domain's active interrupt domain
+/// (Smsdia): a0 = target SDID, a1 = SIDN, a2 = reserved (must be zero).
+/// The RDSM validates that the SIDN was allocated to the target domain,
+/// programs `msdcfg.SIDN` (CSR 0x74E bits 5:0 — the only Smsdia-owned
+/// field; SETA/SEDA belong to Smsdetrca/Smsdedbga and are out of scope)
+/// and returns the effective `msdcfg` value. Callable only from the
+/// confidential domain, and only for itself (`target_sdid` must equal the
+/// sender's SDID): switching the active interrupt domain to a foreign
+/// domain's files would re-route this hart's supervisor external
+/// interrupts. Returns `not_supported` when Smsdia is absent.
+pub const FID_RDSM_SET_SIDN: usize = 4;
+
 // ── TEERET Reason constants ────────────────────────────────────────────
 
 /// Parameter a0 value for NORMAL_RETURN: 0.

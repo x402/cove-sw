@@ -7,7 +7,8 @@
 use core::arch::asm;
 
 use rdsm_abi::{
-    EID_RDSM, FID_RDSM_GET_INFO, FID_RDSM_MFENCE_PA, FID_RDSM_MPT_SET, FID_RDSM_TEERET,
+    EID_RDSM, FID_RDSM_GET_INFO, FID_RDSM_MFENCE_PA, FID_RDSM_MPT_SET, FID_RDSM_SET_SIDN,
+    FID_RDSM_TEERET,
 };
 
 pub use rdsm_abi::{NORMAL_RETURN, RdsmPlatformInfo, TSM_READY, TVM_EXIT};
@@ -92,6 +93,25 @@ pub fn rdsm_mfence_pa(paddr: usize, sdid: usize) -> (usize, usize) {
             in("a6") FID_RDSM_MFENCE_PA,
             inout("a0") paddr => err,
             inout("a1") sdid => val,
+        );
+    }
+    (err, val)
+}
+
+/// Re-asserts this supervisor domain's active interrupt domain (Smsdia).
+/// The RDSM validates ownership before touching `msdcfg`; the return value
+/// carries the effective `msdcfg` register value on success.
+pub fn rdsm_set_sidn(target_sdid: usize, sidn: usize) -> (usize, usize) {
+    let mut err: usize;
+    let mut val: usize;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a7") EID_RDSM,
+            in("a6") FID_RDSM_SET_SIDN,
+            inout("a0") target_sdid => err,
+            inout("a1") sidn => val,
+            in("a2") 0,
         );
     }
     (err, val)

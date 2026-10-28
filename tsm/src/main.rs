@@ -12,7 +12,9 @@ use core::fmt::{self, Write};
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use mm::page_tracker;
-use rdsm_shim::{NORMAL_RETURN, TSM_READY, rdsm_mfence_pa, rdsm_teeret};
+use rdsm_shim::{
+    NORMAL_RETURN, TSM_READY, rdsm_mfence_pa, rdsm_set_sidn, rdsm_teeret,
+};
 use tvm::{run_tvm_vcpu, tvm_manager};
 
 pub const TSM_IMPL_CUSTOM: u32 = 0x54534D31; // "TSM1"
@@ -182,6 +184,48 @@ pub extern "C" fn tsm_main(hart_id: usize, _fdt_paddr: usize) -> ! {
 
     println!("[TSM] Booting... TSM_READY");
     println!("[MARKER 02] TSM: Initialization complete, state=TSM_READY.");
+
+    // ── Smsdia channel self-check ────────────────────────────
+    // The TSM may only re-assert its own interrupt-domain assignment
+    // (SDID=1 ← SIDN=1, the boot-time conf-domain pair): RDSM rejects
+    // cross-domain assignments and unowned SIDNs before touching `msdcfg`.
+    // The own assignment is idempotent here; it exercises the full
+    // validation + CSR path so a broken Smsdia channel fails loudly.
+    const ERR_INVALID_PARAM: usize = (-3isize) as usize;
+    let (err, _) = rdsm_set_sidn(0, 0);
+    if err != ERR_INVALID_PARAM {
+        println!(
+            "[TSM PANIC] RDSM_SET_SIDN cross-domain assignment must be rejected (err={:#x})",
+            err
+        );
+        loop {
+            unsafe { core::arch::asm!("wfi") };
+        }
+    }
+    let (err, _) = rdsm_set_sidn(1, 0);
+    if err != ERR_INVALID_PARAM {
+        println!(
+            "[TSM PANIC] RDSM_SET_SIDN unowned SIDN must be rejected (err={:#x})",
+            err
+        );
+        loop {
+            unsafe { core::arch::asm!("wfi") };
+        }
+    }
+    let (err, msdcfg) = rdsm_set_sidn(1, 1);
+    if err != 0 {
+        println!(
+            "[TSM PANIC] RDSM_SET_SIDN own assignment rejected (err={:#x})",
+            err
+        );
+        loop {
+            unsafe { core::arch::asm!("wfi") };
+        }
+    }
+    println!(
+        "[COVI] RDSM_SET_SIDN verified (sdid=1, sidn=1, msdcfg=0x{:x}).",
+        msdcfg
+    );
 
     // Inform RDSM that TSM is ready and provide dispatch entry point.
     // The MARKER 03 line is printed here (just before the TEERET that makes

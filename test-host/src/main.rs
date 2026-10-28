@@ -459,6 +459,24 @@ pub fn sbi_rdsm_mpt_set_from_host(
     (error, value)
 }
 
+/// Raw RDSM private-extension SET_SIDN, issued from the host domain.
+/// Must be rejected with SBI_ERR_DENIED by the sender check.
+pub fn sbi_rdsm_set_sidn_from_host(target_sdid: usize, sidn: usize) -> (usize, usize) {
+    let mut error: usize;
+    let mut value: usize;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a7") rdsm_abi::EID_RDSM,
+            in("a6") rdsm_abi::FID_RDSM_SET_SIDN,
+            inout("a0") target_sdid => error,
+            inout("a1") sidn => value,
+            in("a2") 0,
+        );
+    }
+    (error, value)
+}
+
 /// Raw COVH get_tsm_info with an arbitrary (possibly hostile) buffer address.
 pub fn sbi_covh_get_tsm_info_raw(paddr: usize, len: usize) -> (usize, usize) {
     let mut error: usize;
@@ -864,6 +882,16 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
         "unknown COVH FID must be SBI_ERR_NOT_SUPPORTED"
     );
     println!("[HOST] P55-N10 OK: unknown COVH FID rejected");
+
+    // N11: direct RDSM SET_SIDN from the host domain must be denied — the
+    // interrupt-domain assignment is confidential-domain-only.
+    let (err, _) = sbi_rdsm_set_sidn_from_host(1, 1);
+    assert_eq!(
+        err,
+        (-8isize) as usize,
+        "host-domain SET_SIDN must be SBI_ERR_DENIED"
+    );
+    println!("[HOST] P55-N11 OK: host-domain SET_SIDN denied");
 
     let (err, _) = sbi_covh_destroy_tvm(tvm2);
     assert_eq!(err, 0);

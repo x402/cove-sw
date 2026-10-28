@@ -46,8 +46,8 @@ pub use riscv_cove::interrupt::EID_COVI;
 pub use riscv_cove::supd::EID_SUPD;
 // Private RDSM↔TSM contract: single source is rdsm-abi.
 pub use rdsm_abi::{
-    EID_RDSM, FID_RDSM_GET_INFO, FID_RDSM_MFENCE_PA, FID_RDSM_MPT_SET, FID_RDSM_TEERET,
-    NORMAL_RETURN, TSM_READY, TVM_EXIT,
+    EID_RDSM, FID_RDSM_GET_INFO, FID_RDSM_MFENCE_PA, FID_RDSM_MPT_SET, FID_RDSM_SET_SIDN,
+    FID_RDSM_TEERET, NORMAL_RETURN, TSM_READY, TVM_EXIT,
 };
 
 // The substrate, re-exported so embedders keep one dependency surface
@@ -71,6 +71,10 @@ const ERR_FAILED: usize = (-1isize) as usize;
 const ERR_INVALID_PARAM: usize = (-3isize) as usize;
 
 const SBI_SUCCESS: usize = 0;
+/// Standard SBI not-supported code: used where the *contractual* reply must
+/// match the SBI table (capability probing / absence of an optional
+/// extension), unlike the deliberately non-standard private codes above.
+const SBI_NOT_SUPPORTED: usize = (-2isize) as usize;
 
 /// Everything the embedding firmware must provide once, at boot.
 pub struct InitEnv<'a, P: rdsm::probe::TrapSafeCsr> {
@@ -102,6 +106,9 @@ pub struct RdsmContext {
     pub conf_sdid: usize,
     pub host_sidn: usize,
     pub conf_sidn: usize,
+    /// Smsdia probe result: `msdcfg` is writable and the interrupt-domain
+    /// assignment path (RDSM_SET_SIDN, COVI) is usable.
+    pub smsdia_available: bool,
     pub host_root_ppn: usize,
     pub conf_root_ppn: usize,
     pub tsm_load_paddr: usize,
@@ -131,6 +138,7 @@ impl RdsmContext {
             conf_sdid: 1,
             host_sidn: 0,
             conf_sidn: 1,
+            smsdia_available: false,
             host_root_ppn: 0,
             conf_root_ppn: 0,
             tsm_load_paddr: 0,
@@ -337,6 +345,22 @@ static SDID_ALLOCATOR: Mutex<SdidAllocator> = Mutex::new(SdidAllocator::new());
 /// Global SIDN allocator, initialized once on the boot hart.
 static SIDN_ALLOCATOR: Mutex<SidnAllocator> = Mutex::new(SidnAllocator::new());
 
+/// Ownership map from SIDN to the supervisor domain (SDID) it was allocated
+/// to. Written only during [`init`] on the boot hart (before any ecall path
+/// is reachable) and read on the RDSM_SET_SIDN path; indexed 0..63, matching
+/// the 6-bit `msdcfg.SIDN` field.
+static SIDN_OWNERS: Mutex<[Option<usize>; 64]> = Mutex::new([None; 64]);
+
+/// Records `sdid` as the owner of `sidn` (boot-time registration only).
+fn register_sidn_owner(sidn: usize, sdid: usize) {
+    SIDN_OWNERS.lock()[sidn] = Some(sdid);
+}
+
+/// Returns the owner of `sidn`, or `None` when the SIDN is unassigned.
+fn sidn_owner(sidn: usize) -> Option<usize> {
+    SIDN_OWNERS.lock()[sidn]
+}
+
 /// Returns a handle to the global SDID allocator.
 ///
 /// The returned guard holds the allocator lock; keep critical sections
@@ -441,7 +465,8 @@ pub fn init<P: rdsm::probe::TrapSafeCsr>(env: InitEnv<'_, P>) {
         mpt_mode, sdid_len
     );
 
-    if !probe_smsdia(probe) {
+    let smsdia_available = probe_smsdia(probe);
+    if !smsdia_available {
         warn!("RDSM: Smsdia not implemented, interrupt domain features limited");
     }
 
@@ -474,6 +499,11 @@ pub fn init<P: rdsm::probe::TrapSafeCsr>(env: InitEnv<'_, P>) {
         .alloc()
         .expect("SIDN allocation for conf failed");
     assert_eq!(conf_sidn, 1, "Confidential SIDN must be 1");
+
+    // Register which supervisor domain owns which interrupt domain; the
+    // RDSM_SET_SIDN path refuses assignments an SDID does not own.
+    register_sidn_owner(host_sidn, host_sdid);
+    register_sidn_owner(conf_sidn, conf_sdid);
 
     // Create MPT page allocator from the reserved pool.
     let mut mpt_alloc = rdsm_mech::MptBumpAlloc::from_pool();
@@ -588,6 +618,7 @@ pub fn init<P: rdsm::probe::TrapSafeCsr>(env: InitEnv<'_, P>) {
         r_ctx.conf_sdid = conf_sdid;
         r_ctx.host_sidn = host_sidn;
         r_ctx.conf_sidn = conf_sidn;
+        r_ctx.smsdia_available = smsdia_available;
         r_ctx.host_root_ppn = host_tree.root_ppn();
         r_ctx.conf_root_ppn = conf_tree.root_ppn();
     }
@@ -643,6 +674,7 @@ pub fn handle_rdsm(function: usize, args: [usize; 6]) -> SbiRet {
     match function {
         FID_RDSM_GET_INFO => get_info(args[2]),
         FID_RDSM_MPT_SET => mpt_set(args),
+        FID_RDSM_SET_SIDN => set_sidn(args),
         FID_RDSM_MFENCE_PA => {
             #[cfg(target_arch = "riscv64")]
             rdsm::fence::mfence_pa(args[0], args[1]);
@@ -765,6 +797,68 @@ fn mpt_set(args: [usize; 6]) -> SbiRet {
     SbiRet {
         error: SBI_SUCCESS,
         value: 0,
+    }
+}
+
+/// FID 4 SET_SIDN: assigns the calling supervisor domain's active interrupt
+/// domain by programming `msdcfg.SIDN` (Smsdia).
+///
+/// Guards, in order: Smsdia must be probed available (`not_supported`
+/// otherwise, matching the substrate's capability report); the reserved a2
+/// must be zero; a domain may only configure its own assignment
+/// (`target_sdid` must equal the sender's SDID — pointing the active SIDN
+/// at a foreign domain's files would re-route this hart's supervisor
+/// external interrupts); the SIDN must be one RDSM allocated to the target
+/// domain. On success returns the effective `msdcfg` value.
+fn set_sidn(args: [usize; 6]) -> SbiRet {
+    if !context().smsdia_available {
+        return SbiRet {
+            error: SBI_NOT_SUPPORTED,
+            value: 0,
+        };
+    }
+    if args[2] != 0 || args[1] >= 64 {
+        return SbiRet {
+            error: ERR_INVALID_PARAM,
+            value: 0,
+        };
+    }
+    let (target_sdid, sidn) = (args[0], args[1]);
+    #[cfg(target_arch = "riscv64")]
+    if target_sdid != sender_sdid() {
+        return SbiRet {
+            error: ERR_INVALID_PARAM,
+            value: 0,
+        };
+    }
+    #[cfg(not(target_arch = "riscv64"))]
+    if target_sdid != context().conf_sdid {
+        return SbiRet {
+            error: ERR_INVALID_PARAM,
+            value: 0,
+        };
+    }
+    if sidn_owner(sidn) != Some(target_sdid) {
+        return SbiRet {
+            error: ERR_INVALID_PARAM,
+            value: 0,
+        };
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        rdsm::interrupt::switch_interrupt_domain(sidn);
+        SbiRet {
+            error: SBI_SUCCESS,
+            value: rdsm::csr::Msdcfg::read().bits(),
+        }
+    }
+    #[cfg(not(target_arch = "riscv64"))]
+    {
+        SbiRet {
+            error: SBI_SUCCESS,
+            value: 0,
+        }
     }
 }
 
@@ -1062,8 +1156,9 @@ pub mod switch {
 
         use super::CONTEXTS;
         use crate::{
-            EID_COVH, ERR_DENIED, ERR_FAILED, FID_RDSM_TEERET, NORMAL_RETURN, SBI_SUCCESS,
-            TSM_READY, context, context_mut, handle_rdsm, handle_teecall, is_tsm_ready,
+            EID_COVH, ERR_DENIED, ERR_FAILED, ERR_INVALID_PARAM, FID_RDSM_SET_SIDN,
+            FID_RDSM_TEERET, NORMAL_RETURN, SBI_NOT_SUPPORTED, SBI_SUCCESS, TSM_READY, context,
+            context_mut, handle_rdsm, handle_teecall, is_tsm_ready,
         };
         use riscv_cove::host::CONVERT_PAGES;
 
@@ -1159,6 +1254,57 @@ pub mod switch {
                 snap.status,
                 StatusWriteValue::for_return(TargetPrivilege::Supervisor),
                 "the patch cycle preserves the host's CSR half"
+            );
+
+            // Leave the substrate down for the rest of the test binary.
+            context_mut().substrate_active = false;
+        }
+
+        #[test]
+        fn sidn_ownership_and_set_sidn_guards() {
+            use crate::{register_sidn_owner, sidn_owner};
+
+            // Bring the substrate up with Smsdia available (host builds
+            // treat the sender as the conf domain, matching conf_sdid=1).
+            context_mut().substrate_active = true;
+            context_mut().smsdia_available = true;
+            register_sidn_owner(1, 1);
+
+            // The reserved a2 must be zero, and the SIDN field is 6 bits.
+            assert_eq!(
+                handle_rdsm(FID_RDSM_SET_SIDN, [1, 1, 1, 0, 0, 0]).error,
+                ERR_INVALID_PARAM
+            );
+            assert_eq!(
+                handle_rdsm(FID_RDSM_SET_SIDN, [1, 64, 0, 0, 0, 0]).error,
+                ERR_INVALID_PARAM
+            );
+            // A domain may not configure a foreign domain's assignment.
+            assert_eq!(
+                handle_rdsm(FID_RDSM_SET_SIDN, [0, 0, 0, 0, 0, 0]).error,
+                ERR_INVALID_PARAM
+            );
+            // The SIDN must be owned by the target domain (0 belongs to the
+            // host domain, not to the calling conf domain).
+            assert_eq!(
+                handle_rdsm(FID_RDSM_SET_SIDN, [1, 0, 0, 0, 0, 0]).error,
+                ERR_INVALID_PARAM
+            );
+            // The owned assignment passes and reports the effective msdcfg
+            // (CSR programming itself is a host-build stub).
+            assert_eq!(
+                handle_rdsm(FID_RDSM_SET_SIDN, [1, 1, 0, 0, 0, 0]).error,
+                SBI_SUCCESS
+            );
+            // Ownership lookup reflects the registration.
+            assert_eq!(sidn_owner(1), Some(1));
+            assert_eq!(sidn_owner(63), None);
+
+            // Without Smsdia the FID reports the standard not-supported.
+            context_mut().smsdia_available = false;
+            assert_eq!(
+                handle_rdsm(FID_RDSM_SET_SIDN, [1, 1, 0, 0, 0, 0]).error,
+                SBI_NOT_SUPPORTED
             );
 
             // Leave the substrate down for the rest of the test binary.

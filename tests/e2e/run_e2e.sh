@@ -2,7 +2,7 @@
 # CoVE end-to-end test runner (Phase 5).
 #
 # Builds the full stack (test-guest/test-host/tsm -> cove-payload.bin ->
-# rustsbi-prototyper firmware), boots it under NEMU, and verifies the 17
+# rustsbi-prototyper firmware), boots it under NEMU, and verifies the
 # canonical serial markers appear in order without panics or access faults.
 #
 # Usage:
@@ -10,7 +10,7 @@
 #   NEMU_BIN=... NEMU_DTB=... ./run_e2e.sh   # override tool paths
 #   TIMEOUT_SECS=120 ./run_e2e.sh    # longer NEMU timeout
 #
-# Exit codes: 0 = all 17 markers matched in order; 1 = build/run/marker failure.
+# Exit codes: 0 = all markers matched in order; 1 = build/run/marker failure.
 # Serial log is kept at /tmp/cove_e2e.log (override with E2E_LOG).
 
 set -u
@@ -52,6 +52,7 @@ full)
     MARKERS=(
       '\[RDSM\] Booting\.\.\.'
       '\[MARKER 02\] TSM: Initialization complete, state=TSM_READY\.'
+      '\[COVI\] RDSM_SET_SIDN verified \(sdid=1, sidn=1, msdcfg=0x[0-9a-f]+\)\.'
       '\[MARKER 03\] RDSM: Switching context to Host Domain \(SDID=0\)\.'
       '\[MARKER 04\] HOST: Discovery passed \(EXT_SUPD & EXT_COVH found\)\.'
       '\[MARKER 05\] HOST: TSM capability probed, state=TSM_READY\.'
