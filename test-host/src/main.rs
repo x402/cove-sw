@@ -509,6 +509,52 @@ pub fn sbi_covh_raw_fid(fid: usize) -> (usize, usize) {
     (error, value)
 }
 
+pub fn sbi_covi_convert_aia_imsic(imsic_page_addr: usize) -> (usize, usize) {
+    let mut error: usize;
+    let mut value: usize;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a7") riscv_cove::interrupt::EID_COVI,
+            in("a6") riscv_cove::interrupt::CONVERT_AIA_IMSIC,
+            inout("a0") imsic_page_addr => error,
+            lateout("a1") value,
+        );
+    }
+    (error, value)
+}
+
+pub fn sbi_covi_reclaim_tvm_aia_imsic(imsic_page_addr: usize) -> (usize, usize) {
+    let mut error: usize;
+    let mut value: usize;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a7") riscv_cove::interrupt::EID_COVI,
+            in("a6") riscv_cove::interrupt::RECLAIM_TVM_AIA_IMSIC,
+            inout("a0") imsic_page_addr => error,
+            lateout("a1") value,
+        );
+    }
+    (error, value)
+}
+
+/// Raw COVI ecall with an arbitrary (possibly hostile) function id.
+pub fn sbi_covi_raw_fid(fid: usize) -> (usize, usize) {
+    let mut error: usize;
+    let mut value: usize;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a7") riscv_cove::interrupt::EID_COVI,
+            in("a6") fid,
+            lateout("a0") error,
+            lateout("a1") value,
+        );
+    }
+    (error, value)
+}
+
 /// Raw COVH create_tvm with an arbitrary (possibly hostile) params address.
 pub fn sbi_covh_create_tvm_at(params_paddr: usize, params_len: usize) -> (usize, usize) {
     let mut error: usize;
@@ -899,6 +945,73 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
     assert_eq!(err, 0);
 
     println!("[HOST] PHASE 5.5 PASS: HOST_VALIDATION_OK");
+
+    // ── Phase 7: COVI convert/reclaim skeleton ───────────────
+    println!("[HOST] PHASE 7: COVI convert/reclaim tests...");
+
+    // The extension must be advertised (probe = TSM ready + Smsdia + IMSIC).
+    let covi_probed = sbi_probe_extension(riscv_cove::interrupt::EID_COVI);
+    assert_eq!(covi_probed, 1, "EXT_COVI must be discovered via base probe");
+
+    // NEMU's DTB advertises the IMSIC at 0x3000_0000 with two machine-level
+    // interrupt files (hart0 at +0, hart1 at +0x1000). Hart1's file is
+    // unused by this single-hart e2e, making it a safe conversion subject;
+    // converting it must never touch the file's contents.
+    const IMSIC_HART1_FILE: usize = 0x3000_1000;
+
+    // C1: addresses outside the IMSIC whitelist are rejected outright.
+    let (err, _) = sbi_covi_convert_aia_imsic(0x9000_0000);
+    assert_eq!(
+        err,
+        (-5isize) as usize,
+        "non-IMSIC convert must be SBI_ERR_INVALID_ADDRESS"
+    );
+    // C2: misaligned IMSIC addresses are rejected.
+    let (err, _) = sbi_covi_convert_aia_imsic(IMSIC_HART1_FILE + 8);
+    assert_eq!(
+        err,
+        (-5isize) as usize,
+        "misaligned convert must be SBI_ERR_INVALID_ADDRESS"
+    );
+
+    // C3: the positive path — convert, fence, reclaim (CoVE 11.3 order),
+    // with the tracker-state violations interleaved.
+    let (err, _) = sbi_covi_convert_aia_imsic(IMSIC_HART1_FILE);
+    assert_eq!(err, 0, "convert_aia_imsic must succeed");
+    let (err, _) = sbi_covi_convert_aia_imsic(IMSIC_HART1_FILE);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "double convert must be SBI_ERR_INVALID_PARAM"
+    );
+    let (err, _) = sbi_covh_global_fence();
+    assert_eq!(err, 0, "post-convert global fence must succeed");
+    let (err, _) = sbi_covh_local_fence();
+    assert_eq!(err, 0, "post-convert local fence must succeed");
+    let (err, _) = sbi_covi_reclaim_tvm_aia_imsic(IMSIC_HART1_FILE + 0x1000);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "reclaim of an untracked page must be SBI_ERR_INVALID_PARAM"
+    );
+    let (err, _) = sbi_covi_reclaim_tvm_aia_imsic(IMSIC_HART1_FILE);
+    assert_eq!(err, 0, "reclaim_tvm_aia_imsic must succeed");
+    let (err, _) = sbi_covi_reclaim_tvm_aia_imsic(IMSIC_HART1_FILE);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "double reclaim must be SBI_ERR_INVALID_PARAM"
+    );
+
+    // C4: COVI FIDs outside the current skeleton report not-supported.
+    let (err, _) = sbi_covi_raw_fid(riscv_cove::interrupt::UNBIND_AIA_IMSIC_BEGIN);
+    assert_eq!(
+        err,
+        (-2isize) as usize,
+        "unimplemented COVI FID must be SBI_ERR_NOT_SUPPORTED"
+    );
+
+    println!("[MARKER 17] HOST: COVI convert/reclaim and negative paths PASSED.");
 
     println!("[MARKER 16] HOST: ALL COVE E2E TESTS PASSED!");
     loop {

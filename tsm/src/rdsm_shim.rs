@@ -24,6 +24,8 @@ pub fn rdsm_get_platform_info() -> Option<RdsmPlatformInfo> {
         tsm_region_end: 0,
         mpt_pool_start: 0,
         mpt_pool_end: 0,
+        imsic_range_start: 0,
+        imsic_range_end: 0,
     };
     let buf = &mut info as *mut RdsmPlatformInfo as usize;
     let mut err: usize;

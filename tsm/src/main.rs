@@ -336,6 +336,11 @@ pub extern "C" fn tsm_dispatch(
             riscv_cove::host::TVM_REMOVE_PAGES => tvm_manager().tvm_remove_pages(a0, a1, a2),
             _ => SbiRet::not_supported(),
         },
+        riscv_cove::interrupt::EID_COVI => match fid {
+            riscv_cove::interrupt::CONVERT_AIA_IMSIC => page_tracker().convert_imsic_page(a0),
+            riscv_cove::interrupt::RECLAIM_TVM_AIA_IMSIC => page_tracker().reclaim_imsic_page(a0),
+            _ => SbiRet::not_supported(),
+        },
         _ => SbiRet::not_supported(),
     }
 }

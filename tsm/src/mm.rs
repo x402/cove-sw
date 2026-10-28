@@ -14,7 +14,11 @@ pub const MAX_PAGES: usize = 512;
 
 static HOST_REGIONS: Once<[(usize, usize); 2]> = Once::new();
 
-/// Populate the whitelist from the RDSM-provided platform layout.
+/// IMSIC interrupt-file MMIO whitelist `(start, end)`, derived from the
+/// RDSM-provided platform layout. Zero-sized when the platform has no IMSIC.
+static IMSIC_REGION: Once<(usize, usize)> = Once::new();
+
+/// Populate the whitelists from the RDSM-provided platform layout.
 pub fn init_host_regions(info: &crate::rdsm_shim::RdsmPlatformInfo) {
     HOST_REGIONS.call_once(|| {
         [
@@ -22,6 +26,7 @@ pub fn init_host_regions(info: &crate::rdsm_shim::RdsmPlatformInfo) {
             (info.mpt_pool_end, info.ram_end),
         ]
     });
+    IMSIC_REGION.call_once(|| (info.imsic_range_start, info.imsic_range_end));
 }
 
 /// Fail-closed check: is `[paddr, paddr+len)` entirely host-allocatable?
@@ -42,6 +47,21 @@ pub fn is_host_range(paddr: usize, len: usize) -> bool {
     })
 }
 
+/// Fail-closed check: is `[paddr, paddr+len)` entirely inside the IMSIC
+/// interrupt-file MMIO region? Always false on IMSIC-less platforms.
+pub fn is_imsic_range(paddr: usize, len: usize) -> bool {
+    if len == 0 {
+        return false;
+    }
+    let end = match paddr.checked_add(len) {
+        Some(e) => e,
+        None => return false,
+    };
+    IMSIC_REGION
+        .get()
+        .map_or(false, |&(start, stop)| stop > start && paddr >= start && end <= stop)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PageState {
     NonConfidential,
@@ -52,6 +72,9 @@ pub enum PageState {
     AssignedPageTable,
     AssignedPayload,
     Shared,
+    /// IMSIC guest/manager interrupt file page owned by the TSM (COVI).
+    /// Device MMIO: contents are never read or written by software here.
+    ImsicFile,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -199,6 +222,103 @@ impl PageTracker {
         }
 
         SbiRet::success(0)
+    }
+
+    /// COVI convert_aia_imsic: turns a host-owned IMSIC interrupt file page
+    /// into a TSM-managed confidential page (CoVE 11.3). The host must run
+    /// the COVH global + local fence sequence afterwards before the page may
+    /// be assigned to a TVM.
+    ///
+    /// Address violations (misalignment, outside the IMSIC whitelist) are
+    /// `invalid_address`; tracker-state violations (already converted) are
+    /// `invalid_param`. Unlike RAM conversion there is no scrub step — the
+    /// page is device MMIO and writes to it would inject spurious
+    /// interrupts.
+    pub fn convert_imsic_page(&mut self, paddr: usize) -> SbiRet {
+        if paddr % PAGE_SIZE != 0 || !is_imsic_range(paddr, PAGE_SIZE) {
+            return SbiRet::invalid_address();
+        }
+        for slot in self.entries.iter().flatten() {
+            if slot.paddr == paddr {
+                return SbiRet::invalid_param();
+            }
+        }
+
+        // 1. Strip Host (SDID=0) access in MPT.
+        let (err0, _) = rdsm_mpt_set(0, paddr, PAGE_SIZE, 0); // NONE
+        if err0 != 0 {
+            return SbiRet::failed();
+        }
+
+        // 2. Grant Confidential (SDID=1) read-write access in MPT.
+        let (err1, _) = rdsm_mpt_set(1, paddr, PAGE_SIZE, 0b011); // RW
+        if err1 != 0 {
+            return SbiRet::failed();
+        }
+
+        // 3. Track the page as a TSM-owned interrupt file.
+        for slot in self.entries.iter_mut() {
+            if slot.is_none() {
+                *slot = Some(PageEntry {
+                    paddr,
+                    state: PageState::ImsicFile,
+                    owner_tvm_id: None,
+                    gpa: None,
+                });
+                return SbiRet::success(0);
+            }
+        }
+        SbiRet::failed()
+    }
+
+    /// COVI reclaim_tvm_aia_imsic: returns a TSM-owned interrupt file page
+    /// to the host (CoVE 11.4). The page must not be assigned to a TVM.
+    ///
+    /// No scrub step (device MMIO); the MPT update restores host access and
+    /// withdraws confidential access, followed by a global MPT fence.
+    pub fn reclaim_imsic_page(&mut self, paddr: usize) -> SbiRet {
+        if paddr % PAGE_SIZE != 0 {
+            return SbiRet::invalid_address();
+        }
+        let mut found = false;
+        for slot in self.entries.iter().flatten() {
+            if slot.paddr == paddr {
+                if slot.owner_tvm_id.is_some() || slot.state != PageState::ImsicFile {
+                    return SbiRet::invalid_param();
+                }
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return SbiRet::invalid_param();
+        }
+
+        // 1. Restore Host (SDID=0) access.
+        let (err0, _) = rdsm_mpt_set(0, paddr, PAGE_SIZE, 0b111); // RWX
+        if err0 != 0 {
+            return SbiRet::failed();
+        }
+
+        // 2. Withdraw Confidential (SDID=1) access.
+        let (err1, _) = rdsm_mpt_set(1, paddr, PAGE_SIZE, 0); // NONE
+        if err1 != 0 {
+            return SbiRet::failed();
+        }
+
+        // 3. Fence so the restored host access is visible.
+        let _ = rdsm_mfence_pa(0, 0);
+
+        // 4. Remove the tracker entry.
+        for slot in self.entries.iter_mut() {
+            if let Some(e) = slot {
+                if e.paddr == paddr {
+                    *slot = None;
+                    return SbiRet::success(0);
+                }
+            }
+        }
+        SbiRet::failed()
     }
 
     pub fn is_converted_and_free(&self, base_paddr: usize, num_pages: usize) -> bool {

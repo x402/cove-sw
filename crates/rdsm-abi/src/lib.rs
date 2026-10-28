@@ -108,6 +108,11 @@ impl PayloadHeader {
 /// The host-allocatable whitelist derivable from this structure is:
 /// `[tsm_region_end, mpt_pool_start)` ∪ `[mpt_pool_end, ram_end)` —
 /// everything else (firmware gap, TSM image, MPT page pool) is reserved.
+///
+/// `[imsic_range_start, imsic_range_end)` is the platform's IMSIC
+/// interrupt-file MMIO region (all machine- and guest-level files), outside
+/// RAM. A zero-sized range means the platform has no IMSIC; interrupt-file
+/// conversion must then be rejected wholesale (fail closed).
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct RdsmPlatformInfo {
@@ -119,9 +124,11 @@ pub struct RdsmPlatformInfo {
     pub tsm_region_end: usize,
     pub mpt_pool_start: usize,
     pub mpt_pool_end: usize,
+    pub imsic_range_start: usize,
+    pub imsic_range_end: usize,
 }
 
-const _: () = assert!(core::mem::size_of::<RdsmPlatformInfo>() == 48);
+const _: () = assert!(core::mem::size_of::<RdsmPlatformInfo>() == 64);
 
 #[cfg(test)]
 mod tests {

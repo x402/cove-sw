@@ -67,6 +67,7 @@ full)
       '\[MARKER 14\] HOST: Received TVM exit, tearing down TVM #[0-9]+\.'
       '\[MARKER 15\] HOST: All confidential pages reclaimed successfully\.'
       'PHASE 5\.5 PASS: HOST_VALIDATION_OK'
+      '\[MARKER 17\] HOST: COVI convert/reclaim and negative paths PASSED\.'
       '\[MARKER 16\] HOST: ALL COVE E2E TESTS PASSED!'
     )
     ;;

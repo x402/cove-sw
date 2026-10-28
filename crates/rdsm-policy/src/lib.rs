@@ -85,6 +85,9 @@ pub struct InitEnv<'a, P: rdsm::probe::TrapSafeCsr> {
     pub payload_base: usize,
     /// Platform RAM range `(start, end)`, `None` when unknown.
     pub ram_range: Option<(usize, usize)>,
+    /// IMSIC interrupt-file MMIO range `(start, end)`, `None` when the
+    /// platform has no IMSIC; gates interrupt-file conversion (COVI).
+    pub imsic_range: Option<(usize, usize)>,
     /// Hart ID of the boot hart running `init`.
     pub hart_id: usize,
     /// Whether the device tree advertises the `smsdid` extension.
@@ -120,6 +123,9 @@ pub struct RdsmContext {
     pub fdt_address: usize,
     /// Platform RAM range `(start, end)` captured from [`InitEnv`].
     pub ram_range: Option<(usize, usize)>,
+    /// IMSIC interrupt-file MMIO range `(start, end)` captured from
+    /// [`InitEnv`]; `None` disables COVI interrupt-file conversion.
+    pub imsic_range: Option<(usize, usize)>,
     /// Boot hart ID captured from [`InitEnv`].
     pub hart_id: usize,
     /// Dispatch entry the TSM registered with its TSM_READY TEERET, consumed
@@ -149,6 +155,7 @@ impl RdsmContext {
             host_size: 0,
             fdt_address: 0,
             ram_range: None,
+            imsic_range: None,
             hart_id: 0,
             dispatch_entry: None,
         }
@@ -421,6 +428,7 @@ pub fn init<P: rdsm::probe::TrapSafeCsr>(env: InitEnv<'_, P>) {
         let r_ctx = context_mut();
         r_ctx.hart_id = env.hart_id;
         r_ctx.ram_range = env.ram_range;
+        r_ctx.imsic_range = env.imsic_range;
     }
 
     // Check and load CoVE payload if present
@@ -699,6 +707,7 @@ fn get_info(info_buf: usize) -> SbiRet {
     let mode_val = r_ctx.mpt_mode.map_or(0, |m| m as usize);
     if info_buf != 0 {
         let (ram_start, ram_end) = r_ctx.ram_range.unwrap_or((0, 0));
+        let (imsic_start, imsic_end) = r_ctx.imsic_range.unwrap_or((0, 0));
         rdsm_mech::write_platform_info(
             info_buf,
             &RdsmPlatformInfo {
@@ -708,6 +717,8 @@ fn get_info(info_buf: usize) -> SbiRet {
                 tsm_region_end: r_ctx.host_load_paddr,
                 mpt_pool_start: rdsm_mech::MPT_PAGE_POOL_PADDR,
                 mpt_pool_end: rdsm_mech::MPT_PAGE_POOL_PADDR + rdsm_mech::MPT_PAGE_POOL_SIZE,
+                imsic_range_start: imsic_start,
+                imsic_range_end: imsic_end,
             },
         );
     }
@@ -758,25 +769,39 @@ fn mpt_set(args: [usize; 6]) -> SbiRet {
     };
 
     // Alignment + reserved-region validation:
-    // - paddr / len must be 4 KiB aligned, len nonzero, range in RAM
-    // - host-domain updates must stay inside host-allocatable memory
+    // - paddr / len must be 4 KiB aligned, len nonzero
+    // - ranges inside the IMSIC interrupt-file MMIO whitelist are accepted
+    //   for both domains (this is how interrupt files change ownership);
+    //   the whitelist is empty on IMSIC-less platforms, rejecting wholesale
+    // - otherwise the range must be in RAM, with host-domain updates staying
+    //   inside host-allocatable memory
     //   ([host_load, mpt_pool) ∪ [mpt_pool_end, ram_end))
-    // - conf-domain updates must not cover the firmware gap
+    //   and conf-domain updates not covering the firmware gap
     //   ([ram_start, tsm_load)) or the MPT page pool
     let range_ok = {
         let end = paddr.checked_add(len);
-        let (ram_start, ram_end) = r_ctx.ram_range.unwrap_or((0, 0));
-        match end {
-            Some(e) if e <= ram_end && paddr >= ram_start => {
-                let overlaps_pool = !(e <= rdsm_mech::MPT_PAGE_POOL_PADDR
-                    || paddr >= rdsm_mech::MPT_PAGE_POOL_PADDR + rdsm_mech::MPT_PAGE_POOL_SIZE);
-                if target_sdid == r_ctx.host_sdid {
-                    paddr >= r_ctx.host_load_paddr && !overlaps_pool
-                } else {
-                    paddr >= r_ctx.tsm_load_paddr && !overlaps_pool
-                }
+        let in_imsic = match (end, r_ctx.imsic_range) {
+            (Some(e), Some((imsic_start, imsic_end))) => {
+                paddr >= imsic_start && e <= imsic_end
             }
             _ => false,
+        };
+        if in_imsic {
+            true
+        } else {
+            let (ram_start, ram_end) = r_ctx.ram_range.unwrap_or((0, 0));
+            match end {
+                Some(e) if e <= ram_end && paddr >= ram_start => {
+                    let overlaps_pool = !(e <= rdsm_mech::MPT_PAGE_POOL_PADDR
+                        || paddr >= rdsm_mech::MPT_PAGE_POOL_PADDR + rdsm_mech::MPT_PAGE_POOL_SIZE);
+                    if target_sdid == r_ctx.host_sdid {
+                        paddr >= r_ctx.host_load_paddr && !overlaps_pool
+                    } else {
+                        paddr >= r_ctx.tsm_load_paddr && !overlaps_pool
+                    }
+                }
+                _ => false,
+            }
         }
     };
     if paddr % 4096 != 0 || len % 4096 != 0 || len == 0 || !range_ok {
@@ -887,8 +912,13 @@ pub fn covh_probe() -> usize {
     is_tsm_ready() as usize
 }
 
-/// BASE probe value for COVI: interrupt virtualization is not yet offered.
-pub const COVI_PROBE: usize = 0;
+/// BASE probe value for COVI: advertised once the TSM has announced
+/// readiness, Smsdia is implemented, and the platform provides an IMSIC
+/// interrupt-file region to virtualize. Absent any of these, the extension
+/// disappears from discovery and every COVI call is gated off at dispatch.
+pub fn covi_probe() -> usize {
+    (is_tsm_ready() && context().smsdia_available && context().imsic_range.is_some()) as usize
+}
 
 /// Handles a COVH / COVI call (TEECALL) from the host domain.
 ///
