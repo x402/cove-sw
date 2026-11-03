@@ -979,7 +979,7 @@ pub mod switch {
 
     use rdsm_abi::{NORMAL_RETURN, TSM_READY};
     use rdsm_mech::{DomainCsrs, program_domain, restore_domain_csrs, save_domain_csrs};
-    use runtime::context::{ContextState, InterruptSet, Satp, StatusWriteValue, TargetPrivilege};
+    use runtime::context::{AddressSpace, ContextState, InterruptSet, Status, Write};
     use sbi_spec::binary::SbiRet;
 
     use super::{CONTEXTS, THCS, context, context_mut};
@@ -1056,9 +1056,11 @@ pub mod switch {
         if let Err(e) = hart.host.fill(
             x1_x31,
             host_entry_paddr,
-            Satp::from_bits(0),
+            AddressSpace::bare(),
             InterruptSet::empty(),
-            StatusWriteValue::for_return(TargetPrivilege::Supervisor),
+            // Fresh-boot return state, all clear; the transfer ceremony
+            // forces MPP to Supervisor on every resume.
+            Status::<Write>::empty(),
         ) {
             return err_after("fill of the fresh host context", e);
         }
@@ -1182,7 +1184,7 @@ pub mod switch {
 
     #[cfg(test)]
     mod tests {
-        use runtime::context::{ContextState, InterruptSet, Satp, StatusWriteValue, TargetPrivilege};
+        use runtime::context::{AddressSpace, ContextState, InterruptSet, Status, Write};
 
         use super::CONTEXTS;
         use crate::{
@@ -1230,7 +1232,7 @@ pub mod switch {
             assert_eq!(snap.x1_x31[9], 3, "a0 carries the hart id");
             assert_eq!(snap.x1_x31[10], 0xf000_0000, "a1 carries the FDT address");
             assert_eq!(snap.pc, 0x8080_0100, "resume at the host entry");
-            assert_eq!(snap.satp, Satp::from_bits(0));
+            assert_eq!(snap.satp, AddressSpace::bare());
             assert_eq!(
                 snap.sie,
                 InterruptSet::empty(),
@@ -1238,7 +1240,7 @@ pub mod switch {
             );
             assert_eq!(
                 snap.status,
-                StatusWriteValue::for_return(TargetPrivilege::Supervisor),
+                Status::<Write>::empty(),
                 "fresh host return state is the cleared supervisor entry"
             );
             assert_eq!(context().dispatch_entry, Some(0x8040_2000));
@@ -1282,7 +1284,7 @@ pub mod switch {
             assert_eq!(snap.sie, InterruptSet::empty());
             assert_eq!(
                 snap.status,
-                StatusWriteValue::for_return(TargetPrivilege::Supervisor),
+                Status::<Write>::empty(),
                 "the patch cycle preserves the host's CSR half"
             );
 
