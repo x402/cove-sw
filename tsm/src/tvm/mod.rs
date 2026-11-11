@@ -480,7 +480,7 @@ impl TvmManager {
         // The host describes the same platform array the RDSM discovered;
         // anything else would point COVI at files the geometry cannot
         // account for. Groups are unsupported (single-group platform).
-        if params.imsic_base_addr as usize != geometry.range_start
+        if params.imsic_base_addr != geometry.range_start
             || params.group_index_bits != 0
             || params.group_index_shift != 0
             || params.hart_index_bits as usize != geometry.hart_index_bits
