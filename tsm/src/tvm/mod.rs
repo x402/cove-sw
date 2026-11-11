@@ -48,11 +48,25 @@ const HSTATUS_VGEIN_MASK: usize = 0x3F << HSTATUS_VGEIN_SHIFT;
 
 /// Indirect-window selectors of one interrupt file (AIA v1.0 §3.7).
 const ISELECT_EIDELIVERY: usize = 0x70;
+const ISELECT_EITHRESHOLD: usize = 0x72;
 const ISELECT_EIE0: usize = 0xC0;
 
 /// Clears a guest interrupt file's delivery line and drains its pending
 /// identities (destroy unbind). Runs in the TSM (confidential SIDN active)
 /// with `hstatus.VGEIN` temporarily pointed at the file.
+///
+/// Order matters: a pending identity is only claimable while enabled (the
+/// eie array gates topei, AIA v1.0 §3.7; eidelivery only gates the signal
+/// line, §3.9), so eie is set to all-ones before the claim loop.
+/// eithreshold is cleared first because a stale threshold would otherwise
+/// keep high identities unclaimable. After draining, the file is restored
+/// to its reset state (eie = 0, eidelivery = 0) so a later bind cannot
+/// inherit the previous tenant's interrupt state.
+///
+/// One 64-bit eie word at select 0xC0 covers every modeled identity
+/// (EXT_ID_MAX = 63; the platform model collapses the real hardware's
+/// 32-bit-per-word eip/eie array into a single word, so selects 0xC1+
+/// are outside the modeled file window and are not touched here).
 fn sanitize_guest_file(vgein: usize) {
     unsafe {
         let mut hstatus: usize;
@@ -61,11 +75,11 @@ fn sanitize_guest_file(vgein: usize) {
         hstatus = (hstatus & !HSTATUS_VGEIN_MASK) | (vgein << HSTATUS_VGEIN_SHIFT);
         core::arch::asm!("csrw hstatus, {}", in(reg) hstatus);
 
+        core::arch::asm!("csrw vsiselect, {}", in(reg) ISELECT_EITHRESHOLD);
+        core::arch::asm!("csrw vsireg, {}", in(reg) 0usize);
         core::arch::asm!("csrw vsiselect, {}", in(reg) ISELECT_EIE0);
-        core::arch::asm!("csrw vsireg, {}", in(reg) 0usize);
-        core::arch::asm!("csrw vsiselect, {}", in(reg) ISELECT_EIDELIVERY);
-        core::arch::asm!("csrw vsireg, {}", in(reg) 0usize);
-        for _ in 0..64 {
+        core::arch::asm!("csrw vsireg, {}", in(reg) usize::MAX);
+        for _ in 0..=EXT_ID_MAX {
             let topei: usize;
             core::arch::asm!("csrr {}, vstopei", out(reg) topei);
             if topei == 0 {
@@ -73,6 +87,10 @@ fn sanitize_guest_file(vgein: usize) {
             }
             core::arch::asm!("csrw vstopei, zero");
         }
+        core::arch::asm!("csrw vsiselect, {}", in(reg) ISELECT_EIE0);
+        core::arch::asm!("csrw vsireg, {}", in(reg) 0usize);
+        core::arch::asm!("csrw vsiselect, {}", in(reg) ISELECT_EIDELIVERY);
+        core::arch::asm!("csrw vsireg, {}", in(reg) 0usize);
 
         core::arch::asm!("csrw hstatus, {}", in(reg) saved);
     }
