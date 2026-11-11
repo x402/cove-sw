@@ -41,7 +41,8 @@ FIRMWARE="$RUSTSBI_ROOT/target/riscv64gc-unknown-none-elf/release/rustsbi-protot
 #   lifecycle lines are matched instead.
 #
 # MARKER_PROFILE selects the marker set:
-#   full    (default) all 17 markers — complete TEECALL/TEERET lifecycle.
+#   full    (default) all 22 markers — complete TEECALL/TEERET lifecycle
+#           plus the COVI bind/inject segment.
 #   interim phase-6.5 port profile: the substrate boots and the TSM runs,
 #           but the retentive TEERET is rejected (upstream rustsbi#286
 #           pending); the last marker is the TSM's interim parking line.
