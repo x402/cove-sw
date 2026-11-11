@@ -414,10 +414,10 @@ tsm_guest_trap_vector:
     sd s9, 200(a0)
     sd s10, 208(a0)
     sd s11, 216(a0)
-    ld t3, 224(a0)
-    ld t4, 232(a0)
-    ld t5, 240(a0)
-    ld t6, 248(a0)
+    sd t3, 224(a0)
+    sd t4, 232(a0)
+    sd t5, 240(a0)
+    sd t6, 248(a0)
 
     csrr t0, sepc
     sd t0, 256(a0)
