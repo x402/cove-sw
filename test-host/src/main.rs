@@ -678,7 +678,10 @@ static mut AIA_PARAMS_BUF: AiaParamsBuffer = AiaParamsBuffer([0; 64]);
 const CONF_GUEST_FILE: usize = 0x3000_D000;
 /// The vIMSIC GPA presented to the guest (inside its 1 MiB memory region,
 /// on a page nothing else maps — bind adds the G-stage device mapping).
-const VCPU_IMSIC_GPA: usize = 0x8002_0000;
+/// Deliberately not the guest's demand-zero page (0x8002_0000): a device
+/// leaf there would swallow the guest's demand-zero writes and turn
+/// PHASE4's DEMAND_ZERO_OK into an MMIO pass-through readback.
+const VCPU_IMSIC_GPA: usize = 0x8003_0000;
 
 #[repr(align(16384))]
 struct AlignedPages([u8; NUM_PAGES * 4096]);
