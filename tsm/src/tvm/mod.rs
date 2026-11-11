@@ -67,7 +67,10 @@ const ISELECT_EIE0: usize = 0xC0;
 /// (EXT_ID_MAX = 63; the platform model collapses the real hardware's
 /// 32-bit-per-word eip/eie array into a single word, so selects 0xC1+
 /// are outside the modeled file window and are not touched here).
-fn sanitize_guest_file(vgein: usize) {
+///
+/// Returns the number of identities drained from the file.
+fn sanitize_guest_file(vgein: usize) -> usize {
+    let mut drained = 0usize;
     unsafe {
         let mut hstatus: usize;
         core::arch::asm!("csrr {}, hstatus", out(reg) hstatus);
@@ -86,6 +89,7 @@ fn sanitize_guest_file(vgein: usize) {
                 break;
             }
             core::arch::asm!("csrw vstopei, zero");
+            drained += 1;
         }
         core::arch::asm!("csrw vsiselect, {}", in(reg) ISELECT_EIE0);
         core::arch::asm!("csrw vsireg, {}", in(reg) 0usize);
@@ -94,6 +98,7 @@ fn sanitize_guest_file(vgein: usize) {
 
         core::arch::asm!("csrw hstatus, {}", in(reg) saved);
     }
+    drained
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1158,7 +1163,12 @@ impl TvmManager {
             // drained), withdrawn from the hart's hgeie line, unmapped
             // from the G-stage, and returned to the unassigned pool.
             if let Some(binding) = tvm.vcpu.as_ref().and_then(|v| v.imsic_binding) {
-                sanitize_guest_file(binding.vgein);
+                let drained = sanitize_guest_file(binding.vgein);
+                crate::println!(
+                    "[TSM] COVI sanitize drained {} identit{}.",
+                    drained,
+                    if drained == 1 { "y" } else { "ies" }
+                );
                 unsafe {
                     core::arch::asm!("csrc hgeie, {}", in(reg) 1usize << binding.vgein);
                 }

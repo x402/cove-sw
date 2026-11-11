@@ -176,9 +176,25 @@ pub extern "C" fn guest_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
         );
     }
     // The injected interrupt was taken on the way back: the handler
-    // claimed it and printed the VS_EXT marker. Deny identity 1 (COVG
-    // FID 5) so the host's repeat injection is refused.
-    println!("[GUEST] PHASE7: resumed after allow; calling COVG DENY...");
+    // claimed it and printed the VS_EXT marker. Before denying identity
+    // 1, allow identity 2 (COVG FID 4) so the host can park a pending
+    // MSI the guest never enables or claims — destroy's guest-file
+    // sanitize must drain it.
+    println!("[GUEST] PHASE7: resumed after allow; allowing identity 2...");
+    unsafe {
+        asm!(
+            "li a7, 0x434F5647",
+            "li a6, 4",
+            "li a0, 2",
+            "li a1, 0",
+            "ecall",
+            lateout("a0") _,
+            lateout("a1") _,
+            lateout("a6") _,
+            lateout("a7") _,
+        );
+    }
+    println!("[GUEST] PHASE7: resumed after allow-2; calling COVG DENY...");
     unsafe {
         asm!(
             "li a7, 0x434F5647",

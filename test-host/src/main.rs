@@ -934,10 +934,23 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
     let (err, _) = sbi_covi_inject_tvm_cpu(tvm_id, 0, 1);
     assert_eq!(err, 0, "inject of an allowed identity must succeed");
 
-    println!("[HOST] Running TVM vCPU 0 (fourth run: VS interrupt handler)...");
+    println!("[HOST] Running TVM vCPU 0 (fourth run: VS handler + allow identity 2)...");
     let (err, val) = sbi_covh_run_tvm_vcpu(tvm_id, 0);
     println!("[HOST] TVM vCPU 0 exited with err={}, val={}", err, val);
     assert_eq!(err, 0, "fourth run_tvm_vcpu must return success");
+    assert_eq!(val, 6, "allow-2 exit must be EXIT_COVG_ALLOW_EXT (=6)");
+
+    // 10f-2. Park a pending MSI the guest never enables or claims:
+    // identity 2 is allowed (COVG FID 4 above) but not in the guest's
+    // eie, so the pending bit stays in the file across every later run
+    // and destroy's sanitize must drain it.
+    let (err, _) = sbi_covi_inject_tvm_cpu(tvm_id, 0, 2);
+    assert_eq!(err, 0, "inject of the never-enabled identity must succeed");
+
+    println!("[HOST] Running TVM vCPU 0 (fifth run: deny identity 1)...");
+    let (err, val) = sbi_covh_run_tvm_vcpu(tvm_id, 0);
+    println!("[HOST] TVM vCPU 0 exited with err={}, val={}", err, val);
+    assert_eq!(err, 0, "fifth run_tvm_vcpu must return success");
     assert_eq!(val, 7, "deny exit must be EXIT_COVG_DENY_EXT (=7)");
 
     // 10g. After the guest denied identity 1 (COVG FID 5) the same
@@ -952,10 +965,10 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
     println!("[MARKER 19] HOST: COVI inject gating validated.");
 
     // 10h. Run once more: the guest exits clean via SRST.
-    println!("[HOST] Running TVM vCPU 0 (fifth run: clean exit)...");
+    println!("[HOST] Running TVM vCPU 0 (sixth run: clean exit)...");
     let (err, val) = sbi_covh_run_tvm_vcpu(tvm_id, 0);
     println!("[HOST] TVM vCPU 0 exited with err={}, val={}", err, val);
-    assert_eq!(err, 0, "fifth run_tvm_vcpu must return success");
+    assert_eq!(err, 0, "sixth run_tvm_vcpu must return success");
     assert_eq!(val, 0, "Final exit must be EXIT_CLEAN (=0)");
     println!(
         "[MARKER 14] HOST: Received TVM exit, tearing down TVM #{}.",
