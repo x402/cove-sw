@@ -51,15 +51,18 @@ const ISELECT_EIDELIVERY: usize = 0x70;
 const ISELECT_EITHRESHOLD: usize = 0x72;
 const ISELECT_EIE0: usize = 0xC0;
 
-/// Clears a guest interrupt file's delivery line and drains its pending
-/// identities (destroy unbind). Runs in the TSM (confidential SIDN active)
-/// with `hstatus.VGEIN` temporarily pointed at the file.
+/// Scrubs a guest interrupt file (CoVE v0.7 §5.2.4: the TSM must perform
+/// scrubbing of confidential memory before returning control of the
+/// memory to the host or assigning to another TVM) and claims its pending
+/// identities (AIA v1.0 §3.9: writing xtopei claims the reported
+/// identity). Runs in the TSM (confidential SIDN active) with
+/// `hstatus.VGEIN` temporarily pointed at the file.
 ///
 /// Order matters: a pending identity is only claimable while enabled (the
 /// eie array gates topei, AIA v1.0 §3.7; eidelivery only gates the signal
 /// line, §3.9), so eie is set to all-ones before the claim loop.
 /// eithreshold is cleared first because a stale threshold would otherwise
-/// keep high identities unclaimable. After draining, the file is restored
+/// keep high identities unclaimable. After claiming, the file is restored
 /// to its reset state (eie = 0, eidelivery = 0) so a later bind cannot
 /// inherit the previous tenant's interrupt state.
 ///
@@ -68,9 +71,9 @@ const ISELECT_EIE0: usize = 0xC0;
 /// 32-bit-per-word eip/eie array into a single word, so selects 0xC1+
 /// are outside the modeled file window and are not touched here).
 ///
-/// Returns the number of identities drained from the file.
-fn sanitize_guest_file(vgein: usize) -> usize {
-    let mut drained = 0usize;
+/// Returns the number of identities claimed from the file.
+fn scrub_guest_file(vgein: usize) -> usize {
+    let mut claimed = 0usize;
     unsafe {
         let mut hstatus: usize;
         core::arch::asm!("csrr {}, hstatus", out(reg) hstatus);
@@ -89,7 +92,7 @@ fn sanitize_guest_file(vgein: usize) -> usize {
                 break;
             }
             core::arch::asm!("csrw vstopei, zero");
-            drained += 1;
+            claimed += 1;
         }
         core::arch::asm!("csrw vsiselect, {}", in(reg) ISELECT_EIE0);
         core::arch::asm!("csrw vsireg, {}", in(reg) 0usize);
@@ -98,7 +101,7 @@ fn sanitize_guest_file(vgein: usize) -> usize {
 
         core::arch::asm!("csrw hstatus, {}", in(reg) saved);
     }
-    drained
+    claimed
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -676,8 +679,9 @@ impl TvmManager {
             core::arch::asm!("csrs hgeie, {}", in(reg) 1usize << vgein);
             core::arch::asm!("csrs hideleg, {}", in(reg) 1usize << 10); // VSEIP
         }
-        // Software pending file (§11.8 unbound record) drains into the
-        // hardware file on bind: seteipnum_le takes one identity per write.
+        // Software pending file (§11.8 unbound record) is replayed into
+        // the hardware file on bind: seteipnum_le takes one identity per
+        // write.
         let pending = vcpu.ctx.ext_int_pending;
         if pending != 0 {
             for iid in 1..=EXT_ID_MAX {
@@ -1159,15 +1163,16 @@ impl TvmManager {
         };
         if tvm.aia.enabled {
             // Implicit unbind: destroy has no unbind FIDs in WP2, so the
-            // bound file is sanitized (identity lines cleared, pending
-            // drained), withdrawn from the hart's hgeie line, unmapped
-            // from the G-stage, and returned to the unassigned pool.
+            // bound file is scrubbed (identity lines cleared, pending
+            // identities claimed), withdrawn from the hart's hgeie line,
+            // unmapped from the G-stage, and returned to the unassigned
+            // pool.
             if let Some(binding) = tvm.vcpu.as_ref().and_then(|v| v.imsic_binding) {
-                let drained = sanitize_guest_file(binding.vgein);
+                let claimed = scrub_guest_file(binding.vgein);
                 crate::println!(
-                    "[TSM] COVI sanitize drained {} identit{}.",
-                    drained,
-                    if drained == 1 { "y" } else { "ies" }
+                    "[TSM] COVI guest-file scrub claimed {} identit{}.",
+                    claimed,
+                    if claimed == 1 { "y" } else { "ies" }
                 );
                 unsafe {
                     core::arch::asm!("csrc hgeie, {}", in(reg) 1usize << binding.vgein);

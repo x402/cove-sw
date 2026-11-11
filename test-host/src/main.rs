@@ -943,7 +943,7 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
     // 10f-2. Park a pending MSI the guest never enables or claims:
     // identity 2 is allowed (COVG FID 4 above) but not in the guest's
     // eie, so the pending bit stays in the file across every later run
-    // and destroy's sanitize must drain it.
+    // and destroy's guest-file scrub must claim it.
     let (err, _) = sbi_covi_inject_tvm_cpu(tvm_id, 0, 2);
     assert_eq!(err, 0, "inject of the never-enabled identity must succeed");
 

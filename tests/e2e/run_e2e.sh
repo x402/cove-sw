@@ -69,7 +69,7 @@ full)
       '\[GUEST\] PHASE7: VS_EXT_INJECT_OK \(iid=1\)'
       '\[MARKER 19\] HOST: COVI inject gating validated\.'
       '\[MARKER 14\] HOST: Received TVM exit, tearing down TVM #[0-9]+\.'
-      '\[TSM\] COVI sanitize drained 1 identity\.'
+      '\[TSM\] COVI guest-file scrub claimed 1 identity\.'
       '\[MARKER 15\] HOST: All confidential pages reclaimed successfully\.'
       'PHASE 5\.5 PASS: HOST_VALIDATION_OK'
       '\[MARKER 17\] HOST: COVI convert/reclaim and negative paths PASSED\.'

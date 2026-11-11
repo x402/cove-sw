@@ -179,7 +179,7 @@ pub extern "C" fn guest_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
     // claimed it and printed the VS_EXT marker. Before denying identity
     // 1, allow identity 2 (COVG FID 4) so the host can park a pending
     // MSI the guest never enables or claims — destroy's guest-file
-    // sanitize must drain it.
+    // scrub must claim it.
     println!("[GUEST] PHASE7: resumed after allow; allowing identity 2...");
     unsafe {
         asm!(
