@@ -7,6 +7,8 @@ pub const PTE_A: u64 = 1 << 6;
 pub const PTE_D: u64 = 1 << 7;
 
 pub const PTE_LEAF_RWX: u64 = PTE_V | PTE_R | PTE_W | PTE_X | PTE_U | PTE_A | PTE_D; // 0xDF
+/// Device leaf (COVI vIMSIC): readable/writable, never executable.
+pub const PTE_LEAF_RW: u64 = PTE_V | PTE_R | PTE_W | PTE_U | PTE_A | PTE_D; // 0x9D
 
 pub const HGATP_MODE_BARE: usize = 0;
 pub const HGATP_MODE_SV39X4: usize = 8;
@@ -79,6 +81,62 @@ impl GStagePageTable {
             return Err(());
         }
         l0_slice[vpn0] = (((spa >> 12) as u64) << 10) | PTE_LEAF_RWX;
+
+        Ok(())
+    }
+
+    /// Maps a 4K device page (COVI vIMSIC): read/write but never
+    /// executable, so guest identity values cannot be laundered into
+    /// instruction fetches. Same shape as [`map_4k`].
+    pub fn map_4k_io(
+        &self,
+        gpa: usize,
+        spa: usize,
+        alloc_page: &mut impl FnMut() -> Option<usize>,
+    ) -> Result<(), ()> {
+        if gpa % 4096 != 0 || spa % 4096 != 0 {
+            return Err(());
+        }
+        if gpa >= (1usize << 41) {
+            return Err(());
+        }
+
+        let vpn2 = (gpa >> 30) & 0x7FF;
+        let vpn1 = (gpa >> 21) & 0x1FF;
+        let vpn0 = (gpa >> 12) & 0x1FF;
+
+        let root_slice =
+            unsafe { core::slice::from_raw_parts_mut(self.root_paddr as *mut u64, 2048) };
+
+        let l1_paddr = if root_slice[vpn2] & PTE_V == 0 {
+            let paddr = alloc_page().ok_or(())?;
+            unsafe {
+                core::ptr::write_bytes(paddr as *mut u8, 0, 4096);
+            }
+            root_slice[vpn2] = (((paddr >> 12) as u64) << 10) | PTE_V;
+            paddr
+        } else {
+            ((root_slice[vpn2] >> 10) << 12) as usize
+        };
+
+        let l1_slice = unsafe { core::slice::from_raw_parts_mut(l1_paddr as *mut u64, 512) };
+
+        let l0_paddr = if l1_slice[vpn1] & PTE_V == 0 {
+            let paddr = alloc_page().ok_or(())?;
+            unsafe {
+                core::ptr::write_bytes(paddr as *mut u8, 0, 4096);
+            }
+            l1_slice[vpn1] = (((paddr >> 12) as u64) << 10) | PTE_V;
+            paddr
+        } else {
+            ((l1_slice[vpn1] >> 10) << 12) as usize
+        };
+
+        let l0_slice = unsafe { core::slice::from_raw_parts_mut(l0_paddr as *mut u64, 512) };
+        if l0_slice[vpn0] & PTE_V != 0 {
+            return Err(());
+        }
+        l0_slice[vpn0] = (((spa >> 12) as u64) << 10) | PTE_LEAF_RW;
 
         Ok(())
     }

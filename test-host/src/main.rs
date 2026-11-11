@@ -539,6 +539,98 @@ pub fn sbi_covi_reclaim_tvm_aia_imsic(imsic_page_addr: usize) -> (usize, usize) 
     (error, value)
 }
 
+/// COVI FID 0: `init_tvm_aia` with the params block at `params_paddr`.
+pub fn sbi_covi_init_tvm_aia(
+    tvm_id: usize,
+    params_paddr: usize,
+    params_len: usize,
+) -> (usize, usize) {
+    let mut error: usize;
+    let mut value: usize;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a7") riscv_cove::interrupt::EID_COVI,
+            in("a6") riscv_cove::interrupt::INIT_TVM_AIA,
+            in("a0") tvm_id,
+            in("a1") params_paddr,
+            in("a2") params_len,
+            lateout("a0") error,
+            lateout("a1") value,
+        );
+    }
+    (error, value)
+}
+
+/// COVI FID 1: `set_tvm_aia_cpu_imsic_addr`.
+pub fn sbi_covi_set_tvm_aia_cpu_imsic_addr(
+    tvm_id: usize,
+    vcpu_id: usize,
+    gpa: usize,
+) -> (usize, usize) {
+    let mut error: usize;
+    let mut value: usize;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a7") riscv_cove::interrupt::EID_COVI,
+            in("a6") riscv_cove::interrupt::SET_TVM_AIA_CPU_IMSIC_ADDR,
+            in("a0") tvm_id,
+            in("a1") vcpu_id,
+            in("a2") gpa,
+            lateout("a0") error,
+            lateout("a1") value,
+        );
+    }
+    (error, value)
+}
+
+/// COVI FID 4: `bind_aia_imsic`.
+pub fn sbi_covi_bind_aia_imsic(
+    tvm_id: usize,
+    vcpu_id: usize,
+    imsic_mask: usize,
+) -> (usize, usize) {
+    let mut error: usize;
+    let mut value: usize;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a7") riscv_cove::interrupt::EID_COVI,
+            in("a6") riscv_cove::interrupt::BIND_AIA_IMSIC,
+            in("a0") tvm_id,
+            in("a1") vcpu_id,
+            in("a2") imsic_mask,
+            lateout("a0") error,
+            lateout("a1") value,
+        );
+    }
+    (error, value)
+}
+
+/// COVI FID 7: `inject_tvm_cpu`.
+pub fn sbi_covi_inject_tvm_cpu(
+    tvm_id: usize,
+    vcpu_id: usize,
+    interrupt_id: usize,
+) -> (usize, usize) {
+    let mut error: usize;
+    let mut value: usize;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a7") riscv_cove::interrupt::EID_COVI,
+            in("a6") riscv_cove::interrupt::INJECT_TVM_CPU,
+            in("a0") tvm_id,
+            in("a1") vcpu_id,
+            in("a2") interrupt_id,
+            lateout("a0") error,
+            lateout("a1") value,
+        );
+    }
+    (error, value)
+}
+
 /// Raw COVI ecall with an arbitrary (possibly hostile) function id.
 pub fn sbi_covi_raw_fid(fid: usize) -> (usize, usize) {
     let mut error: usize;
@@ -572,6 +664,21 @@ pub fn sbi_covh_create_tvm_at(params_paddr: usize, params_len: usize) -> (usize,
 }
 
 const NUM_PAGES: usize = 26;
+
+/// COVI FID 0 parameter block (CoVE §11.1), handed at a host-allocatable
+/// physical address.
+#[repr(align(16))]
+struct AiaParamsBuffer([u8; 64]);
+
+static mut AIA_PARAMS_BUF: AiaParamsBuffer = AiaParamsBuffer([0; 64]);
+
+/// The confidential domain's hart0 guest interrupt file (SmmTT §6.1:
+/// 0x3000_8000 + 1·2^14 + 0·2^13 + 1·2^12), converted and bound to the
+/// e2e TVM's vCPU.
+const CONF_GUEST_FILE: usize = 0x3000_D000;
+/// The vIMSIC GPA presented to the guest (inside its 1 MiB memory region,
+/// on a page nothing else maps — bind adds the G-stage device mapping).
+const VCPU_IMSIC_GPA: usize = 0x8002_0000;
 
 #[repr(align(16384))]
 struct AlignedPages([u8; NUM_PAGES * 4096]);
@@ -707,10 +814,51 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
         tvm_id
     );
 
+    // 8b. COVI: convert the confidential domain's guest interrupt file,
+    // then arm the TVM's AIA configuration (FID 0) and record the vCPU's
+    // vIMSIC GPA (FID 1). All before finalize (CoVE §11.1/§11.2).
+    println!(
+        "[HOST] Converting confidential guest file at 0x{:x}...",
+        CONF_GUEST_FILE
+    );
+    let (err, _) = sbi_covi_convert_aia_imsic(CONF_GUEST_FILE);
+    assert_eq!(err, 0, "guest-file convert must succeed");
+    let (err, _) = sbi_covh_global_fence();
+    assert_eq!(err, 0, "post-convert global fence must succeed");
+    let (err, _) = sbi_covh_local_fence();
+    assert_eq!(err, 0, "post-convert local fence must succeed");
+
+    let params = riscv_cove::interrupt::TvmAiaParams {
+        imsic_base_addr: 0x3000_8000,
+        group_index_bits: 0,
+        group_index_shift: 0,
+        hart_index_bits: 1,
+        guest_index_bits: 1,
+        guests_per_hart: 0,
+    };
+    let params_ptr = core::ptr::addr_of_mut!(AIA_PARAMS_BUF) as *mut u8;
+    unsafe {
+        core::ptr::write_bytes(params_ptr, 0, 64);
+        core::ptr::copy_nonoverlapping(
+            core::ptr::addr_of!(params).cast::<u8>(),
+            params_ptr,
+            core::mem::size_of::<riscv_cove::interrupt::TvmAiaParams>(),
+        );
+    }
+    let (err, _) = sbi_covi_init_tvm_aia(
+        tvm_id,
+        params_ptr as usize,
+        core::mem::size_of::<riscv_cove::interrupt::TvmAiaParams>(),
+    );
+    assert_eq!(err, 0, "init_tvm_aia must succeed");
+
     // 9. Create vCPU 0
     println!("[HOST] Creating vCPU 0 at 0x{:x}...", vcpu_state_paddr);
     let (err, _) = sbi_covh_create_tvm_vcpu(tvm_id, 0, vcpu_state_paddr);
     assert_eq!(err, 0, "create_tvm_vcpu must succeed");
+
+    let (err, _) = sbi_covi_set_tvm_aia_cpu_imsic_addr(tvm_id, 0, VCPU_IMSIC_GPA);
+    assert_eq!(err, 0, "set_tvm_aia_cpu_imsic_addr must succeed");
     println!("[MARKER 08] HOST: TVM #{} created with 1 vCPU.", tvm_id);
 
     // 10. Finalize TVM
@@ -721,6 +869,12 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
         "[MARKER 09] HOST: TVM #{} finalized, launching vCPU #0...",
         tvm_id
     );
+
+    // 10a-prec. COVI bind: the vCPU binds to the hart's guest interrupt
+    // file (mask bit 1 = G0, VGEIN 1) and becomes runnable (§11.5).
+    let (err, _) = sbi_covi_bind_aia_imsic(tvm_id, 0, 0b10);
+    assert_eq!(err, 0, "bind_aia_imsic must succeed");
+    println!("[MARKER 18] HOST: COVI AIA bound (vgein=1).");
 
     // 10a. Run TVM vCPU 0 (first run: guest shares memory, exits)
     println!("[HOST] Running TVM vCPU 0 (first run: COVG share)...");
@@ -763,12 +917,43 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
     assert_eq!(err, 0, "second run_tvm_vcpu must return success");
     assert_eq!(val, 2, "Second exit must be EXIT_COVG_UNSHARE (=2)");
 
-    // 10e. Run once more after the guest returns the shared region to confidential.
-    println!("[HOST] Running TVM vCPU 0 (third run: clean exit)...");
+    // 10e. Third run: the guest arms VS delivery and allows identity 1
+    // (COVG FID 4), which exits back to the host (§12.5 implies exit +
+    // resume).
+    println!("[HOST] Running TVM vCPU 0 (third run: COVG allow external)...");
     let (err, val) = sbi_covh_run_tvm_vcpu(tvm_id, 0);
     println!("[HOST] TVM vCPU 0 exited with err={}, val={}", err, val);
     assert_eq!(err, 0, "third run_tvm_vcpu must return success");
-    assert_eq!(val, 0, "Third exit must be EXIT_CLEAN (=0)");
+    assert_eq!(val, 6, "allow exit must be EXIT_COVG_ALLOW_EXT (=6)");
+
+    // 10f. Inject identity 1 through the guest interrupt file (§11.8):
+    // the pending MSI is taken as soon as the vCPU re-enters VS.
+    let (err, _) = sbi_covi_inject_tvm_cpu(tvm_id, 0, 1);
+    assert_eq!(err, 0, "inject of an allowed identity must succeed");
+
+    println!("[HOST] Running TVM vCPU 0 (fourth run: VS interrupt handler)...");
+    let (err, val) = sbi_covh_run_tvm_vcpu(tvm_id, 0);
+    println!("[HOST] TVM vCPU 0 exited with err={}, val={}", err, val);
+    assert_eq!(err, 0, "fourth run_tvm_vcpu must return success");
+    assert_eq!(val, 7, "deny exit must be EXIT_COVG_DENY_EXT (=7)");
+
+    // 10g. After the guest denied identity 1 (COVG FID 5) the same
+    // injection must be refused (project mapping: denied identity ->
+    // invalid input).
+    let (err, _) = sbi_covi_inject_tvm_cpu(tvm_id, 0, 1);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "inject of a denied identity must be SBI_ERR_INVALID_PARAM"
+    );
+    println!("[MARKER 19] HOST: COVI inject gating validated.");
+
+    // 10h. Run once more: the guest exits clean via SRST.
+    println!("[HOST] Running TVM vCPU 0 (fifth run: clean exit)...");
+    let (err, val) = sbi_covh_run_tvm_vcpu(tvm_id, 0);
+    println!("[HOST] TVM vCPU 0 exited with err={}, val={}", err, val);
+    assert_eq!(err, 0, "fifth run_tvm_vcpu must return success");
+    assert_eq!(val, 0, "Final exit must be EXIT_CLEAN (=0)");
     println!(
         "[MARKER 14] HOST: Received TVM exit, tearing down TVM #{}.",
         tvm_id
@@ -788,7 +973,10 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
     let (err, _) = sbi_covh_destroy_tvm(tvm_id);
     assert_eq!(err, 0, "destroy_tvm must succeed");
 
-    // 13. Reclaim Pages
+    // 13. Reclaim the guest interrupt file, then the RAM pages. Destroy
+    // released the bound file back to the unassigned pool (CoVE 11.4).
+    let (err, _) = sbi_covi_reclaim_tvm_aia_imsic(CONF_GUEST_FILE);
+    assert_eq!(err, 0, "reclaim of the released guest file must succeed");
     println!(
         "[HOST] Reclaiming {} pages at 0x{:x}...",
         NUM_PAGES, base_paddr
@@ -946,18 +1134,22 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
 
     println!("[HOST] PHASE 5.5 PASS: HOST_VALIDATION_OK");
 
-    // ── Phase 7: COVI convert/reclaim skeleton ───────────────
+    // ── Phase 7: COVI convert/reclaim + bind/inject gating ──
     println!("[HOST] PHASE 7: COVI convert/reclaim tests...");
 
-    // The extension must be advertised (probe = TSM ready + Smsdia + IMSIC).
+    // The extension must be advertised (probe = TSM ready + Smsdia +
+    // supervisor IMSIC geometry).
     let covi_probed = sbi_probe_extension(riscv_cove::interrupt::EID_COVI);
     assert_eq!(covi_probed, 1, "EXT_COVI must be discovered via base probe");
 
-    // NEMU's DTB advertises the IMSIC at 0x3000_0000 with two machine-level
-    // interrupt files (hart0 at +0, hart1 at +0x1000). Hart1's file is
-    // unused by this single-hart e2e, making it a safe conversion subject;
-    // converting it must never touch the file's contents.
-    const IMSIC_HART1_FILE: usize = 0x3000_1000;
+    // NEMU's DTB layout (SmmTT v0.49 section 6.1, B + n*2^14 + h*2^13 +
+    // g*2^12 at 0x3000_8000): SIDN0/1 each cover hart0/hart1 with page
+    // order S,G0. The confidential domain (SIDN1) hart0 guest file is the
+    // WP2 bind subject; machine files and supervisor files are never
+    // COVI-convertible.
+    const CONF_GUEST_FILE: usize = 0x3000_D000;
+    const SUPERVISOR_FILE_SIDN0: usize = 0x3000_8000;
+    const MACHINE_HART1_FILE: usize = 0x3000_1000;
 
     // C1: addresses outside the IMSIC whitelist are rejected outright.
     let (err, _) = sbi_covi_convert_aia_imsic(0x9000_0000);
@@ -967,18 +1159,32 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
         "non-IMSIC convert must be SBI_ERR_INVALID_ADDRESS"
     );
     // C2: misaligned IMSIC addresses are rejected.
-    let (err, _) = sbi_covi_convert_aia_imsic(IMSIC_HART1_FILE + 8);
+    let (err, _) = sbi_covi_convert_aia_imsic(CONF_GUEST_FILE + 8);
     assert_eq!(
         err,
         (-5isize) as usize,
         "misaligned convert must be SBI_ERR_INVALID_ADDRESS"
     );
+    // C2b: machine files live outside the supervisor whitelist, and
+    // supervisor-level files (guest index 0) are not COVI-convertible.
+    let (err, _) = sbi_covi_convert_aia_imsic(MACHINE_HART1_FILE);
+    assert_eq!(
+        err,
+        (-5isize) as usize,
+        "machine-file convert must be SBI_ERR_INVALID_ADDRESS"
+    );
+    let (err, _) = sbi_covi_convert_aia_imsic(SUPERVISOR_FILE_SIDN0);
+    assert_eq!(
+        err,
+        (-5isize) as usize,
+        "supervisor-file convert must be SBI_ERR_INVALID_ADDRESS"
+    );
 
     // C3: the positive path — convert, fence, reclaim (CoVE 11.3 order),
     // with the tracker-state violations interleaved.
-    let (err, _) = sbi_covi_convert_aia_imsic(IMSIC_HART1_FILE);
+    let (err, _) = sbi_covi_convert_aia_imsic(CONF_GUEST_FILE);
     assert_eq!(err, 0, "convert_aia_imsic must succeed");
-    let (err, _) = sbi_covi_convert_aia_imsic(IMSIC_HART1_FILE);
+    let (err, _) = sbi_covi_convert_aia_imsic(CONF_GUEST_FILE);
     assert_eq!(
         err,
         (-3isize) as usize,
@@ -988,22 +1194,22 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
     assert_eq!(err, 0, "post-convert global fence must succeed");
     let (err, _) = sbi_covh_local_fence();
     assert_eq!(err, 0, "post-convert local fence must succeed");
-    let (err, _) = sbi_covi_reclaim_tvm_aia_imsic(IMSIC_HART1_FILE + 0x1000);
+    let (err, _) = sbi_covi_reclaim_tvm_aia_imsic(CONF_GUEST_FILE + 0x1000);
     assert_eq!(
         err,
         (-3isize) as usize,
         "reclaim of an untracked page must be SBI_ERR_INVALID_PARAM"
     );
-    let (err, _) = sbi_covi_reclaim_tvm_aia_imsic(IMSIC_HART1_FILE);
+    let (err, _) = sbi_covi_reclaim_tvm_aia_imsic(CONF_GUEST_FILE);
     assert_eq!(err, 0, "reclaim_tvm_aia_imsic must succeed");
-    let (err, _) = sbi_covi_reclaim_tvm_aia_imsic(IMSIC_HART1_FILE);
+    let (err, _) = sbi_covi_reclaim_tvm_aia_imsic(CONF_GUEST_FILE);
     assert_eq!(
         err,
         (-3isize) as usize,
         "double reclaim must be SBI_ERR_INVALID_PARAM"
     );
 
-    // C4: COVI FIDs outside the current skeleton report not-supported.
+    // C4: COVI FIDs outside the WP2 surface report not-supported.
     let (err, _) = sbi_covi_raw_fid(riscv_cove::interrupt::UNBIND_AIA_IMSIC_BEGIN);
     assert_eq!(
         err,

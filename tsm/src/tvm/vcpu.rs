@@ -38,7 +38,28 @@ pub struct GuestContext {
     /// the asm below). Written by the guest trap handler on the hart that
     /// ran the vCPU and read back by its run loop.
     pub last_exit: ExitInfo,
+    /// Guest's `vsiselect` for the COVI indirect window (offset 352 in the
+    /// asm below). Not covered by RDSM's domain CSR save area, so it is
+    /// per-vCPU state carried with the context.
+    pub vsiselect: usize,
+    /// COVG external-interrupt allow bitmap (offset 360): bit i = external
+    /// interrupt identity i injectable into this vCPU. Identity 0 is
+    /// reserved and stays 0; vCPUs start with everything denied (CoVE
+    /// §12.5 default-deny).
+    pub ext_int_allowed: u64,
+    /// COVI FID 7 software pending file for an unbound vCPU (offset 368);
+    /// bound injection goes straight to the hardware guest interrupt file.
+    pub ext_int_pending: u64,
 }
+
+// Layout pins for the hardcoded asm offsets below. Any field addition must
+// stay in the tail past `last_exit` and update the pins + asm together.
+const _: () = assert!(core::mem::offset_of!(GuestContext, host_sp) == 320);
+const _: () = assert!(core::mem::offset_of!(GuestContext, last_exit) == 328);
+const _: () = assert!(core::mem::offset_of!(GuestContext, vsiselect) == 352);
+const _: () = assert!(core::mem::offset_of!(GuestContext, ext_int_allowed) == 360);
+const _: () = assert!(core::mem::offset_of!(GuestContext, ext_int_pending) == 368);
+const _: () = assert!(core::mem::size_of::<GuestContext>() == 384); // align(16) tail pad
 
 impl GuestContext {
     pub const fn new() -> Self {
@@ -54,6 +75,9 @@ impl GuestContext {
             hgatp: 0,
             host_sp: 0,
             last_exit: ExitInfo::new(),
+            vsiselect: 0,
+            ext_int_allowed: 0,
+            ext_int_pending: 0,
         }
     }
 }
@@ -62,6 +86,14 @@ pub struct Vcpu {
     pub id: usize,
     pub state_paddr: usize,
     pub ctx: GuestContext,
+    /// COVI: the vIMSIC GPA this vCPU's guest interrupt file is presented
+    /// at (FID 1), `None` until set. Manager-side state: only touched with
+    /// the vCPU attached (host TEECALLs never overlap a run).
+    pub imsic_gpa: Option<usize>,
+    /// COVI: the physical guest interrupt file the vCPU is bound to
+    /// (FID 4), `None` while unbound. Manager-side state for the same
+    /// reason as [`Self::imsic_gpa`].
+    pub imsic_binding: Option<super::ImsicBinding>,
 }
 
 impl Vcpu {
@@ -70,6 +102,8 @@ impl Vcpu {
             id,
             state_paddr,
             ctx: GuestContext::new(),
+            imsic_gpa: None,
+            imsic_binding: None,
         }
     }
 
@@ -101,6 +135,13 @@ pub const EXIT_COVG_UNSHARE: usize = 2;
 pub const EXIT_COVG_ADD_MMIO: usize = 3;
 pub const EXIT_COVG_REMOVE_MMIO: usize = 4;
 pub const EXIT_UNEXPECTED_TRAP: usize = 5;
+/// COVG FID 4 (`allow_external_interrupt`): recorded, then resumed.
+pub const EXIT_COVG_ALLOW_EXT: usize = 6;
+/// COVG FID 5 (`deny_external_interrupt`): recorded, then resumed.
+pub const EXIT_COVG_DENY_EXT: usize = 7;
+
+/// COVG external-interrupt sentinel: all identities at once (CoVE §12.5).
+const EXT_INTERRUPT_ALL: usize = usize::MAX;
 
 const EID_COVG: usize = 0x434F5647;
 
@@ -174,6 +215,35 @@ pub extern "C" fn handle_guest_trap(ctx: *mut GuestContext) -> usize {
                     e.reason = EXIT_COVG_UNSHARE;
                     e.gpa = gpa;
                     e.len = len;
+                    return TRAP_ACTION_EXIT;
+                }
+                4 | 5 => {
+                    // COVG allow/deny external interrupt (§12.5/§12.6).
+                    // Default deny; `usize::MAX` targets every identity.
+                    let iid = gpa; // a0
+                    let allowed = &mut ctx_ref.ext_int_allowed;
+                    if iid == EXT_INTERRUPT_ALL {
+                        if fid == 4 {
+                            *allowed = !1; // identity 0 reserved
+                        } else {
+                            *allowed = 0;
+                        }
+                    } else if iid == 0 || iid >= 64 {
+                        crate::println!("[TSM] COVG ext interrupt id out of range: {}", iid);
+                        ctx_ref.sepc += 4;
+                        ctx_ref.last_exit.reason = EXIT_UNEXPECTED_TRAP;
+                        return TRAP_ACTION_EXIT;
+                    } else if fid == 4 {
+                        *allowed |= 1 << iid;
+                    } else {
+                        *allowed &= !(1 << iid);
+                    }
+                    ctx_ref.sepc += 4;
+                    ctx_ref.last_exit.reason = if fid == 4 {
+                        EXIT_COVG_ALLOW_EXT
+                    } else {
+                        EXIT_COVG_DENY_EXT
+                    };
                     return TRAP_ACTION_EXIT;
                 }
                 _ => {
@@ -363,6 +433,8 @@ tsm_guest_trap_vector:
     sd t5, 296(a0)
     csrr t6, htinst
     sd t6, 304(a0)
+    csrr t0, vsiselect
+    sd t0, 352(a0)
 
     ld sp, 320(a0)
 
@@ -380,6 +452,8 @@ tsm_guest_trap_vector:
     csrw sstatus, t1
     ld t2, 272(a0)
     csrw hstatus, t2
+    ld t3, 352(a0)
+    csrw vsiselect, t3
 
     ld ra, 8(a0)
     ld sp, 16(a0)

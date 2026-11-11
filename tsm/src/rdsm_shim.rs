@@ -11,7 +11,7 @@ use rdsm_abi::{
     FID_RDSM_TEERET,
 };
 
-pub use rdsm_abi::{NORMAL_RETURN, RdsmPlatformInfo, TSM_READY, TVM_EXIT};
+pub use rdsm_abi::{NORMAL_RETURN, RdsmImsicGeometry, RdsmPlatformInfo, TSM_READY, TVM_EXIT};
 
 /// Query RDSM for the platform layout. Returns `None` when the extension
 /// fails or reports a nonsensical memory map (callers must then fail
@@ -24,8 +24,7 @@ pub fn rdsm_get_platform_info() -> Option<RdsmPlatformInfo> {
         tsm_region_end: 0,
         mpt_pool_start: 0,
         mpt_pool_end: 0,
-        imsic_range_start: 0,
-        imsic_range_end: 0,
+        imsic: RdsmImsicGeometry::default(),
     };
     let buf = &mut info as *mut RdsmPlatformInfo as usize;
     let mut err: usize;

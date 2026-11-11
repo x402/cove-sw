@@ -456,6 +456,29 @@ pub const MPT_PAGE_POOL_SIZE: usize = 4 * 1024 * 1024;
 /// Base physical address of the MPT page pool in reserved memory (0x8090_0000).
 pub const MPT_PAGE_POOL_PADDR: usize = 0x8090_0000;
 
+// ── Smstateen AIA gates ────────────────────────────────────────────────
+
+/// CSRIND[60] | AIA[59] | IMSIC[58] enable bits of mstateen0/hstateen0
+/// (Smstateen): the supervisor domains' indirect AIA accesses
+/// (siselect/sireg, stopei/vstopei, vsiselect/vsireg) trap unless these
+/// gates are open. M-mode opens them once at substrate init.
+pub const SMSTATEEN0_AIA_GATES: usize = 0x1C00_0000_0000_0000;
+
+/// Opens the AIA/CSRIND/IMSIC Smstateen gates for supervisor and VS
+/// accesses. M-mode only (the registers are M-level CSRs); a no-op on
+/// non-RISC-V targets.
+pub fn open_aia_stateen_gates() {
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        core::arch::asm!(
+            "csrs mstateen0, {gates}",
+            "csrs hstateen0, {gates}",
+            gates = in(reg) SMSTATEEN0_AIA_GATES,
+            options(nomem)
+        );
+    }
+}
+
 /// A simple bump-pointer allocator that hands out 4 KiB pages from a
 /// contiguous physical memory region.
 ///

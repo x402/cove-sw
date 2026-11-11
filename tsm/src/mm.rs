@@ -14,9 +14,21 @@ pub const MAX_PAGES: usize = 512;
 
 static HOST_REGIONS: Once<[(usize, usize); 2]> = Once::new();
 
-/// IMSIC interrupt-file MMIO whitelist `(start, end)`, derived from the
-/// RDSM-provided platform layout. Zero-sized when the platform has no IMSIC.
+/// IMSIC supervisor/guest interrupt-file MMIO whitelist `(start, end)`,
+/// derived from the RDSM-provided platform geometry. Zero-sized when the
+/// platform has no supervisor IMSIC.
 static IMSIC_REGION: Once<(usize, usize)> = Once::new();
+
+/// Full supervisor/guest interrupt-file geometry (SmmTT v0.49 section
+/// 6.1): bind-time address calculus derives the per-(domain, hart, guest)
+/// file pages from it. Zeroed when the platform has no supervisor IMSIC.
+static IMSIC_GEOMETRY: Once<crate::rdsm_shim::RdsmImsicGeometry> = Once::new();
+
+/// Returns the supervisor/guest interrupt-file geometry, or `None` on an
+/// IMSIC-less platform (fail closed).
+pub fn imsic_geometry() -> Option<crate::rdsm_shim::RdsmImsicGeometry> {
+    IMSIC_GEOMETRY.get().filter(|g| g.usable()).copied()
+}
 
 /// Populate the whitelists from the RDSM-provided platform layout.
 pub fn init_host_regions(info: &crate::rdsm_shim::RdsmPlatformInfo) {
@@ -26,7 +38,8 @@ pub fn init_host_regions(info: &crate::rdsm_shim::RdsmPlatformInfo) {
             (info.mpt_pool_end, info.ram_end),
         ]
     });
-    IMSIC_REGION.call_once(|| (info.imsic_range_start, info.imsic_range_end));
+    IMSIC_REGION.call_once(|| (info.imsic.range_start, info.imsic.range_end));
+    IMSIC_GEOMETRY.call_once(|| info.imsic);
 }
 
 /// Fail-closed check: is `[paddr, paddr+len)` entirely host-allocatable?
@@ -238,6 +251,24 @@ impl PageTracker {
         if paddr % PAGE_SIZE != 0 || !is_imsic_range(paddr, PAGE_SIZE) {
             return SbiRet::invalid_address();
         }
+        // Only guest interrupt files are COVI-convertible (CoVE §11.3):
+        // decompose against the platform geometry and reject supervisor
+        // files (guest index 0) and foreign domain/hart positions. On an
+        // IMSIC-less platform the whitelist is empty above (fail closed).
+        if let Some(g) = imsic_geometry() {
+            let guests = 1usize << g.guest_index_bits;
+            let harts = 1usize << g.hart_index_bits;
+            let domains = (g.range_end - g.range_start) >> g.domain_index_shift;
+            let off = paddr - g.range_start;
+            let guest_idx = (off >> 12) & (guests - 1);
+            let hart_idx = (off >> (12 + g.guest_index_bits)) & (harts - 1);
+            let domain_idx = off >> g.domain_index_shift;
+            if guests <= 1 || guest_idx == 0 || hart_idx >= harts || domain_idx >= domains {
+                return SbiRet::invalid_address();
+            }
+        } else {
+            return SbiRet::invalid_address();
+        }
         for slot in self.entries.iter().flatten() {
             if slot.paddr == paddr {
                 return SbiRet::invalid_param();
@@ -319,6 +350,56 @@ impl PageTracker {
             }
         }
         SbiRet::failed()
+    }
+
+    /// COVI bind (§11.5): assigns a converted, unowned interrupt-file page
+    /// to `(tvm, vcpu)` at `gpa`. The caller has already validated the
+    /// address against the platform geometry; the tracker only enforces
+    /// page state, so a bound vIMSIC page is always a converted guest
+    /// interrupt file.
+    pub fn bind_imsic_page(
+        &mut self,
+        paddr: usize,
+        tvm_id: usize,
+        vcpu_id: usize,
+        gpa: usize,
+    ) -> SbiRet {
+        for slot in self.entries.iter_mut().flatten() {
+            if slot.paddr == paddr {
+                if slot.state != PageState::ImsicFile || slot.owner_tvm_id.is_some() {
+                    return SbiRet::invalid_param();
+                }
+                slot.owner_tvm_id = Some(tvm_id);
+                slot.gpa = Some(gpa);
+                let _ = vcpu_id; // single-vCPU WP2: the owner tuple is TVM-scoped
+                return SbiRet::success(0);
+            }
+        }
+        SbiRet::invalid_param()
+    }
+
+    /// Whether `paddr` is an interrupt-file page currently unassigned.
+    pub fn is_free_imsic_page(&self, paddr: usize) -> bool {
+        self.entries.iter().flatten().any(|slot| {
+            slot.paddr == paddr
+                && slot.state == PageState::ImsicFile
+                && slot.owner_tvm_id.is_none()
+        })
+    }
+
+    /// Releases an interrupt-file page owned by `tvm_id` back to the
+    /// unassigned pool. Device MMIO: no scrub, and the state stays
+    /// [`PageState::ImsicFile`] (unlike RAM pages, which return to
+    /// [`PageState::ConvertedClean`]).
+    pub fn release_imsic_file(&mut self, paddr: usize, tvm_id: usize) -> bool {
+        for slot in self.entries.iter_mut().flatten() {
+            if slot.paddr == paddr && slot.owner_tvm_id == Some(tvm_id) {
+                slot.owner_tvm_id = None;
+                slot.gpa = None;
+                return true;
+            }
+        }
+        false
     }
 
     pub fn is_converted_and_free(&self, base_paddr: usize, num_pages: usize) -> bool {
@@ -438,7 +519,13 @@ impl PageTracker {
         for slot in self.entries.iter_mut().flatten() {
             if slot.owner_tvm_id == Some(tvm_id) {
                 slot.owner_tvm_id = None;
-                slot.state = PageState::ConvertedClean;
+                // Interrupt-file pages stay in their device state; the host
+                // reclaim path (COVI FID 3) is the only route back to RAM.
+                if slot.state != PageState::ImsicFile {
+                    slot.state = PageState::ConvertedClean;
+                } else {
+                    slot.gpa = None;
+                }
             }
         }
     }

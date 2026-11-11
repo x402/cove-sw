@@ -58,7 +58,7 @@ pub use rdsm;
 // firmware during boot.
 pub use machine_irq::{RDSM_MACHINE_IRQ, RdsmMachineIrq};
 
-use rdsm_abi::{COVE_PAYLOAD_VERSION, RdsmPlatformInfo};
+use rdsm_abi::COVE_PAYLOAD_VERSION;
 use sbi_spec::binary::SbiRet;
 
 // Private error codes: only non-zero-ness is contractual across the private
@@ -85,9 +85,9 @@ pub struct InitEnv<'a, P: rdsm::probe::TrapSafeCsr> {
     pub payload_base: usize,
     /// Platform RAM range `(start, end)`, `None` when unknown.
     pub ram_range: Option<(usize, usize)>,
-    /// IMSIC interrupt-file MMIO range `(start, end)`, `None` when the
-    /// platform has no IMSIC; gates interrupt-file conversion (COVI).
-    pub imsic_range: Option<(usize, usize)>,
+    /// Supervisor/guest interrupt-file geometry, `None` when the platform
+    /// has no supervisor IMSIC; gates interrupt-file conversion (COVI).
+    pub supervisor_imsic: Option<RdsmImsicGeometry>,
     /// Hart ID of the boot hart running `init`.
     pub hart_id: usize,
     /// Whether the device tree advertises the `smsdid` extension.
@@ -123,9 +123,9 @@ pub struct RdsmContext {
     pub fdt_address: usize,
     /// Platform RAM range `(start, end)` captured from [`InitEnv`].
     pub ram_range: Option<(usize, usize)>,
-    /// IMSIC interrupt-file MMIO range `(start, end)` captured from
+    /// Supervisor/guest interrupt-file geometry captured from
     /// [`InitEnv`]; `None` disables COVI interrupt-file conversion.
-    pub imsic_range: Option<(usize, usize)>,
+    pub supervisor_imsic: Option<RdsmImsicGeometry>,
     /// Boot hart ID captured from [`InitEnv`].
     pub hart_id: usize,
     /// Dispatch entry the TSM registered with its TSM_READY TEERET, consumed
@@ -155,7 +155,7 @@ impl RdsmContext {
             host_size: 0,
             fdt_address: 0,
             ram_range: None,
-            imsic_range: None,
+            supervisor_imsic: None,
             hart_id: 0,
             dispatch_entry: None,
         }
@@ -415,6 +415,10 @@ static MPT_UPDATE_LOCK: Mutex<()> = Mutex::new(());
 /// Non-boot harts will have their `mmpt` CSRs left in Bare mode (reset
 /// state) and must be programmed with the host MPT root before MPT
 /// restrictions are enforced in future phases.
+/// ABI types re-exported for the embedding firmware (`RdsmPlatformInfo`
+/// construction in the prototyper's RDSM shim).
+pub use rdsm_abi::{RdsmImsicGeometry, RdsmPlatformInfo};
+
 pub fn init<P: rdsm::probe::TrapSafeCsr>(env: InitEnv<'_, P>) {
     use rdsm::{
         domain::activate_domain,
@@ -428,7 +432,12 @@ pub fn init<P: rdsm::probe::TrapSafeCsr>(env: InitEnv<'_, P>) {
         let r_ctx = context_mut();
         r_ctx.hart_id = env.hart_id;
         r_ctx.ram_range = env.ram_range;
-        r_ctx.imsic_range = env.imsic_range;
+                // Open the Smstateen AIA/CSRIND/IMSIC gates for supervisor and VS
+        // accesses: the COVI indirect-window path (TSM and guest) traps
+        // with them closed. M-mode is the only writer of these CSRs, so
+        // this runs here at substrate init rather than in the TSM.
+        rdsm_mech::open_aia_stateen_gates();
+r_ctx.supervisor_imsic = env.supervisor_imsic;
     }
 
     // Check and load CoVE payload if present
@@ -707,7 +716,7 @@ fn get_info(info_buf: usize) -> SbiRet {
     let mode_val = r_ctx.mpt_mode.map_or(0, |m| m as usize);
     if info_buf != 0 {
         let (ram_start, ram_end) = r_ctx.ram_range.unwrap_or((0, 0));
-        let (imsic_start, imsic_end) = r_ctx.imsic_range.unwrap_or((0, 0));
+        let imsic = r_ctx.supervisor_imsic.unwrap_or_default();
         rdsm_mech::write_platform_info(
             info_buf,
             &RdsmPlatformInfo {
@@ -717,8 +726,7 @@ fn get_info(info_buf: usize) -> SbiRet {
                 tsm_region_end: r_ctx.host_load_paddr,
                 mpt_pool_start: rdsm_mech::MPT_PAGE_POOL_PADDR,
                 mpt_pool_end: rdsm_mech::MPT_PAGE_POOL_PADDR + rdsm_mech::MPT_PAGE_POOL_SIZE,
-                imsic_range_start: imsic_start,
-                imsic_range_end: imsic_end,
+                imsic,
             },
         );
     }
@@ -780,7 +788,10 @@ fn mpt_set(args: [usize; 6]) -> SbiRet {
     //   ([ram_start, tsm_load)) or the MPT page pool
     let range_ok = {
         let end = paddr.checked_add(len);
-        let in_imsic = match (end, r_ctx.imsic_range) {
+        let imsic_range = r_ctx
+            .supervisor_imsic
+            .map(|g| (g.range_start, g.range_end));
+        let in_imsic = match (end, imsic_range) {
             (Some(e), Some((imsic_start, imsic_end))) => {
                 paddr >= imsic_start && e <= imsic_end
             }
@@ -917,7 +928,7 @@ pub fn covh_probe() -> usize {
 /// interrupt-file region to virtualize. Absent any of these, the extension
 /// disappears from discovery and every COVI call is gated off at dispatch.
 pub fn covi_probe() -> usize {
-    (is_tsm_ready() && context().smsdia_available && context().imsic_range.is_some()) as usize
+    (is_tsm_ready() && context().smsdia_available && context().supervisor_imsic.is_some_and(|g| g.usable())) as usize
 }
 
 /// Handles a COVH / COVI call (TEECALL) from the host domain.

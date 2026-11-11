@@ -102,17 +102,46 @@ impl PayloadHeader {
 
 // ── RDSM_GET_INFO platform layout ──────────────────────────────────────
 
+/// Supervisor/guest interrupt-file geometry (SmmTT v0.49 section 6.1).
+///
+/// `range_start` is the base B of the platform's supervisor-domain
+/// interrupt-file array: the supervisor-level file for domain n and hart h
+/// lives at `B + n·2^domain_index_shift + h·2^hart_shift` (hart_shift =
+/// 12 + guest_index_bits), and guest interrupt file g ≥ 1 of that (n, h)
+/// follows at guest index g of the same hart block (page order S, G0, G1,
+/// …). `range_end` closes the contiguous block over every implemented
+/// supervisor interrupt domain. Machine-level files live elsewhere and are
+/// never COVI-convertible.
+///
+/// A platform without a supervisor IMSIC reports a zeroed geometry; every
+/// COVI interrupt-file operation must then be rejected (fail closed).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RdsmImsicGeometry {
+    pub range_start: usize,
+    pub range_end: usize,
+    pub domain_index_shift: usize,
+    pub guest_index_bits: usize,
+    pub hart_index_bits: usize,
+}
+
+impl RdsmImsicGeometry {
+    /// Whether the geometry describes a usable supervisor IMSIC with guest
+    /// interrupt files (at least one implemented domain and GEILEN ≥ 1).
+    pub const fn usable(&self) -> bool {
+        self.range_end > self.range_start
+            && self.guest_index_bits > 0
+            && self.domain_index_shift > 0
+            && self.hart_index_bits < usize::BITS as usize
+    }
+}
+
 /// Platform memory layout handed to the TSM through `RDSM_GET_INFO`
 /// (a2 = confidential-domain buffer).
 ///
 /// The host-allocatable whitelist derivable from this structure is:
 /// `[tsm_region_end, mpt_pool_start)` ∪ `[mpt_pool_end, ram_end)` —
 /// everything else (firmware gap, TSM image, MPT page pool) is reserved.
-///
-/// `[imsic_range_start, imsic_range_end)` is the platform's IMSIC
-/// interrupt-file MMIO region (all machine- and guest-level files), outside
-/// RAM. A zero-sized range means the platform has no IMSIC; interrupt-file
-/// conversion must then be rejected wholesale (fail closed).
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct RdsmPlatformInfo {
@@ -124,11 +153,14 @@ pub struct RdsmPlatformInfo {
     pub tsm_region_end: usize,
     pub mpt_pool_start: usize,
     pub mpt_pool_end: usize,
-    pub imsic_range_start: usize,
-    pub imsic_range_end: usize,
+    /// Supervisor-domain interrupt-file region and geometry; the MPT
+    /// whitelist for interrupt-file ownership changes and the COVI
+    /// conversion/bind address calculus both derive from it.
+    pub imsic: RdsmImsicGeometry,
 }
 
-const _: () = assert!(core::mem::size_of::<RdsmPlatformInfo>() == 64);
+const _: () = assert!(core::mem::size_of::<RdsmImsicGeometry>() == 40);
+const _: () = assert!(core::mem::size_of::<RdsmPlatformInfo>() == 88);
 
 #[cfg(test)]
 mod tests {

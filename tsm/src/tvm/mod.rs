@@ -2,11 +2,81 @@ pub mod page_table;
 pub mod vcpu;
 
 use crate::SbiRet;
-use crate::mm::{is_host_range, PAGE_SIZE, PageState, page_tracker};
+use crate::mm::{imsic_geometry, is_host_range, PAGE_SIZE, PageState, page_tracker};
 use page_table::GStagePageTable;
 use riscv_cove::host::TvmCreateParams;
+use riscv_cove::interrupt::TvmAiaParams;
 use spin::{Mutex, MutexGuard};
 use vcpu::Vcpu;
+
+/// COVI AIA configuration of one TVM (CoVE v0.7 §11.1–§11.2).
+#[derive(Clone, Copy)]
+pub struct TvmAiaState {
+    pub enabled: bool,
+    /// Guest interrupt files per vCPU-hart (§11.1). WP2 implements a
+    /// single guest interrupt file per vCPU (GEILEN=1), i.e. 0 nested
+    /// guests; larger values are rejected at init.
+    pub guests_per_hart: usize,
+}
+
+impl TvmAiaState {
+    pub const fn new() -> Self {
+        Self {
+            enabled: false,
+            guests_per_hart: 0,
+        }
+    }
+}
+
+/// Physical guest interrupt file a vCPU is bound to (CoVE §11.5): the
+/// (domain, hart, guest) file page chosen from the platform geometry at
+/// bind time, on the hart the bind ran on.
+#[derive(Clone, Copy, Debug)]
+pub struct ImsicBinding {
+    pub file_paddr: usize,
+    pub gpa: usize,
+    pub vgein: usize,
+}
+
+/// External interrupt identity bounds: identity 0 is reserved (AIA §3.1)
+/// and the model carries a single 64-bit eip/eie array per file.
+pub const EXT_ID_MAX: usize = 63;
+
+/// Hstatus.VGEIN field position/width (privileged spec).
+const HSTATUS_VGEIN_SHIFT: usize = 12;
+const HSTATUS_VGEIN_MASK: usize = 0x3F << HSTATUS_VGEIN_SHIFT;
+
+/// Indirect-window selectors of one interrupt file (AIA v1.0 §3.7).
+const ISELECT_EIDELIVERY: usize = 0x70;
+const ISELECT_EIE0: usize = 0xC0;
+
+/// Clears a guest interrupt file's delivery line and drains its pending
+/// identities (destroy unbind). Runs in the TSM (confidential SIDN active)
+/// with `hstatus.VGEIN` temporarily pointed at the file.
+fn sanitize_guest_file(vgein: usize) {
+    unsafe {
+        let mut hstatus: usize;
+        core::arch::asm!("csrr {}, hstatus", out(reg) hstatus);
+        let saved = hstatus & HSTATUS_VGEIN_MASK;
+        hstatus = (hstatus & !HSTATUS_VGEIN_MASK) | (vgein << HSTATUS_VGEIN_SHIFT);
+        core::arch::asm!("csrw hstatus, {}", in(reg) hstatus);
+
+        core::arch::asm!("csrw vsiselect, {}", in(reg) ISELECT_EIE0);
+        core::arch::asm!("csrw vsireg, {}", in(reg) 0usize);
+        core::arch::asm!("csrw vsiselect, {}", in(reg) ISELECT_EIDELIVERY);
+        core::arch::asm!("csrw vsireg, {}", in(reg) 0usize);
+        for _ in 0..64 {
+            let topei: usize;
+            core::arch::asm!("csrr {}, vstopei", out(reg) topei);
+            if topei == 0 {
+                break;
+            }
+            core::arch::asm!("csrw vstopei, zero");
+        }
+
+        core::arch::asm!("csrw hstatus, {}", in(reg) saved);
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TvmState {
@@ -50,6 +120,8 @@ pub struct Tvm {
     pub entry_sepc: usize,
     pub entry_arg: usize,
     pub identity: [u8; 64],
+    /// COVI AIA configuration; inert until `init_tvm_aia` (FID 0).
+    pub aia: TvmAiaState,
 }
 
 impl Tvm {
@@ -72,6 +144,7 @@ impl Tvm {
             entry_sepc: 0,
             entry_arg: 0,
             identity: [0; 64],
+            aia: TvmAiaState::new(),
         }
     }
 }
@@ -374,6 +447,273 @@ impl TvmManager {
         SbiRet::success(0)
     }
 
+    // ---- COVI handlers (CoVE v0.7 chapter 11) ----
+
+    /// FID 0 `init_tvm_aia`: validates the host-supplied parameter block
+    /// against the platform's supervisor/guest interrupt-file geometry and
+    /// arms the TVM's AIA configuration. Only while Initializing; nested
+    /// guests (`guests_per_hart > 0`) are rejected (§11.1 allows
+    /// implementations to refuse them).
+    pub fn init_tvm_aia(&mut self, tvm_id: usize, params_paddr: usize, params_len: usize) -> SbiRet {
+        let tvm = match self.active_tvm.as_mut() {
+            Some(t) if t.id == tvm_id => t,
+            _ => return SbiRet::invalid_param(),
+        };
+        if tvm.state != TvmState::Initializing {
+            return SbiRet::invalid_param();
+        }
+        if params_paddr == 0 || params_len < core::mem::size_of::<TvmAiaParams>() {
+            return SbiRet::invalid_param();
+        }
+        if params_paddr % core::mem::align_of::<TvmAiaParams>() != 0
+            || !is_host_range(params_paddr, core::mem::size_of::<TvmAiaParams>())
+        {
+            return SbiRet::invalid_address();
+        }
+
+        let geometry = match imsic_geometry() {
+            Some(g) => g,
+            None => return SbiRet::not_supported(),
+        };
+        let params = unsafe { (*(params_paddr as *const TvmAiaParams)).clone() };
+
+        // The host describes the same platform array the RDSM discovered;
+        // anything else would point COVI at files the geometry cannot
+        // account for. Groups are unsupported (single-group platform).
+        if params.imsic_base_addr as usize != geometry.range_start
+            || params.group_index_bits != 0
+            || params.group_index_shift != 0
+            || params.hart_index_bits as usize != geometry.hart_index_bits
+            || params.guest_index_bits as usize != geometry.guest_index_bits
+            || params.guests_per_hart != 0
+        {
+            return SbiRet::invalid_param();
+        }
+
+        tvm.aia = TvmAiaState {
+            enabled: true,
+            guests_per_hart: 0,
+        };
+        SbiRet::success(0)
+    }
+
+    /// FID 1 `set_tvm_aia_cpu_imsic_addr`: records the vIMSIC GPA for one
+    /// vCPU. Only while Initializing; the GPA must be page-aligned, inside
+    /// one of the TVM's memory regions, and unique across vCPUs (§11.2).
+    pub fn set_tvm_aia_cpu_imsic_addr(
+        &mut self,
+        tvm_id: usize,
+        vcpu_id: usize,
+        gpa: usize,
+    ) -> SbiRet {
+        let tvm = match self.active_tvm.as_mut() {
+            Some(t) if t.id == tvm_id => t,
+            _ => return SbiRet::invalid_param(),
+        };
+        if tvm.state != TvmState::Initializing || !tvm.aia.enabled {
+            return SbiRet::invalid_param();
+        }
+        if gpa % PAGE_SIZE != 0 || gpa == 0 {
+            return SbiRet::invalid_address();
+        }
+        if !tvm
+            .memory_regions
+            .iter()
+            .flatten()
+            .any(|region| gpa >= region.gpa_base && gpa < region.gpa_base + region.len)
+        {
+            return SbiRet::invalid_address();
+        }
+        if tvm.vcpu.as_ref().is_some_and(|v| v.imsic_gpa == Some(gpa)) {
+            // §11.2: no two vCPUs may share a vIMSIC GPA.
+            return SbiRet::invalid_param();
+        }
+        let vcpu = match tvm.vcpu.as_mut() {
+            Some(v) if v.id == vcpu_id => v,
+            _ => return SbiRet::invalid_param(),
+        };
+        vcpu.imsic_gpa = Some(gpa);
+        SbiRet::success(0)
+    }
+
+    /// Physical address of guest interrupt file `vgein` (≥ 1) of `hart` in
+    /// the confidential domain's supervisor interrupt domain (SmmTT §6.1:
+    /// `B + n·2^I + h·2^hart_shift + vgein·2^12`). `None` when the geometry
+    /// cannot cover the request.
+    fn guest_file_paddr(geometry: crate::rdsm_shim::RdsmImsicGeometry, hart: usize, vgein: usize) -> Option<usize> {
+        let guests = 1usize << geometry.guest_index_bits;
+        if vgein == 0 || vgein >= guests {
+            return None;
+        }
+        let harts = 1usize << geometry.hart_index_bits;
+        if hart >= harts {
+            return None;
+        }
+        let hart_shift = 12 + geometry.guest_index_bits;
+        let domains = (geometry.range_end - geometry.range_start)
+            .checked_shr(geometry.domain_index_shift as u32)?;
+        if domains == 0 {
+            return None;
+        }
+        // WP2 single-SIDN pairing: init registers sidn0 -> host, sidn1 ->
+        // conf; the confidential domain owns domain block 1. WP3 replaces
+        // the constant with the allocator's per-domain assignment.
+        const CONF_SIDN: usize = 1;
+        if CONF_SIDN + 1 > domains {
+            return None;
+        }
+        Some(
+            geometry.range_start
+                + CONF_SIDN * (1 << geometry.domain_index_shift)
+                + hart * (1 << hart_shift)
+                + vgein * PAGE_SIZE,
+        )
+    }
+
+    /// FID 4 `bind_aia_imsic`: binds an unbound vCPU, running on the
+    /// calling hart, to the confidential domain's guest interrupt file for
+    /// that hart (§11.5). `imsic_mask` follows the hgeie format: bit 0
+    /// always 0 and exactly `1 + guests_per_hart` bits set — with WP2's
+    /// `guests_per_hart == 0` the only legal mask is bit 1 (G0, VGEIN 1).
+    pub fn bind_aia_imsic(&mut self, tvm_id: usize, vcpu_id: usize, imsic_mask: usize) -> SbiRet {
+        let geometry = match imsic_geometry() {
+            Some(g) => g,
+            None => return SbiRet::not_supported(),
+        };
+        let tvm = match self.active_tvm.as_mut() {
+            Some(t) if t.id == tvm_id => t,
+            _ => return SbiRet::invalid_param(),
+        };
+        if !tvm.aia.enabled {
+            return SbiRet::invalid_param();
+        }
+        if imsic_mask != 1 << 1 {
+            // §11.5: popcount must equal 1 + guests_per_hart; bit 0 is 0.
+            return SbiRet::invalid_param();
+        }
+        let vcpu = match tvm.vcpu.as_mut() {
+            Some(v) if v.id == vcpu_id => v,
+            _ => return SbiRet::invalid_param(),
+        };
+        if vcpu.imsic_binding.is_some() {
+            // §11.5: the vCPU must currently be unbound.
+            return SbiRet::invalid_param();
+        }
+        let gpa = match vcpu.imsic_gpa {
+            Some(g) => g,
+            None => return SbiRet::invalid_param(),
+        };
+
+        let hart = crate::current_hart_id();
+        let file_paddr = match Self::guest_file_paddr(geometry, hart, 1) {
+            Some(p) => p,
+            None => return SbiRet::invalid_param(),
+        };
+
+        // The file must have been converted (COVI FID 2) and fenced, and
+        // not owned by any TVM. Lock order: TVM_MANAGER -> PAGE_TRACKER.
+        let mut tracker = page_tracker();
+        if let SbiRet { error, .. } = tracker.bind_imsic_page(file_paddr, tvm_id, vcpu_id, gpa) {
+            if error != 0 {
+                return SbiRet::invalid_param();
+            }
+        }
+
+        // Map the vIMSIC GPA onto the file in the G-stage: device leaf,
+        // never executable. The PT pool belongs to this TVM.
+        let mut pt_used = tvm.pt_page_used;
+        let pt_count = tvm.pt_page_count;
+        let mut alloc = || {
+            if pt_used < pt_count {
+                let p = tvm.pt_pages[pt_used];
+                pt_used += 1;
+                Some(p)
+            } else {
+                None
+            }
+        };
+        if tvm.page_table.map_4k_io(gpa, file_paddr, &mut alloc).is_err() {
+            let _ = tracker.release_imsic_file(file_paddr, tvm_id);
+            return SbiRet::failed();
+        }
+        tvm.pt_page_used = pt_used;
+
+        // VGEIN selects the guest file inside the active supervisor
+        // interrupt domain (SmmTT §6.3.1): WP2 pairs the confidential
+        // domain with VGEIN 1.
+        let vgein = 1;
+        vcpu.ctx.hstatus = (vcpu.ctx.hstatus & !HSTATUS_VGEIN_MASK) | (vgein << HSTATUS_VGEIN_SHIFT);
+        // Enable the file's identity line at the hart: hgeie is one
+        // element of the per-SIDN array and the TSM runs inside the
+        // confidential domain (sidn1), so this write is scoped to it.
+        // Delegate the VS external interrupt line into VS and open the
+        // Smstateen gates the guest's indirect-window accesses pass
+        // through (CSRIND selects, AIA stopi, IMSIC topei).
+        unsafe {
+            core::arch::asm!("csrs hgeie, {}", in(reg) 1usize << vgein);
+            core::arch::asm!("csrs hideleg, {}", in(reg) 1usize << 10); // VSEIP
+        }
+        // Software pending file (§11.8 unbound record) drains into the
+        // hardware file on bind: seteipnum_le takes one identity per write.
+        let pending = vcpu.ctx.ext_int_pending;
+        if pending != 0 {
+            for iid in 1..=EXT_ID_MAX {
+                if pending & (1 << iid) != 0 {
+                    unsafe {
+                        core::ptr::write_volatile(file_paddr as *mut u32, iid as u32);
+                    }
+                }
+            }
+            vcpu.ctx.ext_int_pending = 0;
+        }
+
+        vcpu.imsic_binding = Some(ImsicBinding {
+            file_paddr,
+            gpa,
+            vgein,
+        });
+        SbiRet::success(0)
+    }
+
+    /// FID 7 `inject_tvm_cpu`: injects external interrupt `iid` into one
+    /// vCPU (§11.8). The identity must be guest-allowed (COVG FID 4;
+    /// default deny, §12.5) — the project maps a denied identity to
+    /// `invalid_param`, the table's invalid-input code for §11.8. A bound
+    /// vCPU receives the MSI through its hardware file; an unbound one
+    /// records it in the software pending file until bind.
+    pub fn inject_tvm_cpu(&mut self, tvm_id: usize, vcpu_id: usize, iid: usize) -> SbiRet {
+        let tvm = match self.active_tvm.as_mut() {
+            Some(t) if t.id == tvm_id => t,
+            _ => return SbiRet::invalid_param(),
+        };
+        if !tvm.aia.enabled {
+            return SbiRet::not_supported();
+        }
+        let vcpu = match tvm.vcpu.as_mut() {
+            Some(v) if v.id == vcpu_id => v,
+            _ => return SbiRet::invalid_param(),
+        };
+        if iid == 0 || iid > EXT_ID_MAX {
+            return SbiRet::invalid_param();
+        }
+        if vcpu.ctx.ext_int_allowed & (1 << iid) == 0 {
+            return SbiRet::invalid_param();
+        }
+        match vcpu.imsic_binding {
+            Some(binding) => {
+                // §11.8: immediately injected by writing the interrupt file.
+                unsafe {
+                    core::ptr::write_volatile(binding.file_paddr as *mut u32, iid as u32);
+                }
+            }
+            None => {
+                // §11.8: recorded in software until the vCPU binds.
+                vcpu.ctx.ext_int_pending |= 1 << iid;
+            }
+        }
+        SbiRet::success(0)
+    }
+
     pub fn create_tvm_vcpu(&mut self, tvm_id: usize, vcpu_id: usize, state_paddr: usize) -> SbiRet {
         let tvm = match self.active_tvm.as_mut() {
             Some(t) if t.id == tvm_id => t,
@@ -428,6 +768,12 @@ impl TvmManager {
             Some(v) => v,
             None => return SbiRet::failed(),
         };
+
+        // §11.2: every vCPU of an AIA-enabled TVM must have its vIMSIC
+        // GPA configured before finalize.
+        if tvm.aia.enabled && vcpu.imsic_gpa.is_none() {
+            return SbiRet::failed();
+        }
 
         vcpu.init_boot(entry_sepc, entry_arg, hgatp);
 
@@ -784,10 +1130,32 @@ impl TvmManager {
     }
 
     pub fn destroy_tvm(&mut self, tvm_id: usize) -> SbiRet {
-        let _tvm = match self.active_tvm.as_mut() {
+        let tvm = match self.active_tvm.as_mut() {
             Some(t) if t.id == tvm_id => t,
             _ => return SbiRet::invalid_param(),
         };
+        if tvm.aia.enabled {
+            // Implicit unbind: destroy has no unbind FIDs in WP2, so the
+            // bound file is sanitized (identity lines cleared, pending
+            // drained), withdrawn from the hart's hgeie line, unmapped
+            // from the G-stage, and returned to the unassigned pool.
+            if let Some(binding) = tvm.vcpu.as_ref().and_then(|v| v.imsic_binding) {
+                sanitize_guest_file(binding.vgein);
+                unsafe {
+                    core::arch::asm!("csrc hgeie, {}", in(reg) 1usize << binding.vgein);
+                }
+                let _ = tvm.page_table.unmap_4k(binding.gpa);
+                unsafe {
+                    core::arch::asm!("hfence.gvma");
+                }
+                if let Some(vcpu) = tvm.vcpu.as_mut() {
+                    vcpu.ctx.hstatus &= !HSTATUS_VGEIN_MASK;
+                    vcpu.ctx.ext_int_pending = 0;
+                    vcpu.ctx.ext_int_allowed = 0;
+                    vcpu.imsic_binding = None;
+                }
+            }
+        }
 
         let mut tracker = page_tracker();
         tracker.release_tvm_pages(tvm_id);
@@ -830,6 +1198,10 @@ pub fn run_tvm_vcpu(tvm_id: usize, vcpu_id: usize) -> SbiRet {
         match tvm.vcpu.as_ref() {
             Some(v) if v.id == vcpu_id => {}
             _ => return SbiRet::invalid_param(),
+        }
+        // §7.4.2: running an unbound (AIA) vCPU is an error.
+        if tvm.aia.enabled && tvm.vcpu.as_ref().and_then(|v| v.imsic_binding).is_none() {
+            return SbiRet::invalid_param();
         }
         tvm.vcpu.take().expect("vcpu presence checked above")
     };

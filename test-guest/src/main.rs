@@ -134,6 +134,66 @@ pub extern "C" fn guest_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
     }
     println!("[GUEST] Resumed after COVG unshare");
 
+    // ── PHASE 7: COVI injected external interrupt ──
+    // Arm the guest interrupt file (eie identity 1, eidelivery on), route
+    // VSEIP into VS via vsie/vstvec, allow identity 1 through COVG, and
+    // take the host's injected MSI in the VS handler. The interrupt lands
+    // right after the allow ecall resumes (sret re-enables vsstatus.SIE
+    // with the MSI already pending in the file).
+    println!("[GUEST] PHASE7: arming VS external interrupt...");
+    unsafe {
+        asm!(
+            "la t0, vs_ext_irq_handler",
+            "csrw vstvec, t0",
+            "li t0, 0xC0",
+            "csrw vsiselect, t0",   // eie0
+            "li t0, 2",
+            "csrw vsireg, t0",      // enable identity 1
+            "li t0, 0x70",
+            "csrw vsiselect, t0",   // eidelivery
+            "li t0, 1",
+            "csrw vsireg, t0",
+            "li t0, 512",
+            "csrs vsie, t0",        // VSEIE
+            "li t0, 2",
+            "csrs sstatus, t0",     // global VS enable
+            options(nomem)
+        );
+    }
+
+    println!("[GUEST] PHASE7: calling COVG ALLOW_EXTERNAL_INTERRUPT...");
+    unsafe {
+        asm!(
+            "li a7, 0x434F5647",
+            "li a6, 4",
+            "li a0, 1",
+            "li a1, 0",
+            "ecall",
+            lateout("a0") _,
+            lateout("a1") _,
+            lateout("a6") _,
+            lateout("a7") _,
+        );
+    }
+    // The injected interrupt was taken on the way back: the handler
+    // claimed it and printed the VS_EXT marker. Deny identity 1 (COVG
+    // FID 5) so the host's repeat injection is refused.
+    println!("[GUEST] PHASE7: resumed after allow; calling COVG DENY...");
+    unsafe {
+        asm!(
+            "li a7, 0x434F5647",
+            "li a6, 5",
+            "li a0, 1",
+            "li a1, 0",
+            "ecall",
+            lateout("a0") _,
+            lateout("a1") _,
+            lateout("a6") _,
+            lateout("a7") _,
+        );
+    }
+    println!("[GUEST] PHASE7: resumed after deny");
+
     // Exit TVM via SRST
     unsafe {
         asm!(
@@ -145,6 +205,31 @@ pub extern "C" fn guest_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
             options(noreturn)
         );
     }
+}
+
+/// VS external interrupt handler (vstvec direct). Claims the reported
+/// identity through vstopei and prints the serial evidence line. The
+/// handler runs on the interrupted VS flow: caller-saved registers are
+/// dead at the expected landing point (right after the allow ecall
+/// resume), so no register saving is needed for this test.
+#[unsafe(naked)]
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".text.entry")]
+pub unsafe extern "C" fn vs_ext_irq_handler() {
+    core::arch::naked_asm!(
+        "csrw vstopei, zero", // claim the reported identity
+        "call vs_irq_note",
+        // NEMU decodes the VS xret as `sret` executed with cpu.v=1; the
+        // dedicated vsret encoding is not in its decode table.
+        ".word 0x10200073",
+    );
+}
+
+/// Serial evidence that the injected MSI was taken in VS-mode. Called from
+/// the naked handler: caller-saved registers are dead at the landing point.
+#[unsafe(no_mangle)]
+extern "C" fn vs_irq_note() {
+    println!("[GUEST] PHASE7: VS_EXT_INJECT_OK (iid=1)");
 }
 
 #[panic_handler]

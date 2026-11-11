@@ -20,6 +20,17 @@ use tvm::{run_tvm_vcpu, tvm_manager};
 pub const TSM_IMPL_CUSTOM: u32 = 0x54534D31; // "TSM1"
 pub const TSM_VERSION: u32 = 1;
 
+/// The hart running this dispatch. `mhartid` is not readable in HS-mode;
+/// the boot hart index lives in `scontext` (0x5a8) and survives domain
+/// switches (see `tsm_main`).
+pub fn current_hart_id() -> usize {
+    let hart: usize;
+    unsafe {
+        core::arch::asm!("csrr {}, 0x5a8", out(reg) hart);
+    }
+    hart
+}
+
 pub struct SbiConsole;
 
 impl Write for SbiConsole {
@@ -138,9 +149,12 @@ static mut DISPATCH_STACKS: DispatchStacks =
 pub unsafe extern "C" fn tsm_dispatch_entry() -> ! {
     naked_asm!(
         // Stack indexed by the hart id kept in `scontext` (0x5a8) since
-        // TSM boot; `mhartid` is not readable in HS-mode.
+        // TSM boot; `mhartid` is not readable in HS-mode. Each hart owns
+        // one 64 KiB slot and starts from its TOP: a downward-growing
+        // stack from the slot base would overwrite the BSS below it.
         "csrr t0, 0x5a8",
         "la t1, DISPATCH_STACKS",
+        "addi t0, t0, 1",
         "slli t0, t0, 16",
         "add sp, t1, t0",
         "call tsm_dispatch",
@@ -339,6 +353,12 @@ pub extern "C" fn tsm_dispatch(
         riscv_cove::interrupt::EID_COVI => match fid {
             riscv_cove::interrupt::CONVERT_AIA_IMSIC => page_tracker().convert_imsic_page(a0),
             riscv_cove::interrupt::RECLAIM_TVM_AIA_IMSIC => page_tracker().reclaim_imsic_page(a0),
+            riscv_cove::interrupt::INIT_TVM_AIA => tvm_manager().init_tvm_aia(a0, a1, a2),
+            riscv_cove::interrupt::SET_TVM_AIA_CPU_IMSIC_ADDR => {
+                tvm_manager().set_tvm_aia_cpu_imsic_addr(a0, a1, a2)
+            }
+            riscv_cove::interrupt::BIND_AIA_IMSIC => tvm_manager().bind_aia_imsic(a0, a1, a2),
+            riscv_cove::interrupt::INJECT_TVM_CPU => tvm_manager().inject_tvm_cpu(a0, a1, a2),
             _ => SbiRet::not_supported(),
         },
         _ => SbiRet::not_supported(),
