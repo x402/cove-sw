@@ -41,8 +41,8 @@ FIRMWARE="$RUSTSBI_ROOT/target/riscv64gc-unknown-none-elf/release/rustsbi-protot
 #   lifecycle lines are matched instead.
 #
 # MARKER_PROFILE selects the marker set:
-#   full    (default) all 23 markers — complete TEECALL/TEERET lifecycle
-#           plus the COVI bind/inject segment.
+#   full    (default) all 24 markers — complete TEECALL/TEERET lifecycle
+#           plus the COVI bind/inject segment and its negative-path checks.
 #   interim phase-6.5 port profile: the substrate boots and the TSM runs,
 #           but the retentive TEERET is rejected (upstream rustsbi#286
 #           pending); the last marker is the TSM's interim parking line.
@@ -68,6 +68,7 @@ full)
       'Resumed after COVG unshare'
       '\[GUEST\] PHASE7: VS_EXT_INJECT_OK \(iid=1\)'
       '\[MARKER 19\] HOST: COVI inject gating validated\.'
+      '\[MARKER 20\] HOST: COVI init/addr/bind/inject/run/reclaim negative paths PASSED\.'
       '\[MARKER 14\] HOST: Received TVM exit, tearing down TVM #[0-9]+\.'
       '\[TSM\] COVI guest-file scrub claimed 1 identity\.'
       '\[MARKER 15\] HOST: All confidential pages reclaimed successfully\.'

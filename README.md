@@ -71,7 +71,7 @@ tests/e2e/run_e2e.sh
 ```
 
 The script packs the payload, builds the Prototyper firmware with the `rdsm`
-feature, boots NEMU and verifies 17 ordered serial markers covering the
+feature, boots NEMU and verifies 24 ordered serial markers covering the
 complete TEECALL/TEERET lifecycle: RDSM init → TSM ready → host extension
 discovery → confidential page conversion → TVM create / finalize / run →
 guest exit → TVM teardown → page reclaim.

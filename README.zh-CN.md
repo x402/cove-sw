@@ -63,7 +63,7 @@ tests/e2e/run_e2e.sh
 ```
 
 脚本打包 payload、构建带 `rdsm` feature 的 Prototyper 固件、启动 NEMU,并按序
-校验 17 个串行 marker,覆盖完整 TEECALL/TEERET 生命周期:RDSM 初始化 → TSM
+校验 24 个串行 marker,覆盖完整 TEECALL/TEERET 生命周期:RDSM 初始化 → TSM
 就绪 → 宿主扩展发现 → 机密页转换 → TVM 创建/终结/运行 → guest 退出 → TVM
 拆除 → 页回收。
 

@@ -682,6 +682,16 @@ const CONF_GUEST_FILE: usize = 0x3000_D000;
 /// leaf there would swallow the guest's demand-zero writes and turn
 /// PHASE4's DEMAND_ZERO_OK into an MMIO pass-through readback.
 const VCPU_IMSIC_GPA: usize = 0x8003_0000;
+/// A second page-aligned GPA inside the TVM's memory region. Used where the
+/// guard under test is the vCPU id, the TVM state or the TVM id, so the
+/// duplicate-GPA check cannot fire first, and a leaked success cannot be
+/// mistaken for the duplicate-GPA rejection.
+const VCPU_IMSIC_GPA_ALT: usize = 0x8003_1000;
+/// TVM and vCPU ids that no live TVM can hold: only vCPU 0 exists and the
+/// e2e TVM is the first one created. Every per-TVM/-vCPU handler must reject
+/// them.
+const UNKNOWN_TVM_ID: usize = 0xDEAD;
+const UNKNOWN_VCPU_ID: usize = 1;
 
 #[repr(align(16384))]
 struct AlignedPages([u8; NUM_PAGES * 4096]);
@@ -831,6 +841,11 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
     let (err, _) = sbi_covh_local_fence();
     assert_eq!(err, 0, "post-convert local fence must succeed");
 
+    // ── COVI negative paths: FID 0 parameter validation ──
+    // Every negative call below must be refused by the TSM's COVI dispatch input
+    // validation and must leave state the positive path depends on intact.
+    // The valid block is staged first so every variant differs from it only
+    // in the field (or length/address) under test.
     let params = riscv_cove::interrupt::TvmAiaParams {
         imsic_base_addr: 0x3000_8000,
         group_index_bits: 0,
@@ -839,20 +854,67 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
         guest_index_bits: 1,
         guests_per_hart: 0,
     };
-    let params_ptr = core::ptr::addr_of_mut!(AIA_PARAMS_BUF) as *mut u8;
-    unsafe {
-        core::ptr::write_bytes(params_ptr, 0, 64);
+    let aia_params_len = core::mem::size_of::<riscv_cove::interrupt::TvmAiaParams>();
+    let aia_params_ptr = core::ptr::addr_of_mut!(AIA_PARAMS_BUF) as *mut u8;
+    let stage_aia_params = |block: &riscv_cove::interrupt::TvmAiaParams| unsafe {
+        core::ptr::write_bytes(aia_params_ptr, 0, 64);
         core::ptr::copy_nonoverlapping(
-            core::ptr::addr_of!(params).cast::<u8>(),
-            params_ptr,
-            core::mem::size_of::<riscv_cove::interrupt::TvmAiaParams>(),
+            (block as *const riscv_cove::interrupt::TvmAiaParams).cast::<u8>(),
+            aia_params_ptr,
+            aia_params_len,
         );
-    }
-    let (err, _) = sbi_covi_init_tvm_aia(
-        tvm_id,
-        params_ptr as usize,
-        core::mem::size_of::<riscv_cove::interrupt::TvmAiaParams>(),
+    };
+    stage_aia_params(&params);
+
+    // N01: FID 0 parameter validation. (a) a short parameter block, (b) a
+    // misaligned block address, (c) a block outside host-allocatable memory
+    // (the TSM image), and (d) the positive block with only
+    // guests_per_hart changed to 1: the implementation does not support
+    // nested IMSIC virtualization, so nested guests are refused.
+    let (err, _) = sbi_covi_init_tvm_aia(tvm_id, aia_params_ptr as usize, aia_params_len - 1);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "FID 0 with params_len below sizeof(TvmAiaParams) must be SBI_ERR_INVALID_PARAM"
     );
+    let (err, _) = sbi_covi_init_tvm_aia(tvm_id, aia_params_ptr as usize + 4, aia_params_len);
+    assert_eq!(
+        err,
+        (-5isize) as usize,
+        "FID 0 with a misaligned params address must be SBI_ERR_INVALID_ADDRESS"
+    );
+    let (err, _) = sbi_covi_init_tvm_aia(tvm_id, 0x8040_0000, aia_params_len);
+    assert_eq!(
+        err,
+        (-5isize) as usize,
+        "FID 0 with a params block in TSM memory must be SBI_ERR_INVALID_ADDRESS"
+    );
+    let mut nested_params = params;
+    nested_params.guests_per_hart = 1;
+    stage_aia_params(&nested_params);
+    let (err, _) = sbi_covi_init_tvm_aia(tvm_id, aia_params_ptr as usize, aia_params_len);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "FID 0 with guests_per_hart = 1 must be SBI_ERR_INVALID_PARAM"
+    );
+    println!("[HOST] COVI-N01 OK: FID 0 short/misaligned/foreign/nested params rejected");
+
+    stage_aia_params(&params);
+
+    // N02a: FID 0 with an unknown TVM id. The buffer holds the same valid
+    // parameter block the positive call below arms, and the TVM is still
+    // Initializing, so only the id match can reject it: without that guard
+    // the call would arm the AIA state and return success.
+    let (err, _) = sbi_covi_init_tvm_aia(UNKNOWN_TVM_ID, aia_params_ptr as usize, aia_params_len);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "FID 0 with an unknown TVM id must be SBI_ERR_INVALID_PARAM"
+    );
+    println!("[HOST] COVI-N02a OK: FID 0 unknown TVM id rejected");
+
+    let (err, _) = sbi_covi_init_tvm_aia(tvm_id, aia_params_ptr as usize, aia_params_len);
     assert_eq!(err, 0, "init_tvm_aia must succeed");
 
     // 9. Create vCPU 0
@@ -864,6 +926,71 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
     assert_eq!(err, 0, "set_tvm_aia_cpu_imsic_addr must succeed");
     println!("[MARKER 08] HOST: TVM #{} created with 1 vCPU.", tvm_id);
 
+    // ── COVI negative paths: unknown TVM id, vCPU id, GPA (pre-finalize) ──
+    // The TVM is still Initializing and its AIA configuration is armed, so
+    // only the guards named per case can produce the result.
+    // N02b: FID 1 with an unknown TVM id. The TVM is Initializing, the AIA
+    // state is armed, vCPU 0 exists, and the GPA is in-region, page-aligned
+    // and not the recorded one, so without the id match the call would
+    // record it and return success.
+    let (err, _) = sbi_covi_set_tvm_aia_cpu_imsic_addr(UNKNOWN_TVM_ID, 0, VCPU_IMSIC_GPA_ALT);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "FID 1 with an unknown TVM id must be SBI_ERR_INVALID_PARAM"
+    );
+    println!("[HOST] COVI-N02b OK: FID 1 unknown TVM id rejected");
+
+    // N03a: FID 1 with an unknown vCPU id is refused after the TVM, state
+    // and GPA guards pass. The GPA is in-region, page-aligned and differs
+    // from the recorded one, so the duplicate-GPA check cannot fire.
+    let (err, _) = sbi_covi_set_tvm_aia_cpu_imsic_addr(tvm_id, UNKNOWN_VCPU_ID, VCPU_IMSIC_GPA_ALT);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "FID 1 with an unknown vCPU id must be SBI_ERR_INVALID_PARAM"
+    );
+    println!("[HOST] COVI-N03a OK: FID 1 unknown vCPU id rejected");
+
+    // N04: FID 1 address validation. The misaligned GPA lies inside the
+    // TVM's memory region, so only the alignment clause can reject it; the
+    // second call exercises the reserved zero GPA; the third is
+    // page-aligned but outside every memory region. GPA 0 is also outside
+    // every region (they all start at 0x8000_0000), so the zero-GPA call
+    // proves the invalid_address rejection but cannot by itself say which
+    // of the two clauses fired.
+    let (err, _) = sbi_covi_set_tvm_aia_cpu_imsic_addr(tvm_id, 0, VCPU_IMSIC_GPA + 8);
+    assert_eq!(
+        err,
+        (-5isize) as usize,
+        "FID 1 with a misaligned GPA must be SBI_ERR_INVALID_ADDRESS"
+    );
+    let (err, _) = sbi_covi_set_tvm_aia_cpu_imsic_addr(tvm_id, 0, 0);
+    assert_eq!(
+        err,
+        (-5isize) as usize,
+        "FID 1 with a zero GPA must be SBI_ERR_INVALID_ADDRESS"
+    );
+    let (err, _) = sbi_covi_set_tvm_aia_cpu_imsic_addr(tvm_id, 0, 0x9000_0000);
+    assert_eq!(
+        err,
+        (-5isize) as usize,
+        "FID 1 with a GPA outside every memory region must be SBI_ERR_INVALID_ADDRESS"
+    );
+    println!("[HOST] COVI-N04 OK: FID 1 misaligned/zero/out-of-region GPA rejected");
+
+    // N05: §11.2 forbids two vCPUs sharing a vIMSIC GPA; re-recording the
+    // GPA this vCPU already owns is the duplicate the model can see. The
+    // table does not name a code for a duplicate GPA, so invalid_param is
+    // the project mapping for this case.
+    let (err, _) = sbi_covi_set_tvm_aia_cpu_imsic_addr(tvm_id, 0, VCPU_IMSIC_GPA);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "FID 1 with a duplicate vIMSIC GPA must be SBI_ERR_INVALID_PARAM"
+    );
+    println!("[HOST] COVI-N05 OK: FID 1 duplicate vIMSIC GPA rejected");
+
     // 10. Finalize TVM
     println!("[HOST] Finalizing TVM with entry PC 0x80000000...");
     let (err, _) = sbi_covh_finalize_tvm(tvm_id, 0x8000_0000, 0, 0);
@@ -873,11 +1000,118 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
         tvm_id
     );
 
+    // ── COVI negative paths: finalized TVM, unknown TVM id, unbound vCPU ──
+    // N06: once finalized the vIMSIC GPA can no longer be set. The
+    // alternative in-region page-aligned GPA makes a leaked success show up
+    // as success instead of as a duplicate-GPA rejection.
+    let (err, _) = sbi_covi_set_tvm_aia_cpu_imsic_addr(tvm_id, 0, VCPU_IMSIC_GPA_ALT);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "FID 1 after finalize must be SBI_ERR_INVALID_PARAM"
+    );
+    println!("[HOST] COVI-N06 OK: FID 1 after finalize rejected");
+
+    // N02c: FID 4 with an unknown TVM id. The TVM is finalized with its AIA
+    // state armed, vCPU 0 exists, is unbound and has a vIMSIC GPA, and the
+    // converted file is free, so without the id match the call would bind
+    // and return success.
+    let (err, _) = sbi_covi_bind_aia_imsic(UNKNOWN_TVM_ID, 0, 0b10);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "FID 4 with an unknown TVM id must be SBI_ERR_INVALID_PARAM"
+    );
+    println!("[HOST] COVI-N02c OK: FID 4 unknown TVM id rejected");
+
+    // N03b: FID 4 with an unknown vCPU id. The finalized TVM is a state bind
+    // accepts, its AIA state is armed, the mask is legal and vCPU 0 is
+    // unbound with a GPA, so only the vCPU id match can reject the call.
+    let (err, _) = sbi_covi_bind_aia_imsic(tvm_id, UNKNOWN_VCPU_ID, 0b10);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "FID 4 with an unknown vCPU id must be SBI_ERR_INVALID_PARAM"
+    );
+    println!("[HOST] COVI-N03b OK: FID 4 unknown vCPU id rejected");
+
+    // N07: with guests_per_hart = 0 the only legal hgeie mask is bit 1
+    // (G0, VGEIN 1); anything else is refused before the vCPU is touched.
+    for mask in [0b00usize, 0b01, 0b11] {
+        let (err, _) = sbi_covi_bind_aia_imsic(tvm_id, 0, mask);
+        assert_eq!(
+            err,
+            (-3isize) as usize,
+            "FID 4 with imsic_mask {:#04b} must be SBI_ERR_INVALID_PARAM",
+            mask
+        );
+    }
+    println!("[HOST] COVI-N07 OK: FID 4 illegal imsic_mask rejected");
+
+    // N08: §7.4.2 — an AIA-enabled vCPU may not run before it is bound, even
+    // though the TVM is Runnable and the vCPU id is valid. Table 28 (§10.17)
+    // does not name a code for an unbound run, so invalid_param is the
+    // project mapping for this case.
+    let (err, _) = sbi_covh_run_tvm_vcpu(tvm_id, 0);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "run of an unbound AIA vCPU must be SBI_ERR_INVALID_PARAM"
+    );
+    println!("[HOST] COVI-N08 OK: run before bind rejected");
+
+    // N09: §11.8 identity bounds: identity 0 is reserved (AIA §3.1) and the
+    // modeled file carries one 64-bit eip/eie word, so identities run
+    // 1..=63. Both are refused before any pending bit is recorded. The
+    // allow-bit guard would refuse both with the same invalid_param (bit 0
+    // is never set, and the release build masks the shift), so this case
+    // proves the rejection; the range guard is the one that fires only by
+    // inspection.
+    let (err, _) = sbi_covi_inject_tvm_cpu(tvm_id, 0, 0);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "FID 7 with iid 0 must be SBI_ERR_INVALID_PARAM"
+    );
+    let (err, _) = sbi_covi_inject_tvm_cpu(tvm_id, 0, 64);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "FID 7 with iid 64 (one above EXT_ID_MAX = 63) must be SBI_ERR_INVALID_PARAM"
+    );
+    println!("[HOST] COVI-N09 OK: FID 7 out-of-range identity rejected");
+
     // 10a-prec. COVI bind: the vCPU binds to the hart's guest interrupt
     // file (mask bit 1 = G0, VGEIN 1) and becomes runnable (§11.5).
     let (err, _) = sbi_covi_bind_aia_imsic(tvm_id, 0, 0b10);
     assert_eq!(err, 0, "bind_aia_imsic must succeed");
     println!("[MARKER 18] HOST: COVI AIA bound (vgein=1).");
+
+    // ── COVI negative paths: bound vCPU ──
+    // N10: a bound vCPU cannot be bound again (§11.5: "The vCPU must
+    // currently be unbound"), so the same legal mask must be refused while
+    // the binding is held. The table does not name a code for a repeat
+    // bind, so invalid_param is the project mapping for this case. The page
+    // tracker's owner check in `bind_imsic_page` rejects the already-owned
+    // file with the same invalid_param, so this case proves the rejection
+    // but cannot, on its own, tell which of the two guards fired.
+    let (err, _) = sbi_covi_bind_aia_imsic(tvm_id, 0, 0b10);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "repeat bind of a bound vCPU must be SBI_ERR_INVALID_PARAM"
+    );
+    println!("[HOST] COVI-N10 OK: repeat bind rejected");
+
+    // N11: the guest interrupt file stays owned by the TVM until destroy
+    // releases it, so COVI FID 3 must refuse it while it is bound (§11.4).
+    let (err, _) = sbi_covi_reclaim_tvm_aia_imsic(CONF_GUEST_FILE);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "reclaim of a bound guest interrupt file must be SBI_ERR_INVALID_PARAM"
+    );
+    println!("[HOST] COVI-N11 OK: reclaim of a bound guest interrupt file rejected");
 
     // 10a. Run TVM vCPU 0 (first run: guest shares memory, exits)
     println!("[HOST] Running TVM vCPU 0 (first run: COVG share)...");
@@ -947,6 +1181,32 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
     let (err, _) = sbi_covi_inject_tvm_cpu(tvm_id, 0, 2);
     assert_eq!(err, 0, "inject of the never-enabled identity must succeed");
 
+    // N02d: FID 7 with an unknown TVM id. The TVM is armed and bound, vCPU 0
+    // is valid, and identity 2 is guest-allowed and already pending, so
+    // without the id match the call would re-write identity 2 into the file
+    // and return success; the pending bit is already set, so a leaked bypass
+    // would still leave the scrub claiming exactly one identity.
+    let (err, _) = sbi_covi_inject_tvm_cpu(UNKNOWN_TVM_ID, 0, 2);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "FID 7 with an unknown TVM id must be SBI_ERR_INVALID_PARAM"
+    );
+    println!("[HOST] COVI-N02d OK: FID 7 unknown TVM id rejected");
+
+    // N03c: FID 7 with an unknown vCPU id, now that the guest has allowed
+    // identity 2 and it is already pending: the vCPU id match is the only
+    // guard left that can reject this call. A leaked bypass would re-set
+    // the already-pending identity-2 bit, so the guest-file scrub would
+    // still claim exactly one identity.
+    let (err, _) = sbi_covi_inject_tvm_cpu(tvm_id, UNKNOWN_VCPU_ID, 2);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "FID 7 with an unknown vCPU id must be SBI_ERR_INVALID_PARAM"
+    );
+    println!("[HOST] COVI-N03c OK: FID 7 unknown vCPU id rejected");
+
     println!("[HOST] Running TVM vCPU 0 (fifth run: deny identity 1)...");
     let (err, val) = sbi_covh_run_tvm_vcpu(tvm_id, 0);
     println!("[HOST] TVM vCPU 0 exited with err={}, val={}", err, val);
@@ -962,7 +1222,19 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
         (-3isize) as usize,
         "inject of a denied identity must be SBI_ERR_INVALID_PARAM"
     );
+    // N12: by now the guest has allowed identity 2 and denied identity 1;
+    // every other identity stays denied (§12.5 default deny) and must be
+    // rejected without touching the guest interrupt file.
+    let (err, _) = sbi_covi_inject_tvm_cpu(tvm_id, 0, 5);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "inject of a non-allowed identity must be SBI_ERR_INVALID_PARAM"
+    );
+    println!("[HOST] COVI-N12 OK: inject of a non-allowed identity rejected");
+
     println!("[MARKER 19] HOST: COVI inject gating validated.");
+    println!("[MARKER 20] HOST: COVI init/addr/bind/inject/run/reclaim negative paths PASSED.");
 
     // 10h. Run once more: the guest exits clean via SRST.
     println!("[HOST] Running TVM vCPU 0 (sixth run: clean exit)...");
