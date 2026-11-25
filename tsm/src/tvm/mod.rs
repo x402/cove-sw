@@ -46,6 +46,10 @@ pub struct ImsicBinding {
     pub file_paddr: usize,
     pub gpa: usize,
     pub vgein: usize,
+    /// Physical hart the bind ran on (§11.5: the vCPU is bound to the
+    /// current physical CPU). Recorded so run and destroy can tell whether
+    /// they execute on that hart.
+    pub hart_id: usize,
 }
 
 /// External interrupt identity bounds: identity 0 is reserved (AIA §3.1)
@@ -81,13 +85,21 @@ const ISELECT_EIE0: usize = 0xC0;
 /// 32-bit-per-word eip/eie array into a single word, so selects 0xC1+
 /// are outside the modeled file window and are not touched here).
 ///
+/// The whole `hstatus` and `vsiselect` are saved before the window is
+/// redirected: only the VGEIN field of the temporary value differs from
+/// the saved `hstatus`, so every other hypervisor bit survives. Both CSRs
+/// are restored on the way out, `hstatus` first, so no `vsireg`/`vstopei`
+/// access runs through the wrong window.
+///
 /// Returns the number of identities claimed from the file.
 fn scrub_guest_file(vgein: usize) -> usize {
     let mut claimed = 0usize;
     unsafe {
         let mut hstatus: usize;
         core::arch::asm!("csrr {}, hstatus", out(reg) hstatus);
-        let saved = hstatus & HSTATUS_VGEIN_MASK;
+        let saved_hstatus = hstatus;
+        let mut saved_vsiselect: usize;
+        core::arch::asm!("csrr {}, vsiselect", out(reg) saved_vsiselect);
         hstatus = (hstatus & !HSTATUS_VGEIN_MASK) | (vgein << HSTATUS_VGEIN_SHIFT);
         core::arch::asm!("csrw hstatus, {}", in(reg) hstatus);
 
@@ -109,7 +121,8 @@ fn scrub_guest_file(vgein: usize) -> usize {
         core::arch::asm!("csrw vsiselect, {}", in(reg) ISELECT_EIDELIVERY);
         core::arch::asm!("csrw vsireg, {}", in(reg) 0usize);
 
-        core::arch::asm!("csrw hstatus, {}", in(reg) saved);
+        core::arch::asm!("csrw hstatus, {}", in(reg) saved_hstatus);
+        core::arch::asm!("csrw vsiselect, {}", in(reg) saved_vsiselect);
     }
     claimed
 }
@@ -665,6 +678,14 @@ impl TvmManager {
             Some(t) if t.id == tvm_id => t,
             _ => return SbiRet::invalid_param(),
         };
+        // Table 37 names no TVM-state error for bind. Project mapping: a
+        // binding is what makes a vCPU eligible to run, so it requires a
+        // finalized TVM. Binding an Initializing TVM would store a VGEIN that
+        // sbi_covh_finalize_tvm() then overwrites, leaving a recorded binding
+        // without a usable guest interrupt file.
+        if tvm.state != TvmState::Runnable {
+            return SbiRet::invalid_param();
+        }
         if !tvm.aia.enabled {
             return SbiRet::invalid_param();
         }
@@ -753,6 +774,7 @@ impl TvmManager {
             file_paddr,
             gpa,
             vgein,
+            hart_id: hart,
         });
         SbiRet::success(0)
     }
@@ -769,8 +791,14 @@ impl TvmManager {
             _ => return SbiRet::invalid_param(),
         };
         if !tvm.aia.enabled {
-            return SbiRet::not_supported();
+            // Table 40 names no "AIA not initialized" error; an unarmed AIA
+            // configuration is an invalid TVM state, so invalid_param is the
+            // project mapping (FID 1 and FID 4 reject the same state with it).
+            return SbiRet::invalid_param();
         }
+        // TODO(multi-hart): a vCPU is detached from the manager while it runs
+        // on another hart, so an inject in that window is refused by the
+        // lookup below instead of reaching the bound file as §11.8 asks.
         let vcpu = match tvm.vcpu.as_mut() {
             Some(v) if v.id == vcpu_id => v,
             _ => return SbiRet::invalid_param(),
@@ -844,12 +872,18 @@ impl TvmManager {
             return SbiRet::invalid_param();
         }
 
-        let hgatp = tvm.page_table.make_hgatp(tvm.vmid);
-
-        let vcpu = match tvm.vcpu.as_mut() {
+        let vcpu = match tvm.vcpu.as_ref() {
             Some(v) => v,
             None => return SbiRet::failed(),
         };
+
+        // A vCPU carrying a binding cannot occur now that bind requires a
+        // Runnable TVM, but finalize must never be the step that clears one.
+        // Table 19 names no code for this state; invalid_param is the project
+        // mapping.
+        if vcpu.imsic_binding.is_some() {
+            return SbiRet::invalid_param();
+        }
 
         // §11.2: every vCPU of an AIA-enabled TVM must have its vIMSIC
         // GPA configured before finalize.
@@ -857,19 +891,26 @@ impl TvmManager {
             return SbiRet::failed();
         }
 
+        // Validate the whole identity argument before any state changes
+        // (§10.8): zero means "no identity"; a nonzero address must be
+        // 64-byte aligned. Table 19 names SBI_ERR_INVALID_PARAM for
+        // "tvm_identity_addr was invalid", and the host-allocatable-range
+        // check is the TSM's own hardening reported under the same code. An
+        // invalid argument must leave the TVM exactly as it was.
+        if identity_addr != 0 && (identity_addr % 64 != 0 || !is_host_range(identity_addr, 64)) {
+            return SbiRet::invalid_param();
+        }
+
+        // No fallible step past this point: the transition to Runnable is
+        // atomic with respect to what the caller can observe.
+        let hgatp = tvm.page_table.make_hgatp(tvm.vmid);
+        let vcpu = tvm.vcpu.as_mut().expect("vCPU presence checked above");
         vcpu.init_boot(entry_sepc, entry_arg, hgatp);
 
         tvm.entry_sepc = entry_sepc;
         tvm.entry_arg = entry_arg;
 
         if identity_addr != 0 {
-            if identity_addr % 64 != 0 {
-                return SbiRet::invalid_address();
-            }
-            // The identity block must be host-allocatable memory.
-            if !is_host_range(identity_addr, 64) {
-                return SbiRet::invalid_address();
-            }
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     identity_addr as *const u8,
@@ -1216,6 +1257,28 @@ impl TvmManager {
             Some(t) if t.id == tvm_id => t,
             _ => return SbiRet::invalid_param(),
         };
+
+        // §10.10: destroy fails while the VMM still executes a virtual hart.
+        // A running vCPU is detached from the manager, so a Runnable TVM with
+        // no attached vCPU has one in flight on some hart. The arguments are
+        // valid but the operation cannot complete, so this is FAILED: Table
+        // 21 reserves INVALID_PARAM for an invalid tvm_guest_id.
+        if tvm.state == TvmState::Runnable && tvm.vcpu.is_none() {
+            return SbiRet::failed();
+        }
+
+        // A binding belongs to the hart the bind ran on (§11.5) and only that
+        // hart's VS indirect window can reach its interrupt file. The host
+        // may retry on the binding hart.
+        // TODO(multi-hart): tearing a binding down from another hart needs a
+        // per-hart work protocol; the local VS indirect window cannot scrub
+        // another hart's interrupt file.
+        if let Some(binding) = tvm.vcpu.as_ref().and_then(|v| v.imsic_binding) {
+            if binding.hart_id != crate::current_hart_id() {
+                return SbiRet::failed();
+            }
+        }
+
         if tvm.aia.enabled {
             // Implicit unbind: destroy has no unbind FIDs, so the bound file
             // is scrubbed (identity lines cleared, pending identities
@@ -1289,6 +1352,15 @@ pub fn run_tvm_vcpu(tvm_id: usize, vcpu_id: usize) -> SbiRet {
         // §7.4.2: running an unbound (AIA) vCPU is an error.
         if tvm.aia.enabled && tvm.vcpu.as_ref().and_then(|v| v.imsic_binding).is_none() {
             return SbiRet::invalid_param();
+        }
+        // §7.4.2: a vCPU is eligible to run only on the physical hart it is
+        // bound to; a run on a different hart must fail. Table 28 names no
+        // code for a wrong-hart run; the ids and state are valid, so FAILED is
+        // the project mapping.
+        if let Some(binding) = tvm.vcpu.as_ref().and_then(|v| v.imsic_binding) {
+            if binding.hart_id != crate::current_hart_id() {
+                return SbiRet::failed();
+            }
         }
         tvm.vcpu.take().expect("vcpu presence checked above")
     };

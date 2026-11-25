@@ -850,6 +850,22 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
     let (err, _) = sbi_covh_create_tvm_vcpu(tvm_id, 0, vcpu_state_paddr);
     assert_eq!(err, 0, "create_tvm_vcpu must succeed");
 
+    // N24: FID 7 before FID 0. The AIA configuration is not armed yet, so an
+    // unarmed TVM state must refuse the injection. Table 40 names no
+    // uninitialized-AIA error and does not list not_supported (-2); the same
+    // state is invalid_param for FID 1 and FID 4, so the project maps it to
+    // invalid_param. This case pins the result but cannot by itself isolate
+    // the AIA-enabled guard: with that guard deleted the TSM handler's
+    // default-deny rule (identity 1 has not been allowed by the guest) would
+    // answer invalid_param too.
+    let (err, _) = sbi_covi_inject_tvm_cpu(tvm_id, 0, 1);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "FID 7 before FID 0 must be SBI_ERR_INVALID_PARAM"
+    );
+    println!("[HOST] COVI-N24 OK: FID 7 before FID 0 rejected");
+
     // ── COVI negative paths: FID 0 parameter validation ──
     // Every negative call below must be refused by the TSM's COVI dispatch
     // input validation and must leave state the positive path depends on
@@ -1307,6 +1323,45 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
     stage_aia_params(&params);
     let (err, _) = sbi_covi_init_tvm_aia(tvm_id, aia_params_ptr as usize, aia_params_len);
     assert_eq!(err, 0, "restoring the valid AIA block must succeed");
+
+    // N23: FID 4 before finalize. A bind is what makes a vCPU eligible to
+    // run, so it requires a finalized TVM. Here the TVM is still
+    // Initializing while every other bind input is valid: the AIA
+    // configuration is armed, vCPU 0 carries its vIMSIC GPA, and the
+    // converted guest file is free. Without the TVM-state guard the call
+    // binds and returns 0; Table 37 names no state error, so invalid_param
+    // is the project mapping. Deleting that guard changes this result to 0.
+    let (err, _) = sbi_covi_bind_aia_imsic(tvm_id, 0, 0b10);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "FID 4 before finalize must be SBI_ERR_INVALID_PARAM"
+    );
+    println!("[HOST] COVI-N23 OK: FID 4 before finalize rejected");
+
+    // N25: finalize refuses an unusable identity address before it changes
+    // any state. 0x8040_0000 is 64-byte aligned but lies in TSM memory, and
+    // base_paddr + 8 lies in host memory but is not 64-byte aligned; Table 19
+    // names SBI_ERR_INVALID_PARAM for an invalid tvm_identity_addr, so both
+    // are invalid parameters. The case still discriminates: without the
+    // validation the first call would succeed and finalize the TVM, so the
+    // valid finalize below could not run. The host cannot observe whether a
+    // rejected call mutated the vCPU, because a successful finalize rewrites
+    // the same fields; what this case pins is that a refused finalize leaves
+    // the TVM usable.
+    let (err, _) = sbi_covh_finalize_tvm(tvm_id, 0x8000_0000, 0, 0x8040_0000);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "finalize with an identity in TSM memory must be SBI_ERR_INVALID_PARAM"
+    );
+    let (err, _) = sbi_covh_finalize_tvm(tvm_id, 0x8000_0000, 0, base_paddr + 8);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "finalize with a misaligned host identity must be SBI_ERR_INVALID_PARAM"
+    );
+    println!("[HOST] COVI-N25 OK: finalize with an unusable identity address rejected");
 
     // 10. Finalize TVM
     println!("[HOST] Finalizing TVM with entry PC 0x80000000...");
