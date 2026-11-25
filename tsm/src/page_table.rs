@@ -8,7 +8,7 @@ pub const PTE_D: u64 = 1 << 7;
 
 pub const PTE_LEAF_RWX: u64 = PTE_V | PTE_R | PTE_W | PTE_X | PTE_U | PTE_A | PTE_D; // 0xDF
 /// Device leaf (COVI vIMSIC): readable/writable, never executable.
-pub const PTE_LEAF_RW: u64 = PTE_V | PTE_R | PTE_W | PTE_U | PTE_A | PTE_D; // 0x9D
+pub const PTE_LEAF_RW: u64 = PTE_V | PTE_R | PTE_W | PTE_U | PTE_A | PTE_D; // 0xD7
 
 pub const HGATP_MODE_BARE: usize = 0;
 pub const HGATP_MODE_SV39X4: usize = 8;
@@ -264,5 +264,220 @@ impl GStagePageTable {
 
     pub fn make_hgatp(&self, vmid: usize) -> usize {
         (HGATP_MODE_SV39X4 << 60) | ((vmid & 0x3FFF) << 44) | (self.root_paddr >> 12)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PAGE: usize = 4096;
+    /// Root table: 2048 entries of 8 bytes.
+    const ROOT_SIZE: usize = 16 * 1024;
+
+    /// Backing store for the root table plus the tables an allocator may
+    /// hand out.
+    #[repr(align(4096))]
+    struct PagePool([u8; PAGE * 17]);
+
+    impl PagePool {
+        fn new() -> Self {
+            Self([0; PAGE * 17])
+        }
+
+        fn base(&mut self) -> usize {
+            // The table code writes through this address, so the address must
+            // come from an exclusive borrow of the backing store.
+            self.0.as_mut_ptr() as usize
+        }
+    }
+
+    /// Deterministic table allocator: hands out pool pages after the root
+    /// table and returns `None` once `limit` pages are in use.
+    struct PoolAlloc {
+        first_paddr: usize,
+        handed_out: usize,
+        limit: usize,
+        calls: usize,
+    }
+
+    impl PoolAlloc {
+        fn new(base: usize, limit: usize) -> Self {
+            Self {
+                first_paddr: base + ROOT_SIZE,
+                handed_out: 0,
+                limit,
+                calls: 0,
+            }
+        }
+
+        fn alloc(&mut self) -> Option<usize> {
+            self.calls += 1;
+            if self.handed_out >= self.limit {
+                return None;
+            }
+            let paddr = self.first_paddr + self.handed_out * PAGE;
+            self.handed_out += 1;
+            Some(paddr)
+        }
+    }
+
+    /// Pool page left untouched by the table allocator.
+    fn spare_page(base: usize, index: usize) -> usize {
+        base + ROOT_SIZE + index * PAGE
+    }
+
+    #[test]
+    fn map_lookup_and_unmap_round_trip() {
+        let mut pool = PagePool::new();
+        let base = pool.base();
+        let table = GStagePageTable::new(base);
+        let mut alloc = PoolAlloc::new(base, 13);
+
+        let gpa0 = 0x4000_0000;
+        let gpa1 = gpa0 + PAGE;
+        let gpa2 = 0x8000_0000;
+        let spa0 = spare_page(base, 8);
+        let spa1 = spare_page(base, 9);
+        let spa2 = spare_page(base, 10);
+
+        assert_eq!(table.map_4k(gpa0, spa0, &mut || alloc.alloc()), Ok(()));
+        assert_eq!(alloc.calls, 2);
+        assert_eq!(table.map_4k(gpa1, spa1, &mut || alloc.alloc()), Ok(()));
+        assert_eq!(alloc.calls, 2);
+        assert_eq!(table.map_4k(gpa2, spa2, &mut || alloc.alloc()), Ok(()));
+        assert_eq!(alloc.calls, 4);
+
+        assert_eq!(table.lookup_4k(gpa0), Ok(spa0));
+        assert_eq!(table.lookup_4k(gpa1), Ok(spa1));
+        assert_eq!(table.lookup_4k(gpa2), Ok(spa2));
+
+        assert_eq!(table.unmap_4k(gpa1), Ok(spa1));
+        assert_eq!(table.lookup_4k(gpa1), Err(()));
+        assert_eq!(table.lookup_4k(gpa0), Ok(spa0));
+        assert_eq!(table.lookup_4k(gpa2), Ok(spa2));
+    }
+
+    #[test]
+    fn leaf_bits_match_the_mapping_kind() {
+        let mut pool = PagePool::new();
+        let base = pool.base();
+        let table = GStagePageTable::new(base);
+        let mut alloc = PoolAlloc::new(base, 13);
+        let spa = spare_page(base, 8);
+
+        let gpa = 0x4000_0000;
+        assert_eq!(table.map_4k(gpa, spa, &mut || alloc.alloc()), Ok(()));
+        let raw = table.raw_lookup_4k(gpa).unwrap();
+        assert_eq!(raw & 0xFF, PTE_LEAF_RWX);
+        assert_eq!(raw >> 10, (spa >> 12) as u64);
+
+        let io_gpa = 0x4000_1000;
+        assert_eq!(table.map_4k_io(io_gpa, spa, &mut || alloc.alloc()), Ok(()));
+        let raw = table.raw_lookup_4k(io_gpa).unwrap();
+        assert_eq!(raw & 0xFF, PTE_LEAF_RW);
+        assert_eq!(raw & PTE_X, 0);
+        assert_eq!(raw >> 10, (spa >> 12) as u64);
+    }
+
+    #[test]
+    fn bad_addresses_are_refused_before_allocating() {
+        let mut pool = PagePool::new();
+        let base = pool.base();
+        let table = GStagePageTable::new(base);
+        let mut alloc = PoolAlloc::new(base, 13);
+        let spa = spare_page(base, 8);
+
+        assert_eq!(
+            table.map_4k(0x4000_0010, spa, &mut || alloc.alloc()),
+            Err(())
+        );
+        assert_eq!(
+            table.map_4k(0x4000_0000, spa + 0x10, &mut || alloc.alloc()),
+            Err(())
+        );
+        assert_eq!(table.map_4k(1 << 41, spa, &mut || alloc.alloc()), Err(()));
+        assert_eq!(alloc.calls, 0);
+
+        assert_eq!(
+            table.map_4k((1 << 41) - PAGE, spa, &mut || alloc.alloc()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn duplicate_leaf_is_refused() {
+        let mut pool = PagePool::new();
+        let base = pool.base();
+        let table = GStagePageTable::new(base);
+        let mut alloc = PoolAlloc::new(base, 13);
+        let gpa = 0x4000_0000;
+        let spa0 = spare_page(base, 8);
+        let spa1 = spare_page(base, 9);
+
+        assert_eq!(table.map_4k(gpa, spa0, &mut || alloc.alloc()), Ok(()));
+        assert_eq!(table.map_4k(gpa, spa1, &mut || alloc.alloc()), Err(()));
+        assert_eq!(table.lookup_4k(gpa), Ok(spa0));
+    }
+
+    #[test]
+    fn allocator_exhaustion_fails_the_mapping() {
+        let mut pool = PagePool::new();
+        let base = pool.base();
+        let table = GStagePageTable::new(base);
+        let mut alloc = PoolAlloc::new(base, 0);
+        let gpa = 0x4000_0000;
+        let spa = spare_page(base, 8);
+
+        assert_eq!(table.map_4k(gpa, spa, &mut || alloc.alloc()), Err(()));
+        assert_eq!(alloc.calls, 1);
+        assert_eq!(table.lookup_4k(gpa), Err(()));
+    }
+
+    #[test]
+    fn invalidate_validate_and_remove_retain_the_spa() {
+        let mut pool = PagePool::new();
+        let base = pool.base();
+        let table = GStagePageTable::new(base);
+        let mut alloc = PoolAlloc::new(base, 13);
+        let gpa = 0x4000_0000;
+        let spa = spare_page(base, 8);
+
+        assert_eq!(table.map_4k(gpa, spa, &mut || alloc.alloc()), Ok(()));
+
+        assert_eq!(table.invalidate_4k(gpa), Ok(()));
+        assert_eq!(table.lookup_4k(gpa), Err(()));
+        assert_eq!(table.invalidate_4k(gpa), Err(()));
+
+        assert_eq!(table.validate_4k(gpa), Ok(()));
+        assert_eq!(table.lookup_4k(gpa), Ok(spa));
+        assert_eq!(table.validate_4k(gpa), Err(()));
+
+        assert_eq!(table.invalidate_4k(gpa), Ok(()));
+        assert_eq!(table.remove_invalid_4k(gpa), Ok(spa));
+        assert_eq!(table.raw_lookup_4k(gpa), Ok(0));
+        assert_eq!(table.lookup_4k(gpa), Err(()));
+    }
+
+    #[test]
+    fn removal_without_a_mapping_fails() {
+        let mut pool = PagePool::new();
+        let base = pool.base();
+        let table = GStagePageTable::new(base);
+
+        assert_eq!(table.remove_invalid_4k(0x4000_0000), Err(()));
+        assert_eq!(table.unmap_4k(0x4000_0000), Err(()));
+    }
+
+    #[test]
+    fn hgatp_encodes_mode_vmid_and_root() {
+        let mut pool = PagePool::new();
+        let base = pool.base();
+        let table = GStagePageTable::new(base);
+
+        assert_eq!(
+            table.make_hgatp(5),
+            (8 << 60) | (5 << 44) | (base >> 12)
+        );
     }
 }

@@ -1,13 +1,12 @@
-pub mod aia;
-pub mod page_table;
 pub mod vcpu;
 
-use crate::SbiRet;
-use crate::mm::{imsic_geometry, is_host_range, PAGE_SIZE, PageState, page_tracker};
-use page_table::GStagePageTable;
 use riscv_cove::host::TvmCreateParams;
 use riscv_cove::interrupt::TvmAiaParams;
 use spin::{Mutex, MutexGuard};
+use tsm::aia;
+use tsm::mm::{PAGE_SIZE, PageState, imsic_geometry, is_host_range, page_tracker};
+use tsm::page_table::{self, GStagePageTable};
+use tsm::sbi::SbiRet;
 use vcpu::Vcpu;
 
 /// COVI AIA configuration of one TVM (CoVE v0.7 §11.1–§11.2).

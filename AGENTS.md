@@ -33,6 +33,7 @@ cargo xtask pack                 # 打包 cove-payload.bin
 cargo check -p tsm -p test-host -p test-guest --target riscv64gc-unknown-none-elf
 tests/e2e/run_e2e.sh             # 全链路回归（需要 ../rustsbi 与 ../NEMU 就位）
 cargo test -p rdsm-abi           # ABI 布局单测（宿主机）
+cargo test -p tsm                # TSM 页追踪 / G-stage 页表 / AIA 参数单测（宿主机）
 ```
 
 ## 提交规范

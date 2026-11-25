@@ -147,3 +147,189 @@ pub fn validate(params: &TvmAiaParams) -> Result<AiaLayout, AiaParamsError> {
         index_mask,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn params(
+        base: usize,
+        group_bits: u32,
+        group_shift: u32,
+        hart_bits: u32,
+        guest_bits: u32,
+        guests: u32,
+    ) -> TvmAiaParams {
+        TvmAiaParams {
+            imsic_base_addr: base,
+            group_index_bits: group_bits,
+            group_index_shift: group_shift,
+            hart_index_bits: hart_bits,
+            guest_index_bits: guest_bits,
+            guests_per_hart: guests,
+        }
+    }
+
+    #[test]
+    fn accepts_a_single_hart_without_guest_files() {
+        let layout = validate(&params(0x8003_0000, 0, 24, 1, 0, 0)).unwrap();
+        assert_eq!(
+            layout,
+            AiaLayout {
+                guest_mask: 0,
+                index_mask: 0x1000,
+            }
+        );
+    }
+
+    #[test]
+    fn accepts_hart_and_guest_index_fields() {
+        let layout = validate(&params(0x8000_0000, 0, 24, 3, 2, 0)).unwrap();
+        assert_eq!(
+            layout,
+            AiaLayout {
+                guest_mask: 0x3000,
+                index_mask: 0x1F000,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_misaligned_base() {
+        assert_eq!(
+            validate(&params(0x8003_0004, 0, 24, 1, 0, 0)),
+            Err(AiaParamsError::BaseAlignment)
+        );
+    }
+
+    #[test]
+    fn rejects_group_index_bits() {
+        assert_eq!(
+            validate(&params(0x8000_0000, 1, 24, 1, 0, 0)),
+            Err(AiaParamsError::GroupIndexBits)
+        );
+    }
+
+    #[test]
+    fn rejects_out_of_range_group_shift() {
+        assert_eq!(
+            validate(&params(0x8000_0000, 0, 23, 1, 0, 0)),
+            Err(AiaParamsError::GroupIndexShift)
+        );
+        assert_eq!(
+            validate(&params(0x8000_0000, 0, 64, 1, 0, 0)),
+            Err(AiaParamsError::GroupIndexShift)
+        );
+    }
+
+    #[test]
+    fn rejects_out_of_range_guest_index_bits() {
+        assert_eq!(
+            validate(&params(0x8000_0000, 0, 24, 1, 53, 0)),
+            Err(AiaParamsError::GuestIndexBits)
+        );
+        // 7 guests per hart need 3 guest index bits.
+        assert_eq!(
+            validate(&params(0x8000_0000, 0, 24, 1, 2, 7)),
+            Err(AiaParamsError::GuestIndexBits)
+        );
+    }
+
+    #[test]
+    fn rejects_guests_per_hart() {
+        // One guest per hart: 1 guest index bit meets the minimum.
+        assert_eq!(
+            validate(&params(0x8000_0000, 0, 24, 1, 1, 1)),
+            Err(AiaParamsError::GuestsPerHart)
+        );
+    }
+
+    #[test]
+    fn rejects_hart_field_past_the_address_end() {
+        // The guest field [12, 64) leaves no room for the hart field.
+        assert_eq!(
+            validate(&params(0, 0, 24, 1, 52, 0)),
+            Err(AiaParamsError::HartIndexBits)
+        );
+    }
+
+    #[test]
+    fn rejects_base_bits_inside_index_fields() {
+        // Bit 12 is inside the 2-bit guest field starting at bit 12.
+        assert_eq!(
+            validate(&params(0x8000_1000, 0, 24, 0, 2, 0)),
+            Err(AiaParamsError::BaseIndexBits)
+        );
+        // Bit 12 is inside the 1-bit hart field starting at bit 12.
+        assert_eq!(
+            validate(&params(0x8000_1000, 0, 24, 1, 0, 0)),
+            Err(AiaParamsError::BaseIndexBits)
+        );
+    }
+
+    #[test]
+    fn accepts_the_field_boundaries() {
+        assert_eq!(
+            validate(&params(0x8000_0000, 0, 24, 0, 0, 0)),
+            Ok(AiaLayout::EMPTY)
+        );
+        assert_eq!(
+            validate(&params(0x8000_0000, 0, 63, 0, 0, 0)),
+            Ok(AiaLayout::EMPTY)
+        );
+        let guest_mask = ((1usize << 52) - 1) << 12;
+        assert_eq!(
+            validate(&params(0, 0, 24, 0, 52, 0)),
+            Ok(AiaLayout {
+                guest_mask,
+                index_mask: guest_mask,
+            })
+        );
+    }
+
+    #[test]
+    fn guest_bits_min_table() {
+        assert_eq!(guest_bits_min(0), 0);
+        assert_eq!(guest_bits_min(1), 1);
+        assert_eq!(guest_bits_min(2), 2);
+        assert_eq!(guest_bits_min(3), 2);
+        assert_eq!(guest_bits_min(4), 3);
+        assert_eq!(guest_bits_min(7), 3);
+        assert_eq!(guest_bits_min(u32::MAX), 32);
+    }
+
+    #[test]
+    fn field_mask_table() {
+        assert_eq!(field_mask(12, 0), Some(0));
+        assert_eq!(field_mask(12, 52), Some(((1usize << 52) - 1) << 12));
+        assert_eq!(field_mask(0, 64), Some(usize::MAX));
+        assert_eq!(field_mask(12, 53), None);
+        assert_eq!(field_mask(64, 0), Some(0));
+        assert_eq!(field_mask(64, 1), None);
+        assert_eq!(field_mask(0, 65), None);
+    }
+
+    #[test]
+    fn contains_gpa_accepts_only_declared_index_bits() {
+        let layout = AiaLayout {
+            index_mask: 0x1F000,
+            guest_mask: 0x3000,
+        };
+        let base = 0x8000_0000;
+
+        assert!(layout.contains_gpa(base, base));
+        assert!(layout.contains_gpa(base, base + 0x4000));
+        assert!(layout.contains_gpa(base, base + 0x1C000));
+        assert!(!layout.contains_gpa(base, base + 0x1000));
+        assert!(!layout.contains_gpa(base, base + 0x5000));
+        assert!(!layout.contains_gpa(base, base + 0x20000));
+    }
+
+    #[test]
+    fn empty_layout_accepts_only_the_base() {
+        let base = 0x8000_0000;
+
+        assert!(AiaLayout::EMPTY.contains_gpa(base, base));
+        assert!(!AiaLayout::EMPTY.contains_gpa(base, base + 0x1000));
+    }
+}

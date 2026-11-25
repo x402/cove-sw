@@ -117,3 +117,25 @@ pub fn rdsm_set_sidn(target_sdid: usize, sidn: usize) -> (usize, usize) {
     }
     (err, val)
 }
+
+/// MPT backend that forwards to the RDSM firmware.
+pub struct RdsmMpt;
+
+impl crate::mm::MptBackend for RdsmMpt {
+    fn mpt_set(
+        &mut self,
+        target_sdid: usize,
+        paddr: usize,
+        len: usize,
+        perm: u8,
+    ) -> Result<(), ()> {
+        match rdsm_mpt_set(target_sdid, paddr, len, perm).0 {
+            0 => Ok(()),
+            _ => Err(()),
+        }
+    }
+
+    fn mfence_pa(&mut self, paddr: usize, sdid: usize) {
+        let _ = rdsm_mfence_pa(paddr, sdid);
+    }
+}

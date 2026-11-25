@@ -3,7 +3,6 @@
 
 extern crate alloc;
 
-pub mod mm;
 pub mod rdsm_shim;
 pub mod tvm;
 
@@ -15,6 +14,8 @@ use mm::page_tracker;
 use rdsm_shim::{
     NORMAL_RETURN, TSM_READY, rdsm_mfence_pa, rdsm_set_sidn, rdsm_teeret,
 };
+use tsm::mm;
+use tsm::sbi::SbiRet;
 use tvm::{run_tvm_vcpu, tvm_manager};
 
 pub const TSM_IMPL_CUSTOM: u32 = 0x54534D31; // "TSM1"
@@ -262,40 +263,21 @@ pub extern "C" fn tsm_main(hart_id: usize, _fdt_paddr: usize) -> ! {
     }
 }
 
-#[repr(C)]
-pub struct SbiRet {
-    pub error: usize,
-    pub value: usize,
-}
-
-impl SbiRet {
-    pub const fn success(value: usize) -> Self {
-        Self { error: 0, value }
-    }
-    pub const fn failed() -> Self {
-        Self {
-            error: (-1isize) as usize,
-            value: 0,
-        }
-    }
-    pub const fn not_supported() -> Self {
-        Self {
-            error: (-2isize) as usize,
-            value: 0,
-        }
-    }
-    pub const fn invalid_param() -> Self {
-        Self {
-            error: (-3isize) as usize,
-            value: 0,
-        }
-    }
-    pub const fn invalid_address() -> Self {
-        Self {
-            error: (-5isize) as usize,
-            value: 0,
-        }
-    }
+/// Runs one page-tracker operation against the booted platform layout and
+/// the RDSM MPT backend.
+///
+/// Fails closed when no layout is installed. `tsm_main` installs the layout
+/// before the first dispatch and parks the hart when
+/// `rdsm_get_platform_info` fails, so the `None` arm is unreachable after a
+/// successful boot.
+fn tracker_op(
+    op: impl FnOnce(&mut mm::PageTracker, &mm::PlatformLayout, &mut rdsm_shim::RdsmMpt) -> SbiRet,
+) -> SbiRet {
+    let Some(platform) = mm::platform() else {
+        return SbiRet::failed();
+    };
+    let mut backend = rdsm_shim::RdsmMpt;
+    op(&mut page_tracker(), platform, &mut backend)
 }
 
 #[unsafe(no_mangle)]
@@ -312,8 +294,12 @@ pub extern "C" fn tsm_dispatch(
     match eid {
         riscv_cove::host::EID_COVH => match fid {
             riscv_cove::host::GET_TSM_INFO => handle_get_tsm_info(a0, a1),
-            riscv_cove::host::CONVERT_PAGES => page_tracker().convert_pages(a0, a1),
-            riscv_cove::host::RECLAIM_PAGES => page_tracker().reclaim_pages(a0, a1),
+            riscv_cove::host::CONVERT_PAGES => {
+                tracker_op(|tracker, platform, mpt| tracker.convert_pages(platform, mpt, a0, a1))
+            }
+            riscv_cove::host::RECLAIM_PAGES => {
+                tracker_op(|tracker, _platform, mpt| tracker.reclaim_pages(mpt, a0, a1))
+            }
             riscv_cove::host::GLOBAL_FENCE => {
                 let _ = rdsm_mfence_pa(0, 0);
                 SbiRet::success(0)
@@ -351,8 +337,12 @@ pub extern "C" fn tsm_dispatch(
             _ => SbiRet::not_supported(),
         },
         riscv_cove::interrupt::EID_COVI => match fid {
-            riscv_cove::interrupt::CONVERT_AIA_IMSIC => page_tracker().convert_imsic_page(a0),
-            riscv_cove::interrupt::RECLAIM_TVM_AIA_IMSIC => page_tracker().reclaim_imsic_page(a0),
+            riscv_cove::interrupt::CONVERT_AIA_IMSIC => {
+                tracker_op(|tracker, platform, mpt| tracker.convert_imsic_page(platform, mpt, a0))
+            }
+            riscv_cove::interrupt::RECLAIM_TVM_AIA_IMSIC => {
+                tracker_op(|tracker, _platform, mpt| tracker.reclaim_imsic_page(mpt, a0))
+            }
             riscv_cove::interrupt::INIT_TVM_AIA => tvm_manager().init_tvm_aia(a0, a1, a2),
             riscv_cove::interrupt::SET_TVM_AIA_CPU_IMSIC_ADDR => {
                 tvm_manager().set_tvm_aia_cpu_imsic_addr(a0, a1, a2)

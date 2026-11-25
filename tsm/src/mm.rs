@@ -1,5 +1,5 @@
-use crate::SbiRet;
-use crate::rdsm_shim::{rdsm_mfence_pa, rdsm_mpt_set};
+use crate::sbi::SbiRet;
+use rdsm_abi::{RdsmImsicGeometry, RdsmPlatformInfo};
 use spin::{Mutex, MutexGuard, Once};
 
 pub const PAGE_SIZE: usize = 4096;
@@ -12,67 +12,111 @@ pub const MAX_PAGES: usize = 512;
 // these regions; everything else (firmware gap, TSM image, MPT page
 // pool) is reserved and must be rejected.
 
-static HOST_REGIONS: Once<[(usize, usize); 2]> = Once::new();
-
-/// IMSIC supervisor/guest interrupt-file MMIO whitelist `(start, end)`,
-/// derived from the RDSM-provided platform geometry. Zero-sized when the
-/// platform has no supervisor IMSIC.
-static IMSIC_REGION: Once<(usize, usize)> = Once::new();
-
-/// Full supervisor/guest interrupt-file geometry (SmmTT v0.49 section
-/// 6.1): bind-time address calculus derives the per-(domain, hart, guest)
-/// file pages from it. Zeroed when the platform has no supervisor IMSIC.
-static IMSIC_GEOMETRY: Once<crate::rdsm_shim::RdsmImsicGeometry> = Once::new();
-
-/// Returns the supervisor/guest interrupt-file geometry, or `None` on an
-/// IMSIC-less platform (fail closed).
-pub fn imsic_geometry() -> Option<crate::rdsm_shim::RdsmImsicGeometry> {
-    IMSIC_GEOMETRY.get().filter(|g| g.usable()).copied()
+/// Memory map the TSM validates host-supplied addresses against. Fixed at
+/// boot from the platform layout RDSM reports.
+#[derive(Clone, Copy, Debug)]
+pub struct PlatformLayout {
+    host_regions: [(usize, usize); 2],
+    imsic: RdsmImsicGeometry,
 }
 
-/// Populate the whitelists from the RDSM-provided platform layout.
-pub fn init_host_regions(info: &crate::rdsm_shim::RdsmPlatformInfo) {
-    HOST_REGIONS.call_once(|| {
-        [
-            (info.tsm_region_end, info.mpt_pool_start),
-            (info.mpt_pool_end, info.ram_end),
-        ]
-    });
-    IMSIC_REGION.call_once(|| (info.imsic.range_start, info.imsic.range_end));
-    IMSIC_GEOMETRY.call_once(|| info.imsic);
+impl PlatformLayout {
+    /// Derives the layout from the RDSM-reported platform info: the two
+    /// host-allocatable regions are `[tsm_region_end, mpt_pool_start)` and
+    /// `[mpt_pool_end, ram_end)`; everything else is reserved.
+    pub fn new(info: &RdsmPlatformInfo) -> Self {
+        Self {
+            host_regions: [
+                (info.tsm_region_end, info.mpt_pool_start),
+                (info.mpt_pool_end, info.ram_end),
+            ],
+            imsic: info.imsic,
+        }
+    }
+
+    /// Builds a layout from an explicit region pair and IMSIC geometry.
+    pub fn from_parts(host_regions: [(usize, usize); 2], imsic: RdsmImsicGeometry) -> Self {
+        Self {
+            host_regions,
+            imsic,
+        }
+    }
+
+    /// Fail-closed check: is `[paddr, paddr+len)` entirely host-allocatable?
+    /// Containment only; page alignment is the caller's concern (each COVH
+    /// entry validates its own alignment requirements).
+    pub fn is_host_range(&self, paddr: usize, len: usize) -> bool {
+        if len == 0 {
+            return false;
+        }
+        let end = match paddr.checked_add(len) {
+            Some(e) => e,
+            None => return false,
+        };
+        self.host_regions
+            .iter()
+            .any(|&(start, stop)| paddr >= start && end <= stop)
+    }
+
+    /// Fail-closed check: is `[paddr, paddr+len)` entirely inside the IMSIC
+    /// interrupt-file MMIO region? Always false on IMSIC-less platforms.
+    pub fn is_imsic_range(&self, paddr: usize, len: usize) -> bool {
+        if len == 0 {
+            return false;
+        }
+        let end = match paddr.checked_add(len) {
+            Some(e) => e,
+            None => return false,
+        };
+        let (start, stop) = (self.imsic.range_start, self.imsic.range_end);
+        stop > start && paddr >= start && end <= stop
+    }
+
+    /// Returns the supervisor/guest interrupt-file geometry, or `None` on an
+    /// IMSIC-less platform (fail closed).
+    pub fn imsic_geometry(&self) -> Option<RdsmImsicGeometry> {
+        Some(self.imsic).filter(|g| g.usable())
+    }
+}
+
+/// Layout installed at boot, before the first dispatch.
+static PLATFORM: Once<PlatformLayout> = Once::new();
+
+/// Populates the whitelists from the RDSM-provided platform layout.
+pub fn init_host_regions(info: &RdsmPlatformInfo) {
+    PLATFORM.call_once(|| PlatformLayout::new(info));
+}
+
+/// The layout installed at boot, or `None` before boot initialisation.
+pub fn platform() -> Option<&'static PlatformLayout> {
+    PLATFORM.get()
 }
 
 /// Fail-closed check: is `[paddr, paddr+len)` entirely host-allocatable?
-/// Containment only; page alignment is the caller's concern (each COVH
-/// entry validates its own alignment requirements).
+/// Always false before a layout is installed.
 pub fn is_host_range(paddr: usize, len: usize) -> bool {
-    if len == 0 {
-        return false;
-    }
-    let end = match paddr.checked_add(len) {
-        Some(e) => e,
-        None => return false,
-    };
-    HOST_REGIONS.get().map_or(false, |regions| {
-        regions
-            .iter()
-            .any(|&(start, stop)| paddr >= start && end <= stop)
-    })
+    platform().map_or(false, |layout| layout.is_host_range(paddr, len))
 }
 
 /// Fail-closed check: is `[paddr, paddr+len)` entirely inside the IMSIC
 /// interrupt-file MMIO region? Always false on IMSIC-less platforms.
 pub fn is_imsic_range(paddr: usize, len: usize) -> bool {
-    if len == 0 {
-        return false;
-    }
-    let end = match paddr.checked_add(len) {
-        Some(e) => e,
-        None => return false,
-    };
-    IMSIC_REGION
-        .get()
-        .map_or(false, |&(start, stop)| stop > start && paddr >= start && end <= stop)
+    platform().map_or(false, |layout| layout.is_imsic_range(paddr, len))
+}
+
+/// Returns the supervisor/guest interrupt-file geometry, or `None` on an
+/// IMSIC-less platform (fail closed).
+pub fn imsic_geometry() -> Option<RdsmImsicGeometry> {
+    platform().and_then(|layout| layout.imsic_geometry())
+}
+
+/// MPT operations the page tracker needs from the RDSM firmware. The
+/// backend is passed per call so the tracker's MPT call sequence can be
+/// recorded on the host.
+pub trait MptBackend {
+    /// `RDSM_MPT_SET`; `Err` when the firmware returned a nonzero error.
+    fn mpt_set(&mut self, target_sdid: usize, paddr: usize, len: usize, perm: u8) -> Result<(), ()>;
+    fn mfence_pa(&mut self, paddr: usize, sdid: usize);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,7 +153,13 @@ impl PageTracker {
         }
     }
 
-    pub fn convert_pages(&mut self, base_paddr: usize, num_pages: usize) -> SbiRet {
+    pub fn convert_pages(
+        &mut self,
+        platform: &PlatformLayout,
+        mpt: &mut impl MptBackend,
+        base_paddr: usize,
+        num_pages: usize,
+    ) -> SbiRet {
         if base_paddr % PAGE_SIZE != 0 || num_pages == 0 {
             return SbiRet::invalid_param();
         }
@@ -121,7 +171,7 @@ impl PageTracker {
 
         // Only host-allocatable memory may be converted:
         // firmware, TSM image and MPT page pool must stay out of reach.
-        if !is_host_range(base_paddr, len) {
+        if !platform.is_host_range(base_paddr, len) {
             return SbiRet::invalid_param();
         }
 
@@ -145,15 +195,13 @@ impl PageTracker {
             return SbiRet::failed();
         }
 
-        // 1. Strip Host (SDID=0) access in MPT
-        let (err0, _) = rdsm_mpt_set(0, base_paddr, len, 0); // NONE
-        if err0 != 0 {
+        // 1. Strip Host (SDID=0) access in MPT (NONE).
+        if mpt.mpt_set(0, base_paddr, len, 0).is_err() {
             return SbiRet::failed();
         }
 
-        // 2. Grant Confidential (SDID=1) access in MPT
-        let (err1, _) = rdsm_mpt_set(1, base_paddr, len, 7); // RWX
-        if err1 != 0 {
+        // 2. Grant Confidential (SDID=1) access in MPT (RWX).
+        if mpt.mpt_set(1, base_paddr, len, 7).is_err() {
             return SbiRet::failed();
         }
 
@@ -176,7 +224,12 @@ impl PageTracker {
         SbiRet::success(0)
     }
 
-    pub fn reclaim_pages(&mut self, base_paddr: usize, num_pages: usize) -> SbiRet {
+    pub fn reclaim_pages(
+        &mut self,
+        mpt: &mut impl MptBackend,
+        base_paddr: usize,
+        num_pages: usize,
+    ) -> SbiRet {
         if base_paddr % PAGE_SIZE != 0 || num_pages == 0 {
             return SbiRet::invalid_param();
         }
@@ -212,14 +265,13 @@ impl PageTracker {
             }
         }
 
-        // 1. Restore Host access (SDID=0)
-        let (err0, _) = rdsm_mpt_set(0, base_paddr, len, 7); // RWX
-        if err0 != 0 {
+        // 1. Restore Host access (SDID=0, RWX).
+        if mpt.mpt_set(0, base_paddr, len, 7).is_err() {
             return SbiRet::failed();
         }
 
         // 2. Fence
-        let _ = rdsm_mfence_pa(0, 0);
+        mpt.mfence_pa(0, 0);
 
         // 3. Remove entries
         for i in 0..num_pages {
@@ -247,15 +299,20 @@ impl PageTracker {
     /// `invalid_param`. Unlike RAM conversion there is no scrub step — the
     /// page is device MMIO and writes to it would inject spurious
     /// interrupts.
-    pub fn convert_imsic_page(&mut self, paddr: usize) -> SbiRet {
-        if paddr % PAGE_SIZE != 0 || !is_imsic_range(paddr, PAGE_SIZE) {
+    pub fn convert_imsic_page(
+        &mut self,
+        platform: &PlatformLayout,
+        mpt: &mut impl MptBackend,
+        paddr: usize,
+    ) -> SbiRet {
+        if paddr % PAGE_SIZE != 0 || !platform.is_imsic_range(paddr, PAGE_SIZE) {
             return SbiRet::invalid_address();
         }
         // Only guest interrupt files are COVI-convertible (CoVE §11.3):
         // decompose against the platform geometry and reject supervisor
         // files (guest index 0) and foreign domain/hart positions. On an
         // IMSIC-less platform the whitelist is empty above (fail closed).
-        if let Some(g) = imsic_geometry() {
+        if let Some(g) = platform.imsic_geometry() {
             let guests = 1usize << g.guest_index_bits;
             let harts = 1usize << g.hart_index_bits;
             let domains = (g.range_end - g.range_start) >> g.domain_index_shift;
@@ -275,15 +332,13 @@ impl PageTracker {
             }
         }
 
-        // 1. Strip Host (SDID=0) access in MPT.
-        let (err0, _) = rdsm_mpt_set(0, paddr, PAGE_SIZE, 0); // NONE
-        if err0 != 0 {
+        // 1. Strip Host (SDID=0) access in MPT (NONE).
+        if mpt.mpt_set(0, paddr, PAGE_SIZE, 0).is_err() {
             return SbiRet::failed();
         }
 
-        // 2. Grant Confidential (SDID=1) read-write access in MPT.
-        let (err1, _) = rdsm_mpt_set(1, paddr, PAGE_SIZE, 0b011); // RW
-        if err1 != 0 {
+        // 2. Grant Confidential (SDID=1) read-write access in MPT (RW).
+        if mpt.mpt_set(1, paddr, PAGE_SIZE, 0b011).is_err() {
             return SbiRet::failed();
         }
 
@@ -307,7 +362,7 @@ impl PageTracker {
     ///
     /// No scrub step (device MMIO); the MPT update restores host access and
     /// withdraws confidential access, followed by a global MPT fence.
-    pub fn reclaim_imsic_page(&mut self, paddr: usize) -> SbiRet {
+    pub fn reclaim_imsic_page(&mut self, mpt: &mut impl MptBackend, paddr: usize) -> SbiRet {
         if paddr % PAGE_SIZE != 0 {
             return SbiRet::invalid_address();
         }
@@ -325,20 +380,18 @@ impl PageTracker {
             return SbiRet::invalid_param();
         }
 
-        // 1. Restore Host (SDID=0) access.
-        let (err0, _) = rdsm_mpt_set(0, paddr, PAGE_SIZE, 0b111); // RWX
-        if err0 != 0 {
+        // 1. Restore Host (SDID=0) access (RWX).
+        if mpt.mpt_set(0, paddr, PAGE_SIZE, 0b111).is_err() {
             return SbiRet::failed();
         }
 
-        // 2. Withdraw Confidential (SDID=1) access.
-        let (err1, _) = rdsm_mpt_set(1, paddr, PAGE_SIZE, 0); // NONE
-        if err1 != 0 {
+        // 2. Withdraw Confidential (SDID=1) access (NONE).
+        if mpt.mpt_set(1, paddr, PAGE_SIZE, 0).is_err() {
             return SbiRet::failed();
         }
 
         // 3. Fence so the restored host access is visible.
-        let _ = rdsm_mfence_pa(0, 0);
+        mpt.mfence_pa(0, 0);
 
         // 4. Remove the tracker entry.
         for slot in self.entries.iter_mut() {
@@ -371,7 +424,7 @@ impl PageTracker {
                 }
                 slot.owner_tvm_id = Some(tvm_id);
                 slot.gpa = Some(gpa);
-                let _ = vcpu_id; // single-vCPU WP2: the owner tuple is TVM-scoped
+                let _ = vcpu_id; // The manager holds a single vCPU today, so the owner tuple is TVM-scoped.
                 return SbiRet::success(0);
             }
         }
@@ -543,4 +596,521 @@ static PAGE_TRACKER: Mutex<PageTracker> = Mutex::new(PageTracker::new());
 /// Locks and returns the shared page tracker.
 pub fn page_tracker() -> MutexGuard<'static, PageTracker> {
     PAGE_TRACKER.lock()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::vec::Vec;
+
+    /// IMSIC geometry of the simulated platform: two domains, two harts,
+    /// guest files enabled.
+    fn test_imsic_geometry() -> RdsmImsicGeometry {
+        RdsmImsicGeometry {
+            range_start: 0x3000_8000,
+            range_end: 0x3001_0000,
+            domain_index_shift: 14,
+            guest_index_bits: 1,
+            hart_index_bits: 1,
+        }
+    }
+
+    fn no_imsic() -> RdsmImsicGeometry {
+        RdsmImsicGeometry::default()
+    }
+
+    fn platform_with_ram(base: usize, pages: usize) -> PlatformLayout {
+        PlatformLayout::from_parts([(base, base + pages * PAGE_SIZE), (0, 0)], test_imsic_geometry())
+    }
+
+    /// MPT backend that records the tracker's calls. `fail_at` makes the
+    /// n-th `mpt_set` call (1-based) fail.
+    struct ScriptedBackend {
+        sets: Vec<(usize, usize, usize, u8)>,
+        fences: Vec<(usize, usize)>,
+        fail_at: Option<usize>,
+    }
+
+    impl ScriptedBackend {
+        fn new() -> Self {
+            Self {
+                sets: Vec::new(),
+                fences: Vec::new(),
+                fail_at: None,
+            }
+        }
+
+        fn failing_at(call: usize) -> Self {
+            Self {
+                fail_at: Some(call),
+                ..Self::new()
+            }
+        }
+    }
+
+    impl MptBackend for ScriptedBackend {
+        fn mpt_set(
+            &mut self,
+            target_sdid: usize,
+            paddr: usize,
+            len: usize,
+            perm: u8,
+        ) -> Result<(), ()> {
+            self.sets.push((target_sdid, paddr, len, perm));
+            if self.fail_at == Some(self.sets.len()) {
+                Err(())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn mfence_pa(&mut self, paddr: usize, sdid: usize) {
+            self.fences.push((paddr, sdid));
+        }
+    }
+
+    /// Page-aligned scratch RAM: the reclaim path scrubs through the raw
+    /// address, so those pages must be real memory.
+    #[repr(align(4096))]
+    struct Ram([u8; 4 * PAGE_SIZE]);
+
+    fn entry(tracker: &PageTracker, paddr: usize) -> PageEntry {
+        *tracker
+            .entries
+            .iter()
+            .flatten()
+            .find(|slot| slot.paddr == paddr)
+            .expect("page is tracked")
+    }
+
+    #[test]
+    fn convert_pages_grants_the_confidential_domain() {
+        let ram = Ram([0; 4 * PAGE_SIZE]);
+        let base = ram.0.as_ptr() as usize;
+        let platform = platform_with_ram(base, 4);
+        let mut tracker = PageTracker::new();
+        let mut mpt = ScriptedBackend::new();
+
+        assert_eq!(
+            tracker.convert_pages(&platform, &mut mpt, base, 3),
+            SbiRet::success(0)
+        );
+        assert_eq!(
+            mpt.sets,
+            std::vec![(0, base, 3 * PAGE_SIZE, 0), (1, base, 3 * PAGE_SIZE, 7)]
+        );
+        assert!(mpt.fences.is_empty());
+
+        let entries: Vec<PageEntry> = tracker.entries.iter().flatten().copied().collect();
+        assert_eq!(entries.len(), 3);
+        for (i, slot) in entries.iter().enumerate() {
+            assert_eq!(slot.paddr, base + i * PAGE_SIZE);
+            assert_eq!(slot.state, PageState::ConvertedClean);
+            assert_eq!(slot.owner_tvm_id, None);
+            assert_eq!(slot.gpa, None);
+        }
+        assert!(tracker.is_converted_and_free(base, 3));
+    }
+
+    #[test]
+    fn convert_pages_refuses_bad_arguments_before_touching_the_mpt() {
+        let ram = Ram([0; 4 * PAGE_SIZE]);
+        let base = ram.0.as_ptr() as usize;
+        let platform = platform_with_ram(base, 4);
+        let mut tracker = PageTracker::new();
+        let mut mpt = ScriptedBackend::new();
+
+        assert_eq!(
+            tracker.convert_pages(&platform, &mut mpt, base + 8, 1),
+            SbiRet::invalid_param()
+        );
+        assert_eq!(
+            tracker.convert_pages(&platform, &mut mpt, base, 0),
+            SbiRet::invalid_param()
+        );
+        assert_eq!(
+            tracker.convert_pages(&platform, &mut mpt, base, usize::MAX),
+            SbiRet::invalid_param()
+        );
+        assert_eq!(
+            tracker.convert_pages(&platform, &mut mpt, base + PAGE_SIZE, 4),
+            SbiRet::invalid_param()
+        );
+
+        assert!(mpt.sets.is_empty());
+        assert!(tracker.entries.iter().all(|slot| slot.is_none()));
+    }
+
+    #[test]
+    fn convert_pages_refuses_overlapping_ranges() {
+        let ram = Ram([0; 4 * PAGE_SIZE]);
+        let base = ram.0.as_ptr() as usize;
+        let platform = platform_with_ram(base, 4);
+        let mut tracker = PageTracker::new();
+        let mut mpt = ScriptedBackend::new();
+
+        assert_eq!(
+            tracker.convert_pages(&platform, &mut mpt, base, 1),
+            SbiRet::success(0)
+        );
+        assert_eq!(
+            tracker.convert_pages(&platform, &mut mpt, base, 1),
+            SbiRet::invalid_param()
+        );
+        assert_eq!(
+            tracker.convert_pages(&platform, &mut mpt, base, 2),
+            SbiRet::invalid_param()
+        );
+
+        // Ownership does not make a tracked page convertible again.
+        assert!(tracker.assign_page(base, PageState::AssignedPayload, 7));
+        assert_eq!(
+            tracker.convert_pages(&platform, &mut mpt, base, 1),
+            SbiRet::invalid_param()
+        );
+        assert_eq!(mpt.sets.len(), 2);
+    }
+
+    #[test]
+    fn convert_pages_stops_at_the_tracker_capacity() {
+        let base = 0x8000_0000;
+        let platform = platform_with_ram(base, 600);
+        let mut tracker = PageTracker::new();
+        let mut mpt = ScriptedBackend::new();
+
+        assert_eq!(
+            tracker.convert_pages(&platform, &mut mpt, base, MAX_PAGES),
+            SbiRet::success(0)
+        );
+        assert_eq!(
+            tracker.convert_pages(&platform, &mut mpt, base + MAX_PAGES * PAGE_SIZE, 1),
+            SbiRet::failed()
+        );
+        assert_eq!(mpt.sets.len(), 2);
+    }
+
+    #[test]
+    fn reclaim_pages_scrubs_and_returns_the_pages_to_the_host() {
+        let mut ram = Ram([0; 4 * PAGE_SIZE]);
+        let base = ram.0.as_ptr() as usize;
+        let platform = platform_with_ram(base, 4);
+        let mut tracker = PageTracker::new();
+        let mut mpt = ScriptedBackend::new();
+
+        ram.0.fill(0xAA);
+        assert_eq!(
+            tracker.convert_pages(&platform, &mut mpt, base, 2),
+            SbiRet::success(0)
+        );
+
+        assert_eq!(tracker.reclaim_pages(&mut mpt, base, 2), SbiRet::success(0));
+        assert!(ram.0[..2 * PAGE_SIZE].iter().all(|&b| b == 0));
+        assert_eq!(
+            mpt.sets,
+            std::vec![
+                (0, base, 2 * PAGE_SIZE, 0),
+                (1, base, 2 * PAGE_SIZE, 7),
+                (0, base, 2 * PAGE_SIZE, 7),
+            ]
+        );
+        assert_eq!(mpt.fences, std::vec![(0, 0)]);
+        assert!(tracker.entries.iter().all(|slot| slot.is_none()));
+    }
+
+    #[test]
+    fn reclaim_pages_refuses_owned_or_untracked_pages() {
+        let mut ram = Ram([0; 4 * PAGE_SIZE]);
+        let base = ram.0.as_ptr() as usize;
+        let platform = platform_with_ram(base, 4);
+        let mut tracker = PageTracker::new();
+        let mut mpt = ScriptedBackend::new();
+
+        ram.0.fill(0xAA);
+        assert_eq!(
+            tracker.convert_pages(&platform, &mut mpt, base, 2),
+            SbiRet::success(0)
+        );
+        assert!(tracker.assign_page(base, PageState::AssignedPayload, 7));
+        let calls_before = mpt.sets.len();
+
+        assert_eq!(
+            tracker.reclaim_pages(&mut mpt, base, 2),
+            SbiRet::invalid_param()
+        );
+        assert_eq!(mpt.sets.len(), calls_before);
+        assert!(ram.0[..2 * PAGE_SIZE].iter().all(|&b| b == 0xAA));
+
+        assert_eq!(
+            tracker.reclaim_pages(&mut mpt, base + 2 * PAGE_SIZE, 1),
+            SbiRet::invalid_param()
+        );
+        assert_eq!(mpt.sets.len(), calls_before);
+    }
+
+    #[test]
+    fn reclaim_pages_keeps_the_entries_when_the_host_restore_fails() {
+        let mut ram = Ram([0; 4 * PAGE_SIZE]);
+        let base = ram.0.as_ptr() as usize;
+        let platform = platform_with_ram(base, 4);
+        let mut tracker = PageTracker::new();
+        let mut mpt = ScriptedBackend::failing_at(3);
+
+        ram.0.fill(0xAA);
+        assert_eq!(
+            tracker.convert_pages(&platform, &mut mpt, base, 2),
+            SbiRet::success(0)
+        );
+
+        assert_eq!(tracker.reclaim_pages(&mut mpt, base, 2), SbiRet::failed());
+        assert!(mpt.fences.is_empty());
+        assert!(tracker.is_converted_and_free(base, 2));
+    }
+
+    #[test]
+    fn convert_imsic_page_takes_a_guest_file() {
+        let platform = PlatformLayout::from_parts([(0, 0), (0, 0)], test_imsic_geometry());
+        let mut tracker = PageTracker::new();
+        let mut mpt = ScriptedBackend::new();
+        let paddr = 0x3000_D000;
+
+        assert_eq!(
+            tracker.convert_imsic_page(&platform, &mut mpt, paddr),
+            SbiRet::success(0)
+        );
+        assert_eq!(
+            mpt.sets,
+            std::vec![(0, paddr, PAGE_SIZE, 0), (1, paddr, PAGE_SIZE, 3)]
+        );
+        assert!(tracker.is_free_imsic_page(paddr));
+        assert_eq!(entry(&tracker, paddr).state, PageState::ImsicFile);
+    }
+
+    #[test]
+    fn convert_imsic_page_refuses_bad_addresses_and_platforms() {
+        let platform = PlatformLayout::from_parts([(0, 0), (0, 0)], test_imsic_geometry());
+        let mut tracker = PageTracker::new();
+        let mut mpt = ScriptedBackend::new();
+
+        assert_eq!(
+            tracker.convert_imsic_page(&platform, &mut mpt, 0x3000_D004),
+            SbiRet::invalid_address()
+        );
+        assert_eq!(
+            tracker.convert_imsic_page(&platform, &mut mpt, 0x3000_7000),
+            SbiRet::invalid_address()
+        );
+        assert_eq!(
+            tracker.convert_imsic_page(&platform, &mut mpt, 0x3000_C000),
+            SbiRet::invalid_address()
+        );
+
+        let imsic_less = PlatformLayout::from_parts([(0, 0), (0, 0)], no_imsic());
+        assert_eq!(
+            tracker.convert_imsic_page(&imsic_less, &mut mpt, 0x3000_D000),
+            SbiRet::invalid_address()
+        );
+        assert!(mpt.sets.is_empty());
+
+        assert_eq!(
+            tracker.convert_imsic_page(&platform, &mut mpt, 0x3000_D000),
+            SbiRet::success(0)
+        );
+        assert_eq!(
+            tracker.convert_imsic_page(&platform, &mut mpt, 0x3000_D000),
+            SbiRet::invalid_param()
+        );
+    }
+
+    #[test]
+    fn reclaim_imsic_page_restores_host_access() {
+        let platform = PlatformLayout::from_parts([(0, 0), (0, 0)], test_imsic_geometry());
+        let mut tracker = PageTracker::new();
+        let mut mpt = ScriptedBackend::new();
+        let paddr = 0x3000_F000;
+
+        assert_eq!(
+            tracker.convert_imsic_page(&platform, &mut mpt, paddr),
+            SbiRet::success(0)
+        );
+        assert_eq!(
+            tracker.reclaim_imsic_page(&mut mpt, paddr),
+            SbiRet::success(0)
+        );
+        assert_eq!(
+            mpt.sets,
+            std::vec![
+                (0, paddr, PAGE_SIZE, 0),
+                (1, paddr, PAGE_SIZE, 3),
+                (0, paddr, PAGE_SIZE, 7),
+                (1, paddr, PAGE_SIZE, 0),
+            ]
+        );
+        assert_eq!(mpt.fences, std::vec![(0, 0)]);
+        assert!(tracker.entries.iter().all(|slot| slot.is_none()));
+
+        assert_eq!(
+            tracker.reclaim_imsic_page(&mut mpt, paddr + 4),
+            SbiRet::invalid_address()
+        );
+        assert_eq!(
+            tracker.reclaim_imsic_page(&mut mpt, paddr),
+            SbiRet::invalid_param()
+        );
+
+        assert_eq!(
+            tracker.convert_imsic_page(&platform, &mut mpt, paddr),
+            SbiRet::success(0)
+        );
+        assert_eq!(
+            tracker.bind_imsic_page(paddr, 7, 0, 0x1000),
+            SbiRet::success(0)
+        );
+        assert_eq!(
+            tracker.reclaim_imsic_page(&mut mpt, paddr),
+            SbiRet::invalid_param()
+        );
+        assert!(tracker.release_imsic_file(paddr, 7));
+        assert_eq!(
+            tracker.reclaim_imsic_page(&mut mpt, paddr),
+            SbiRet::success(0)
+        );
+    }
+
+    #[test]
+    fn interrupt_file_binding_is_tvm_scoped() {
+        let platform = PlatformLayout::from_parts([(0, 0), (0, 0)], test_imsic_geometry());
+        let mut tracker = PageTracker::new();
+        let mut mpt = ScriptedBackend::new();
+        let paddr = 0x3000_D000;
+        let gpa = 0x8000_0000;
+
+        assert_eq!(
+            tracker.convert_imsic_page(&platform, &mut mpt, paddr),
+            SbiRet::success(0)
+        );
+        assert_eq!(
+            tracker.bind_imsic_page(paddr, 7, 0, gpa),
+            SbiRet::success(0)
+        );
+        assert_eq!(
+            tracker.bind_imsic_page(paddr, 8, 0, gpa),
+            SbiRet::invalid_param()
+        );
+        assert!(!tracker.is_free_imsic_page(paddr));
+
+        let bound = entry(&tracker, paddr);
+        assert_eq!(bound.state, PageState::ImsicFile);
+        assert_eq!(bound.owner_tvm_id, Some(7));
+        assert_eq!(bound.gpa, Some(gpa));
+
+        assert!(!tracker.release_imsic_file(paddr, 8));
+        assert_eq!(entry(&tracker, paddr).owner_tvm_id, Some(7));
+        assert_eq!(entry(&tracker, paddr).gpa, Some(gpa));
+
+        tracker.release_tvm_pages(7);
+        let released = entry(&tracker, paddr);
+        assert_eq!(released.state, PageState::ImsicFile);
+        assert_eq!(released.owner_tvm_id, None);
+        assert_eq!(released.gpa, None);
+    }
+
+    #[test]
+    fn assignment_helpers_track_ownership() {
+        let ram = Ram([0; 4 * PAGE_SIZE]);
+        let base = ram.0.as_ptr() as usize;
+        let platform = platform_with_ram(base, 4);
+        let mut tracker = PageTracker::new();
+        let mut mpt = ScriptedBackend::new();
+
+        assert_eq!(tracker.find_free_page(), None);
+        assert_eq!(
+            tracker.convert_pages(&platform, &mut mpt, base, 3),
+            SbiRet::success(0)
+        );
+        assert_eq!(tracker.find_free_page(), Some(base));
+
+        assert!(tracker.assign_page(base, PageState::AssignedPayload, 7));
+        assert!(!tracker.assign_page(base, PageState::AssignedPayload, 7));
+        assert!(tracker.assign_range(base + PAGE_SIZE, 2, PageState::AssignedPageTable, 7));
+        assert!(!tracker.assign_range(base + PAGE_SIZE, 2, PageState::AssignedPageTable, 7));
+        assert!(!tracker.assign_range(base + 2 * PAGE_SIZE, 2, PageState::AssignedPageTable, 7));
+
+        tracker.release_page(base, 7);
+        let freed = entry(&tracker, base);
+        assert_eq!(freed.state, PageState::ConvertedClean);
+        assert_eq!(freed.owner_tvm_id, None);
+
+        assert!(tracker.assign_page(base, PageState::AssignedPayload, 8));
+        tracker.release_page(base + PAGE_SIZE, 7);
+        assert!(tracker.assign_page(base + PAGE_SIZE, PageState::AssignedPayload, 3));
+        tracker.release_tvm_pages(8);
+        assert_eq!(entry(&tracker, base).owner_tvm_id, None);
+        assert_eq!(entry(&tracker, base + PAGE_SIZE).owner_tvm_id, Some(3));
+    }
+
+    #[test]
+    fn shared_page_bookkeeping() {
+        let ram = Ram([0; 4 * PAGE_SIZE]);
+        let base = ram.0.as_ptr() as usize;
+        let platform = platform_with_ram(base, 4);
+        let mut tracker = PageTracker::new();
+        let mut mpt = ScriptedBackend::new();
+        let gpa = 0x8000_0000;
+
+        assert_eq!(
+            tracker.convert_pages(&platform, &mut mpt, base, 1),
+            SbiRet::success(0)
+        );
+        // Sharing requires an owner.
+        assert!(!tracker.set_shared(base, gpa, 7));
+
+        assert!(tracker.assign_page(base, PageState::AssignedPayload, 7));
+        assert!(tracker.set_shared(base, gpa, 7));
+        assert_eq!(tracker.find_shared_by_gpa(gpa, 7), Some(base));
+        assert_eq!(tracker.find_shared_by_gpa(gpa, 8), None);
+
+        assert!(tracker.clear_shared(base, 7));
+        let cleared = entry(&tracker, base);
+        assert_eq!(cleared.state, PageState::AssignedPayload);
+        assert_eq!(cleared.gpa, None);
+        assert!(!tracker.clear_shared(base, 7));
+    }
+
+    #[test]
+    fn platform_layout_derives_the_host_regions() {
+        let info = RdsmPlatformInfo {
+            ram_start: 0x8000_0000,
+            ram_end: 0x9000_0000,
+            tsm_region_start: 0x8040_0000,
+            tsm_region_end: 0x8060_0000,
+            mpt_pool_start: 0x8068_0000,
+            mpt_pool_end: 0x8070_0000,
+            imsic: test_imsic_geometry(),
+        };
+        let layout = PlatformLayout::new(&info);
+
+        assert_eq!(
+            layout.host_regions,
+            [(0x8060_0000, 0x8068_0000), (0x8070_0000, 0x9000_0000)]
+        );
+
+        assert!(layout.is_host_range(0x8060_0000, 0x8_0000));
+        assert!(layout.is_host_range(0x8070_0000, PAGE_SIZE));
+        // Neither the MPT pool nor memory past RAM end is host memory.
+        assert!(!layout.is_host_range(0x8068_0000, PAGE_SIZE));
+        assert!(!layout.is_host_range(0x9000_0000, PAGE_SIZE));
+        // Empty and overflowing ranges are refused.
+        assert!(!layout.is_host_range(0x8060_0000, 0));
+        assert!(!layout.is_host_range(usize::MAX - PAGE_SIZE, 2 * PAGE_SIZE));
+        // A range straddling a region end is not contained.
+        assert!(!layout.is_host_range(0x8067_F000, 2 * PAGE_SIZE));
+
+        assert!(layout.is_imsic_range(0x3000_D000, PAGE_SIZE));
+        assert!(!layout.is_imsic_range(0x3000_7000, PAGE_SIZE));
+        assert!(layout.imsic_geometry().is_some());
+
+        let imsic_less = PlatformLayout::from_parts([(0, 0), (0, 0)], no_imsic());
+        assert!(!imsic_less.is_imsic_range(0x3000_D000, PAGE_SIZE));
+        assert!(imsic_less.imsic_geometry().is_none());
+    }
 }
