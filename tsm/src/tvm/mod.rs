@@ -1,3 +1,4 @@
+pub mod aia;
 pub mod page_table;
 pub mod vcpu;
 
@@ -13,17 +14,26 @@ use vcpu::Vcpu;
 #[derive(Clone, Copy)]
 pub struct TvmAiaState {
     pub enabled: bool,
-    /// Guest interrupt files per vCPU-hart (§11.1). WP2 implements a
-    /// single guest interrupt file per vCPU (GEILEN=1), i.e. 0 nested
-    /// guests; larger values are rejected at init.
-    pub guests_per_hart: usize,
+    /// Host-supplied parameter block; meaningful only while `enabled`, in
+    /// which case it has passed [`aia::validate`].
+    pub params: TvmAiaParams,
+    /// Index masks derived from `params`; meaningful only while `enabled`.
+    pub layout: aia::AiaLayout,
 }
 
 impl TvmAiaState {
     pub const fn new() -> Self {
         Self {
             enabled: false,
-            guests_per_hart: 0,
+            params: TvmAiaParams {
+                imsic_base_addr: 0,
+                group_index_bits: 0,
+                group_index_shift: 0,
+                hart_index_bits: 0,
+                guest_index_bits: 0,
+                guests_per_hart: 0,
+            },
+            layout: aia::AiaLayout::EMPTY,
         }
     }
 }
@@ -475,11 +485,11 @@ impl TvmManager {
 
     // ---- COVI handlers (CoVE v0.7 chapter 11) ----
 
-    /// FID 0 `init_tvm_aia`: validates the host-supplied parameter block
-    /// against the platform's supervisor/guest interrupt-file geometry and
-    /// arms the TVM's AIA configuration. Only while Initializing; nested
-    /// guests (`guests_per_hart > 0`) are rejected (§11.1 allows
-    /// implementations to refuse them).
+    /// FID 0 `init_tvm_aia`: validates the host-supplied block as the
+    /// TVM's virtual IMSIC layout (§11.1) and arms the TVM's AIA
+    /// configuration. Only while Initializing. Before finalize the call may
+    /// be repeated, but a new block must keep every recorded vIMSIC GPA
+    /// inside its virtual array.
     pub fn init_tvm_aia(&mut self, tvm_id: usize, params_paddr: usize, params_len: usize) -> SbiRet {
         let tvm = match self.active_tvm.as_mut() {
             Some(t) if t.id == tvm_id => t,
@@ -497,35 +507,50 @@ impl TvmManager {
             return SbiRet::invalid_address();
         }
 
-        let geometry = match imsic_geometry() {
-            Some(g) => g,
-            None => return SbiRet::not_supported(),
-        };
+        // AIA virtualization needs a platform IMSIC to supply physical
+        // guest interrupt files. The block itself describes the TVM's own
+        // virtual address space and is validated independently below.
+        if imsic_geometry().is_none() {
+            return SbiRet::not_supported();
+        }
         let params = unsafe { (*(params_paddr as *const TvmAiaParams)).clone() };
 
-        // The host describes the same platform array the RDSM discovered;
-        // anything else would point COVI at files the geometry cannot
-        // account for. Groups are unsupported (single-group platform).
-        if params.imsic_base_addr != geometry.range_start
-            || params.group_index_bits != 0
-            || params.group_index_shift != 0
-            || params.hart_index_bits as usize != geometry.hart_index_bits
-            || params.guest_index_bits as usize != geometry.guest_index_bits
-            || params.guests_per_hart != 0
-        {
+        // Table 33 names no code for malformed fields inside the block, so
+        // every violation is the project's invalid_param mapping.
+        let layout = match aia::validate(&params) {
+            Ok(layout) => layout,
+            Err(_) => return SbiRet::invalid_param(),
+        };
+        // TSM rule, not a CoVE requirement: the TVM's vIMSIC address must be
+        // representable in the Sv39x4 G-stage (the same aperture the page
+        // table enforces), so a base at or above 2^41 could never be bound.
+        if params.imsic_base_addr >= (1usize << 41) {
             return SbiRet::invalid_param();
+        }
+
+        // §11.1 only forbids calls after sbi_covh_finalize_tvm(), so a
+        // second call while Initializing is legal. It must not orphan a
+        // recorded vIMSIC GPA: the candidate array has to contain it. The
+        // manager holds a single vCPU slot today; with several vCPUs this
+        // becomes an iteration over all of them.
+        if let Some(gpa) = tvm.vcpu.as_ref().and_then(|v| v.imsic_gpa) {
+            if !layout.contains_gpa(params.imsic_base_addr, gpa) {
+                return SbiRet::invalid_param();
+            }
         }
 
         tvm.aia = TvmAiaState {
             enabled: true,
-            guests_per_hart: 0,
+            params,
+            layout,
         };
         SbiRet::success(0)
     }
 
     /// FID 1 `set_tvm_aia_cpu_imsic_addr`: records the vIMSIC GPA for one
-    /// vCPU. Only while Initializing; the GPA must be page-aligned, inside
-    /// one of the TVM's memory regions, and unique across vCPUs (§11.2).
+    /// vCPU. Only after FID 0 and while Initializing. The GPA must be a
+    /// valid per-vCPU base of the configured virtual array, a page inside a
+    /// registered memory region, and not owned by another vCPU (§11.2).
     pub fn set_tvm_aia_cpu_imsic_addr(
         &mut self,
         tvm_id: usize,
@@ -539,21 +564,50 @@ impl TvmManager {
         if tvm.state != TvmState::Initializing || !tvm.aia.enabled {
             return SbiRet::invalid_param();
         }
-        if gpa % PAGE_SIZE != 0 || gpa == 0 {
+        // Resolve the vCPU before validating the GPA, so an unknown id is
+        // reported as such rather than as an address error.
+        if !matches!(tvm.vcpu.as_ref(), Some(v) if v.id == vcpu_id) {
+            return SbiRet::invalid_param();
+        }
+
+        // GPA syntax: a page inside the Sv39x4 G-stage aperture. This bound
+        // makes the page end below 2^41, so the addition cannot overflow.
+        if gpa % PAGE_SIZE != 0 || gpa >= (1usize << 41) {
             return SbiRet::invalid_address();
         }
+        let end = gpa + PAGE_SIZE;
+        // §11.2: the GPA must be valid for the AIA configuration armed by
+        // FID 0, i.e. one (hart, guest) entry of its virtual array.
+        if !tvm
+            .aia
+            .layout
+            .contains_gpa(tvm.aia.params.imsic_base_addr, gpa)
+        {
+            return SbiRet::invalid_address();
+        }
+        // TSM rule, not a CoVE requirement: the whole page must already be
+        // backed by one registered TVM memory region before it can be
+        // presented to the guest as a device page.
         if !tvm
             .memory_regions
             .iter()
             .flatten()
-            .any(|region| gpa >= region.gpa_base && gpa < region.gpa_base + region.len)
+            .any(|region| gpa >= region.gpa_base && end <= region.gpa_base + region.len)
         {
             return SbiRet::invalid_address();
         }
-        if tvm.vcpu.as_ref().is_some_and(|v| v.imsic_gpa == Some(gpa)) {
-            // §11.2: no two vCPUs may share a vIMSIC GPA.
+        // §11.2: no two vCPUs may share the same vIMSIC GPA. Table 34 names
+        // no code for a duplicate GPA; invalid_param is the project mapping.
+        // The manager holds a single vCPU slot today; with several vCPUs this
+        // becomes an iteration over all of them.
+        if tvm
+            .vcpu
+            .as_ref()
+            .is_some_and(|v| v.id != vcpu_id && v.imsic_gpa == Some(gpa))
+        {
             return SbiRet::invalid_param();
         }
+
         let vcpu = match tvm.vcpu.as_mut() {
             Some(v) if v.id == vcpu_id => v,
             _ => return SbiRet::invalid_param(),
@@ -581,9 +635,9 @@ impl TvmManager {
         if domains == 0 {
             return None;
         }
-        // WP2 single-SIDN pairing: init registers sidn0 -> host, sidn1 ->
-        // conf; the confidential domain owns domain block 1. WP3 replaces
-        // the constant with the allocator's per-domain assignment.
+        // Single-SIDN pairing: init registers sidn0 -> host, sidn1 ->
+        // confidential; the confidential domain owns domain block 1. A
+        // per-domain allocator would replace the constant.
         const CONF_SIDN: usize = 1;
         if CONF_SIDN + 1 > domains {
             return None;
@@ -599,8 +653,9 @@ impl TvmManager {
     /// FID 4 `bind_aia_imsic`: binds an unbound vCPU, running on the
     /// calling hart, to the confidential domain's guest interrupt file for
     /// that hart (§11.5). `imsic_mask` follows the hgeie format: bit 0
-    /// always 0 and exactly `1 + guests_per_hart` bits set — with WP2's
-    /// `guests_per_hart == 0` the only legal mask is bit 1 (G0, VGEIN 1).
+    /// always 0 and exactly `1 + guests_per_hart` bits set — with the single
+    /// guest interrupt file per vCPU this implementation supports
+    /// (`guests_per_hart == 0`) the only legal mask is bit 1 (G0, VGEIN 1).
     pub fn bind_aia_imsic(&mut self, tvm_id: usize, vcpu_id: usize, imsic_mask: usize) -> SbiRet {
         let geometry = match imsic_geometry() {
             Some(g) => g,
@@ -665,8 +720,8 @@ impl TvmManager {
         tvm.pt_page_used = pt_used;
 
         // VGEIN selects the guest file inside the active supervisor
-        // interrupt domain (SmmTT §6.3.1): WP2 pairs the confidential
-        // domain with VGEIN 1.
+        // interrupt domain (SmmTT §6.3.1): the confidential domain is paired
+        // with VGEIN 1.
         let vgein = 1;
         vcpu.ctx.hstatus = (vcpu.ctx.hstatus & !HSTATUS_VGEIN_MASK) | (vgein << HSTATUS_VGEIN_SHIFT);
         // Enable the file's identity line at the hart: hgeie is one
@@ -1162,11 +1217,10 @@ impl TvmManager {
             _ => return SbiRet::invalid_param(),
         };
         if tvm.aia.enabled {
-            // Implicit unbind: destroy has no unbind FIDs in WP2, so the
-            // bound file is scrubbed (identity lines cleared, pending
-            // identities claimed), withdrawn from the hart's hgeie line,
-            // unmapped from the G-stage, and returned to the unassigned
-            // pool.
+            // Implicit unbind: destroy has no unbind FIDs, so the bound file
+            // is scrubbed (identity lines cleared, pending identities
+            // claimed), withdrawn from the hart's hgeie line, unmapped from
+            // the G-stage, and returned to the unassigned pool.
             if let Some(binding) = tvm.vcpu.as_ref().and_then(|v| v.imsic_binding) {
                 let claimed = scrub_guest_file(binding.vgein);
                 crate::println!(
