@@ -5,6 +5,12 @@ use spin::{Mutex, MutexGuard, Once};
 pub const PAGE_SIZE: usize = 4096;
 pub const MAX_PAGES: usize = 512;
 
+/// Supervisor domain ids of the two domains this TSM deals with: the
+/// non-confidential host domain and the confidential domain the TSM runs
+/// in. MPT updates are addressed per domain through these ids.
+pub const HOST_SDID: usize = 0;
+pub const CONF_SDID: usize = 1;
+
 // ── Host-allocatable memory whitelist ───────────────────────
 //
 // Derived once at boot from RDSM_GET_INFO. Host-supplied physical
@@ -110,6 +116,52 @@ pub fn imsic_geometry() -> Option<RdsmImsicGeometry> {
     platform().and_then(|layout| layout.imsic_geometry())
 }
 
+/// Decodes `paddr` against the platform's interrupt-file geometry.
+/// `Some((domain, hart, guest))` when `paddr` is a guest interrupt file of
+/// the confidential domain; `None` for everything else: a misaligned
+/// address, anything outside the interrupt-file whitelist, a supervisor
+/// file (guest index 0), a file of another domain, an IMSIC-less platform.
+///
+/// The interrupt-domain index equals the SIDN, and the firmware pairs SIDN
+/// 1 with SDID 1 (single-SIDN pairing), so the confidential domain's block
+/// is the one at index [`CONF_SDID`]. `guest_file_paddr` in the TVM manager
+/// derives the bind target from the same pairing; a per-domain SIDN
+/// allocator would have to replace both.
+fn confidential_guest_file(
+    platform: &PlatformLayout,
+    paddr: usize,
+) -> Option<(usize, usize, usize)> {
+    if paddr % PAGE_SIZE != 0 || !platform.is_imsic_range(paddr, PAGE_SIZE) {
+        return None;
+    }
+    let g = platform.imsic_geometry()?;
+    // SmmTT §6.1: B + n·2^I + h·2^(12+J) + g·2^12, where I is
+    // `domain_index_shift` and J `guest_index_bits`. Checked shifts keep
+    // an absurd geometry from the firmware from overflowing.
+    let off = paddr - g.range_start;
+    let domain_shift = u32::try_from(g.domain_index_shift).ok()? as usize;
+    let domain = off.checked_shr(domain_shift as u32)?;
+    // A shift of 64 or more was refused just above, so `domain_shift` can
+    // still be used as a shift count below.
+    debug_assert!(domain_shift < usize::BITS as usize);
+    let guests = 1usize.checked_shl(u32::try_from(g.guest_index_bits).ok()?)?;
+    let harts = 1usize.checked_shl(u32::try_from(g.hart_index_bits).ok()?)?;
+    let hart_shift = 12usize.checked_add(g.guest_index_bits)?;
+    let hart = off.checked_shr(u32::try_from(hart_shift).ok()?)? & (harts - 1);
+    // The bits between the hart field and the domain field are reserved:
+    // an address that sets them names no interrupt file.
+    let hart_top = hart_shift.checked_add(g.hart_index_bits)?;
+    if hart_top > domain_shift {
+        return None;
+    }
+    let reserved = ((1usize << domain_shift) - 1) ^ ((1usize << hart_top) - 1);
+    if off & reserved != 0 {
+        return None;
+    }
+    let guest = (off >> 12) & (guests - 1);
+    Some((domain, hart, guest)).filter(|&(domain, _, guest)| guest != 0 && domain == CONF_SDID)
+}
+
 /// MPT operations the page tracker needs from the RDSM firmware. The
 /// backend is passed per call so the tracker's MPT call sequence can be
 /// recorded on the host.
@@ -207,12 +259,23 @@ impl PageTracker {
         }
 
         // 1. Strip Host (SDID=0) access in MPT (NONE).
-        if mpt.mpt_set(0, base_paddr, len, 0).is_err() {
+        if mpt.mpt_set(HOST_SDID, base_paddr, len, 0).is_err() {
             return SbiRet::failed();
         }
 
         // 2. Grant Confidential (SDID=1) access in MPT (RWX).
-        if mpt.mpt_set(1, base_paddr, len, 7).is_err() {
+        if mpt.mpt_set(CONF_SDID, base_paddr, len, 7).is_err() {
+            // The pages are untracked, so nothing remembers that they were
+            // taken away: give them straight back to the host. If even that
+            // fails they stay untracked with host access NONE and the
+            // confidential access unchanged (RWX under the firmware's boot
+            // trees): `reclaim_pages` over them restores the host as a
+            // no-op on non-confidential pages. Nothing is exposed to the
+            // host.
+            if mpt.mpt_set(HOST_SDID, base_paddr, len, 0b111).is_err() {
+                return SbiRet::failed();
+            }
+            mpt.mfence_pa(0, 0);
             return SbiRet::failed();
         }
 
@@ -300,7 +363,7 @@ impl PageTracker {
 
         // Restore Host access (SDID=0, RWX) over the whole range; the
         // non-confidential pages already carry it.
-        if mpt.mpt_set(0, base_paddr, len, 0b111).is_err() {
+        if mpt.mpt_set(HOST_SDID, base_paddr, len, 0b111).is_err() {
             return SbiRet::failed();
         }
         mpt.mfence_pa(0, 0);
@@ -317,15 +380,18 @@ impl PageTracker {
         SbiRet::success(0)
     }
 
-    /// COVI convert_aia_imsic: turns a host-owned IMSIC interrupt file page
-    /// into a TSM-managed confidential page (CoVE 11.3). The host must run
-    /// the COVH global + local fence sequence afterwards before the page may
-    /// be assigned to a TVM.
+    /// COVI convert_aia_imsic: turns a non-confidential guest interrupt
+    /// file of the confidential domain into a TSM-managed confidential page
+    /// (CoVE 11.3). The host must run the COVH global + local fence sequence
+    /// afterwards before the file may be assigned to a TVM.
     ///
-    /// Address violations (misalignment, outside the IMSIC whitelist) are
-    /// `invalid_address`; tracker-state violations (already converted) are
-    /// `invalid_param`. Unlike RAM conversion there is no scrub step — the
-    /// page is device MMIO and writes to it would inject spurious
+    /// A misaligned address, one outside the IMSIC whitelist, or one that is
+    /// not a confidential-domain guest file is `invalid_address` (Table 35):
+    /// a bind can only reach files of the confidential domain, so a file of
+    /// another domain would be taken from its owner for nothing. An already
+    /// tracked file is `invalid_param` — the project mapping, since Table 35
+    /// names no code for it. Unlike RAM conversion there is no scrub step:
+    /// the page is device MMIO and writes to it would inject spurious
     /// interrupts.
     pub fn convert_imsic_page(
         &mut self,
@@ -333,104 +399,105 @@ impl PageTracker {
         mpt: &mut impl MptBackend,
         paddr: usize,
     ) -> SbiRet {
-        if paddr % PAGE_SIZE != 0 || !platform.is_imsic_range(paddr, PAGE_SIZE) {
+        if confidential_guest_file(platform, paddr).is_none() {
             return SbiRet::invalid_address();
         }
-        // Only guest interrupt files are COVI-convertible (CoVE §11.3):
-        // decompose against the platform geometry and reject supervisor
-        // files (guest index 0) and foreign domain/hart positions. On an
-        // IMSIC-less platform the whitelist is empty above (fail closed).
-        if let Some(g) = platform.imsic_geometry() {
-            let guests = 1usize << g.guest_index_bits;
-            let harts = 1usize << g.hart_index_bits;
-            let domains = (g.range_end - g.range_start) >> g.domain_index_shift;
-            let off = paddr - g.range_start;
-            let guest_idx = (off >> 12) & (guests - 1);
-            let hart_idx = (off >> (12 + g.guest_index_bits)) & (harts - 1);
-            let domain_idx = off >> g.domain_index_shift;
-            if guests <= 1 || guest_idx == 0 || hart_idx >= harts || domain_idx >= domains {
-                return SbiRet::invalid_address();
-            }
-        } else {
-            return SbiRet::invalid_address();
+        if self.lookup(paddr).is_some() {
+            return SbiRet::invalid_param();
         }
-        for slot in self.entries.iter().flatten() {
-            if slot.paddr == paddr {
-                return SbiRet::invalid_param();
-            }
-        }
+        // Reserve the record slot before the MPT is touched: a tracker that
+        // cannot describe the file must not convert it.
+        let Some(slot_index) = self.entries.iter().position(|slot| slot.is_none()) else {
+            return SbiRet::failed();
+        };
 
         // 1. Strip Host (SDID=0) access in MPT (NONE).
-        if mpt.mpt_set(0, paddr, PAGE_SIZE, 0).is_err() {
+        if mpt.mpt_set(HOST_SDID, paddr, PAGE_SIZE, 0).is_err() {
             return SbiRet::failed();
         }
 
         // 2. Grant Confidential (SDID=1) read-write access in MPT (RW).
-        if mpt.mpt_set(1, paddr, PAGE_SIZE, 0b011).is_err() {
+        if mpt.mpt_set(CONF_SDID, paddr, PAGE_SIZE, 0b011).is_err() {
+            // The file is untracked, so nothing remembers that it was
+            // taken away: give it straight back to the host. If even that
+            // fails it stays untracked with host access NONE and the
+            // confidential access unchanged; the host may convert it again
+            // and retry. Nothing is exposed to the host.
+            if mpt.mpt_set(HOST_SDID, paddr, PAGE_SIZE, 0b111).is_err() {
+                return SbiRet::failed();
+            }
+            mpt.mfence_pa(0, 0);
             return SbiRet::failed();
         }
 
-        // 3. Track the page as a TSM-owned interrupt file.
-        for slot in self.entries.iter_mut() {
-            if slot.is_none() {
-                *slot = Some(PageEntry {
-                    paddr,
-                    state: PageState::ImsicFile,
-                    owner_tvm_id: None,
-                    gpa: None,
-                });
-                return SbiRet::success(0);
-            }
-        }
-        SbiRet::failed()
+        // 3. Track the file in the slot reserved above.
+        self.entries[slot_index] = Some(PageEntry {
+            paddr,
+            state: PageState::ImsicFile,
+            owner_tvm_id: None,
+            gpa: None,
+        });
+        SbiRet::success(0)
     }
 
-    /// COVI reclaim_tvm_aia_imsic: returns a TSM-owned interrupt file page
-    /// to the host (CoVE 11.4). The page must not be assigned to a TVM.
+    /// COVI reclaim_tvm_aia_imsic: returns a TSM-owned confidential
+    /// interrupt file page to the host (CoVE 11.4). The page must not be
+    /// assigned to a TVM.
     ///
-    /// No scrub step (device MMIO); the MPT update restores host access and
-    /// withdraws confidential access, followed by a global MPT fence.
-    pub fn reclaim_imsic_page(&mut self, mpt: &mut impl MptBackend, paddr: usize) -> SbiRet {
-        if paddr % PAGE_SIZE != 0 {
+    /// A misaligned address, one outside the IMSIC whitelist, or one that is
+    /// not a confidential-domain guest file is `invalid_address` (Table 36).
+    /// A file that is still assigned to a TVM is `invalid_param` (Table 36:
+    /// "The memory is still assigned to a TVM."). A file that is not
+    /// tracked, or is in another state, is `invalid_param` as the project
+    /// mapping: Table 36 names no code for it. No scrub step (device MMIO):
+    /// the confidential access is withdrawn before the host's is restored.
+    pub fn reclaim_imsic_page(
+        &mut self,
+        platform: &PlatformLayout,
+        mpt: &mut impl MptBackend,
+        paddr: usize,
+    ) -> SbiRet {
+        if confidential_guest_file(platform, paddr).is_none() {
             return SbiRet::invalid_address();
         }
-        let mut found = false;
-        for slot in self.entries.iter().flatten() {
-            if slot.paddr == paddr {
-                if slot.owner_tvm_id.is_some() || slot.state != PageState::ImsicFile {
-                    return SbiRet::invalid_param();
-                }
-                found = true;
-                break;
-            }
-        }
-        if !found {
+        let Some(slot_index) = self
+            .entries
+            .iter()
+            .position(|slot| slot.is_some_and(|e| e.paddr == paddr))
+        else {
+            return SbiRet::invalid_param();
+        };
+        // `position` matched a present entry, so this cannot be `None`.
+        let entry = self.entries[slot_index].expect("entry found above");
+        if entry.owner_tvm_id.is_some() || entry.state != PageState::ImsicFile {
             return SbiRet::invalid_param();
         }
 
-        // 1. Restore Host (SDID=0) access (RWX).
-        if mpt.mpt_set(0, paddr, PAGE_SIZE, 0b111).is_err() {
+        // 1. Withdraw Confidential (SDID=1) access (NONE) first: the TSM
+        // gives the file up before the host gets it.
+        if mpt.mpt_set(CONF_SDID, paddr, PAGE_SIZE, 0).is_err() {
             return SbiRet::failed();
         }
 
-        // 2. Withdraw Confidential (SDID=1) access (NONE).
-        if mpt.mpt_set(1, paddr, PAGE_SIZE, 0).is_err() {
+        // 2. Restore Host (SDID=0) access (RWX).
+        if mpt.mpt_set(HOST_SDID, paddr, PAGE_SIZE, 0b111).is_err() {
+            // Take the file back so it keeps matching its tracker entry. If
+            // that fails too, the entry stays while neither domain can
+            // reach the file: a retried reclaim starts from a consistent
+            // state and completes the hand-over.
+            if mpt.mpt_set(CONF_SDID, paddr, PAGE_SIZE, 0b011).is_err() {
+                return SbiRet::failed();
+            }
+            mpt.mfence_pa(0, 0);
             return SbiRet::failed();
         }
 
-        // 3. Fence so the restored host access is visible.
+        // 3. Fence so both permission changes are visible.
         mpt.mfence_pa(0, 0);
 
         // 4. Remove the tracker entry.
-        for slot in self.entries.iter_mut() {
-            if let Some(e) = slot {
-                if e.paddr == paddr {
-                    *slot = None;
-                    return SbiRet::success(0);
-                }
-            }
-        }
-        SbiRet::failed()
+        self.entries[slot_index] = None;
+        SbiRet::success(0)
     }
 
     /// COVI bind (§11.5): assigns a converted, unowned interrupt-file page
@@ -696,14 +763,14 @@ mod tests {
         PlatformLayout::from_parts([(base, base + pages * PAGE_SIZE), (0, 0)], test_imsic_geometry())
     }
 
-    /// MPT backend that records the tracker's calls. `fail_at` makes the
-    /// n-th `mpt_set` call (1-based) fail. `watch` names a byte range whose
+    /// MPT backend that records the tracker's calls. `fail_calls` lists the
+    /// `mpt_set` calls (1-based) that fail. `watch` names a byte range whose
     /// contents are recorded at every call, which pins the order of a scrub
     /// and a permission change.
     struct ScriptedBackend {
         sets: Vec<(usize, usize, usize, u8)>,
         fences: Vec<(usize, usize)>,
-        fail_at: Option<usize>,
+        fail_calls: Vec<usize>,
         watch: Option<(usize, usize)>,
         watched_zero: Vec<bool>,
     }
@@ -713,15 +780,23 @@ mod tests {
             Self {
                 sets: Vec::new(),
                 fences: Vec::new(),
-                fail_at: None,
+                fail_calls: Vec::new(),
                 watch: None,
                 watched_zero: Vec::new(),
             }
         }
 
         fn failing_at(call: usize) -> Self {
+            Self::failing_all(&[call])
+        }
+
+        fn failing_all(calls: &[usize]) -> Self {
+            let mut fail_calls = Vec::new();
+            for call in calls {
+                fail_calls.push(*call);
+            }
             Self {
-                fail_at: Some(call),
+                fail_calls,
                 ..Self::new()
             }
         }
@@ -741,7 +816,7 @@ mod tests {
                 self.watched_zero.push(zero);
             }
             self.sets.push((target_sdid, paddr, len, perm));
-            if self.fail_at == Some(self.sets.len()) {
+            if self.fail_calls.contains(&self.sets.len()) {
                 Err(())
             } else {
                 Ok(())
@@ -769,8 +844,8 @@ mod tests {
 
     #[test]
     fn convert_pages_grants_the_confidential_domain() {
-        let ram = Ram([0; 4 * PAGE_SIZE]);
-        let base = ram.0.as_ptr() as usize;
+        let mut ram = Ram([0; 4 * PAGE_SIZE]);
+        let base = ram.0.as_mut_ptr() as usize;
         let platform = platform_with_ram(base, 4);
         let mut tracker = PageTracker::new();
         let mut mpt = ScriptedBackend::new();
@@ -798,8 +873,8 @@ mod tests {
 
     #[test]
     fn convert_pages_refuses_bad_arguments_before_touching_the_mpt() {
-        let ram = Ram([0; 4 * PAGE_SIZE]);
-        let base = ram.0.as_ptr() as usize;
+        let mut ram = Ram([0; 4 * PAGE_SIZE]);
+        let base = ram.0.as_mut_ptr() as usize;
         let platform = platform_with_ram(base, 4);
         let mut tracker = PageTracker::new();
         let mut mpt = ScriptedBackend::new();
@@ -827,8 +902,8 @@ mod tests {
 
     #[test]
     fn convert_pages_refuses_overlapping_ranges() {
-        let ram = Ram([0; 4 * PAGE_SIZE]);
-        let base = ram.0.as_ptr() as usize;
+        let mut ram = Ram([0; 4 * PAGE_SIZE]);
+        let base = ram.0.as_mut_ptr() as usize;
         let platform = platform_with_ram(base, 4);
         let mut tracker = PageTracker::new();
         let mut mpt = ScriptedBackend::new();
@@ -874,9 +949,45 @@ mod tests {
     }
 
     #[test]
+    fn convert_pages_returns_the_pages_when_the_confidential_grant_fails() {
+        let mut ram = Ram([0; 4 * PAGE_SIZE]);
+        let base = ram.0.as_mut_ptr() as usize;
+        let platform = platform_with_ram(base, 4);
+
+        // The host strip itself fails: nothing changed.
+        let mut tracker = PageTracker::new();
+        let mut mpt = ScriptedBackend::failing_at(1);
+        assert_eq!(
+            tracker.convert_pages(&platform, &mut mpt, base, 2),
+            SbiRet::failed()
+        );
+        assert_eq!(mpt.sets, std::vec![(HOST_SDID, base, 2 * PAGE_SIZE, 0)]);
+        assert!(mpt.fences.is_empty());
+        assert!(tracker.entries.iter().all(|slot| slot.is_none()));
+
+        // The confidential grant fails: the host regains its access at once.
+        let mut tracker = PageTracker::new();
+        let mut mpt = ScriptedBackend::failing_at(2);
+        assert_eq!(
+            tracker.convert_pages(&platform, &mut mpt, base, 2),
+            SbiRet::failed()
+        );
+        assert_eq!(
+            mpt.sets,
+            std::vec![
+                (HOST_SDID, base, 2 * PAGE_SIZE, 0),
+                (CONF_SDID, base, 2 * PAGE_SIZE, 7),
+                (HOST_SDID, base, 2 * PAGE_SIZE, 0b111),
+            ]
+        );
+        assert_eq!(mpt.fences, std::vec![(0, 0)]);
+        assert!(tracker.entries.iter().all(|slot| slot.is_none()));
+    }
+
+    #[test]
     fn reclaim_pages_scrubs_and_returns_the_pages_to_the_host() {
         let mut ram = Ram([0; 4 * PAGE_SIZE]);
-        let base = ram.0.as_ptr() as usize;
+        let base = ram.0.as_mut_ptr() as usize;
         let platform = platform_with_ram(base, 4);
         let mut tracker = PageTracker::new();
         let mut mpt = ScriptedBackend::new();
@@ -907,7 +1018,7 @@ mod tests {
     #[test]
     fn reclaim_scrubs_before_the_host_regains_access() {
         let mut ram = Ram([0; 4 * PAGE_SIZE]);
-        let base = ram.0.as_ptr() as usize;
+        let base = ram.0.as_mut_ptr() as usize;
         let platform = platform_with_ram(base, 4);
         let mut tracker = PageTracker::new();
         let mut mpt = ScriptedBackend::new();
@@ -930,7 +1041,7 @@ mod tests {
     #[test]
     fn reclaim_leaves_non_confidential_pages_alone() {
         let mut ram = Ram([0; 4 * PAGE_SIZE]);
-        let base = ram.0.as_ptr() as usize;
+        let base = ram.0.as_mut_ptr() as usize;
         let platform = platform_with_ram(base, 4);
         let mut tracker = PageTracker::new();
         let mut mpt = ScriptedBackend::new();
@@ -951,7 +1062,7 @@ mod tests {
     #[test]
     fn reclaim_scrubs_only_the_confidential_pages_of_a_mixed_range() {
         let mut ram = Ram([0; 4 * PAGE_SIZE]);
-        let base = ram.0.as_ptr() as usize;
+        let base = ram.0.as_mut_ptr() as usize;
         let platform = platform_with_ram(base, 4);
         let mut tracker = PageTracker::new();
         let mut mpt = ScriptedBackend::new();
@@ -983,7 +1094,7 @@ mod tests {
     #[test]
     fn reclaim_refuses_untracked_pages_outside_host_memory() {
         let mut ram = Ram([0; 4 * PAGE_SIZE]);
-        let base = ram.0.as_ptr() as usize;
+        let base = ram.0.as_mut_ptr() as usize;
         // Only the first page is host-allocatable; the second is untracked
         // and outside the platform's host range.
         let platform = platform_with_ram(base, 1);
@@ -1003,7 +1114,7 @@ mod tests {
     #[test]
     fn reclaim_refuses_pages_owned_by_a_tvm() {
         let mut ram = Ram([0; 4 * PAGE_SIZE]);
-        let base = ram.0.as_ptr() as usize;
+        let base = ram.0.as_mut_ptr() as usize;
         let platform = platform_with_ram(base, 4);
         let mut tracker = PageTracker::new();
         let mut mpt = ScriptedBackend::new();
@@ -1027,8 +1138,8 @@ mod tests {
 
     #[test]
     fn reclaim_validates_its_range() {
-        let ram = Ram([0; 4 * PAGE_SIZE]);
-        let base = ram.0.as_ptr() as usize;
+        let mut ram = Ram([0; 4 * PAGE_SIZE]);
+        let base = ram.0.as_mut_ptr() as usize;
         let platform = platform_with_ram(base, 4);
         let mut tracker = PageTracker::new();
         let mut mpt = ScriptedBackend::new();
@@ -1051,7 +1162,7 @@ mod tests {
     #[test]
     fn reclaim_pages_keeps_the_entries_when_the_host_restore_fails() {
         let mut ram = Ram([0; 4 * PAGE_SIZE]);
-        let base = ram.0.as_ptr() as usize;
+        let base = ram.0.as_mut_ptr() as usize;
         let platform = platform_with_ram(base, 4);
         let mut tracker = PageTracker::new();
         let mut mpt = ScriptedBackend::failing_at(3);
@@ -1083,7 +1194,32 @@ mod tests {
         );
         assert_eq!(
             mpt.sets,
-            std::vec![(0, paddr, PAGE_SIZE, 0), (1, paddr, PAGE_SIZE, 3)]
+            std::vec![
+                (HOST_SDID, paddr, PAGE_SIZE, 0),
+                (CONF_SDID, paddr, PAGE_SIZE, 0b011),
+            ]
+        );
+        assert!(tracker.is_free_imsic_page(paddr));
+        assert_eq!(entry(&tracker, paddr).state, PageState::ImsicFile);
+    }
+
+    #[test]
+    fn convert_imsic_page_takes_the_hart_one_guest_file() {
+        let platform = PlatformLayout::from_parts([(0, 0), (0, 0)], test_imsic_geometry());
+        let mut tracker = PageTracker::new();
+        let mut mpt = ScriptedBackend::new();
+        let paddr = 0x3000_F000;
+
+        assert_eq!(
+            tracker.convert_imsic_page(&platform, &mut mpt, paddr),
+            SbiRet::success(0)
+        );
+        assert_eq!(
+            mpt.sets,
+            std::vec![
+                (HOST_SDID, paddr, PAGE_SIZE, 0),
+                (CONF_SDID, paddr, PAGE_SIZE, 0b011),
+            ]
         );
         assert!(tracker.is_free_imsic_page(paddr));
         assert_eq!(entry(&tracker, paddr).state, PageState::ImsicFile);
@@ -1103,8 +1239,19 @@ mod tests {
             tracker.convert_imsic_page(&platform, &mut mpt, 0x3000_7000),
             SbiRet::invalid_address()
         );
+        // Supervisor files (guest index 0) are never guest interrupt files.
         assert_eq!(
             tracker.convert_imsic_page(&platform, &mut mpt, 0x3000_C000),
+            SbiRet::invalid_address()
+        );
+        assert_eq!(
+            tracker.convert_imsic_page(&platform, &mut mpt, 0x3000_8000),
+            SbiRet::invalid_address()
+        );
+        // A bind can only reach files of the confidential domain, so the
+        // host's own guest file must not be taken either.
+        assert_eq!(
+            tracker.convert_imsic_page(&platform, &mut mpt, 0x3000_9000),
             SbiRet::invalid_address()
         );
 
@@ -1126,6 +1273,65 @@ mod tests {
     }
 
     #[test]
+    fn convert_imsic_page_needs_a_free_tracker_slot() {
+        let base = 0x8000_0000;
+        let platform = platform_with_ram(base, 600);
+        let mut tracker = PageTracker::new();
+        let mut mpt = ScriptedBackend::new();
+
+        assert_eq!(
+            tracker.convert_pages(&platform, &mut mpt, base, MAX_PAGES),
+            SbiRet::success(0)
+        );
+        let calls_before = mpt.sets.len();
+
+        // The tracker cannot describe the file, so the MPT must stay
+        // untouched: a full tracker never converts.
+        assert_eq!(
+            tracker.convert_imsic_page(&platform, &mut mpt, 0x3000_D000),
+            SbiRet::failed()
+        );
+        assert_eq!(mpt.sets.len(), calls_before);
+        assert!(mpt.fences.is_empty());
+        assert!(tracker.lookup(0x3000_D000).is_none());
+    }
+
+    #[test]
+    fn convert_imsic_page_returns_the_file_when_a_grant_fails() {
+        let platform = PlatformLayout::from_parts([(0, 0), (0, 0)], test_imsic_geometry());
+        let paddr = 0x3000_D000;
+
+        // The host strip itself fails: nothing changed.
+        let mut tracker = PageTracker::new();
+        let mut mpt = ScriptedBackend::failing_at(1);
+        assert_eq!(
+            tracker.convert_imsic_page(&platform, &mut mpt, paddr),
+            SbiRet::failed()
+        );
+        assert_eq!(mpt.sets, std::vec![(HOST_SDID, paddr, PAGE_SIZE, 0)]);
+        assert!(mpt.fences.is_empty());
+        assert!(tracker.lookup(paddr).is_none());
+
+        // The confidential grant fails: the host regains its access at once.
+        let mut tracker = PageTracker::new();
+        let mut mpt = ScriptedBackend::failing_at(2);
+        assert_eq!(
+            tracker.convert_imsic_page(&platform, &mut mpt, paddr),
+            SbiRet::failed()
+        );
+        assert_eq!(
+            mpt.sets,
+            std::vec![
+                (HOST_SDID, paddr, PAGE_SIZE, 0),
+                (CONF_SDID, paddr, PAGE_SIZE, 0b011),
+                (HOST_SDID, paddr, PAGE_SIZE, 0b111),
+            ]
+        );
+        assert_eq!(mpt.fences, std::vec![(0, 0)]);
+        assert!(tracker.lookup(paddr).is_none());
+    }
+
+    #[test]
     fn reclaim_imsic_page_restores_host_access() {
         let platform = PlatformLayout::from_parts([(0, 0), (0, 0)], test_imsic_geometry());
         let mut tracker = PageTracker::new();
@@ -1137,27 +1343,28 @@ mod tests {
             SbiRet::success(0)
         );
         assert_eq!(
-            tracker.reclaim_imsic_page(&mut mpt, paddr),
+            tracker.reclaim_imsic_page(&platform, &mut mpt, paddr),
             SbiRet::success(0)
         );
+        // The confidential access is withdrawn before the host's returns.
         assert_eq!(
             mpt.sets,
             std::vec![
-                (0, paddr, PAGE_SIZE, 0),
-                (1, paddr, PAGE_SIZE, 3),
-                (0, paddr, PAGE_SIZE, 7),
-                (1, paddr, PAGE_SIZE, 0),
+                (HOST_SDID, paddr, PAGE_SIZE, 0),
+                (CONF_SDID, paddr, PAGE_SIZE, 0b011),
+                (CONF_SDID, paddr, PAGE_SIZE, 0),
+                (HOST_SDID, paddr, PAGE_SIZE, 0b111),
             ]
         );
         assert_eq!(mpt.fences, std::vec![(0, 0)]);
         assert!(tracker.entries.iter().all(|slot| slot.is_none()));
 
         assert_eq!(
-            tracker.reclaim_imsic_page(&mut mpt, paddr + 4),
+            tracker.reclaim_imsic_page(&platform, &mut mpt, paddr + 4),
             SbiRet::invalid_address()
         );
         assert_eq!(
-            tracker.reclaim_imsic_page(&mut mpt, paddr),
+            tracker.reclaim_imsic_page(&platform, &mut mpt, paddr),
             SbiRet::invalid_param()
         );
 
@@ -1170,14 +1377,84 @@ mod tests {
             SbiRet::success(0)
         );
         assert_eq!(
-            tracker.reclaim_imsic_page(&mut mpt, paddr),
+            tracker.reclaim_imsic_page(&platform, &mut mpt, paddr),
             SbiRet::invalid_param()
         );
         assert!(tracker.release_imsic_file(paddr, 7));
         assert_eq!(
-            tracker.reclaim_imsic_page(&mut mpt, paddr),
+            tracker.reclaim_imsic_page(&platform, &mut mpt, paddr),
             SbiRet::success(0)
         );
+    }
+
+    #[test]
+    fn reclaim_imsic_page_validates_the_address() {
+        let platform = PlatformLayout::from_parts([(0, 0), (0, 0)], test_imsic_geometry());
+        let mut tracker = PageTracker::new();
+        let mut mpt = ScriptedBackend::new();
+
+        // A supervisor file, the host's own guest file and a non-IMSIC
+        // address are not confidential-domain guest files.
+        for paddr in [0x3000_C000, 0x3000_9000, 0x9000_0000] {
+            assert_eq!(
+                tracker.reclaim_imsic_page(&platform, &mut mpt, paddr),
+                SbiRet::invalid_address()
+            );
+        }
+        // An untracked confidential guest file is refused as state, not
+        // address.
+        assert_eq!(
+            tracker.reclaim_imsic_page(&platform, &mut mpt, 0x3000_F000),
+            SbiRet::invalid_param()
+        );
+        assert!(mpt.sets.is_empty());
+        assert!(mpt.fences.is_empty());
+    }
+
+    #[test]
+    fn reclaim_imsic_page_keeps_the_entry_when_a_grant_fails() {
+        let platform = PlatformLayout::from_parts([(0, 0), (0, 0)], test_imsic_geometry());
+        let paddr = 0x3000_D000;
+
+        // The confidential withdrawal fails: nothing changed.
+        let mut tracker = PageTracker::new();
+        let mut mpt = ScriptedBackend::new();
+        assert_eq!(
+            tracker.convert_imsic_page(&platform, &mut mpt, paddr),
+            SbiRet::success(0)
+        );
+        let mut mpt = ScriptedBackend::failing_at(1);
+        assert_eq!(
+            tracker.reclaim_imsic_page(&platform, &mut mpt, paddr),
+            SbiRet::failed()
+        );
+        assert_eq!(mpt.sets, std::vec![(CONF_SDID, paddr, PAGE_SIZE, 0)]);
+        assert!(mpt.fences.is_empty());
+        assert!(tracker.is_free_imsic_page(paddr));
+
+        // The host restore fails: the file goes back to the confidential
+        // domain so it still matches its tracker entry.
+        let mut tracker = PageTracker::new();
+        let mut mpt = ScriptedBackend::new();
+        assert_eq!(
+            tracker.convert_imsic_page(&platform, &mut mpt, paddr),
+            SbiRet::success(0)
+        );
+        let mut mpt = ScriptedBackend::failing_at(2);
+        assert_eq!(
+            tracker.reclaim_imsic_page(&platform, &mut mpt, paddr),
+            SbiRet::failed()
+        );
+        assert_eq!(
+            mpt.sets,
+            std::vec![
+                (CONF_SDID, paddr, PAGE_SIZE, 0),
+                (HOST_SDID, paddr, PAGE_SIZE, 0b111),
+                (CONF_SDID, paddr, PAGE_SIZE, 0b011),
+            ]
+        );
+        assert_eq!(mpt.fences, std::vec![(0, 0)]);
+        assert!(tracker.is_free_imsic_page(paddr));
     }
 
     #[test]
@@ -1220,8 +1497,8 @@ mod tests {
 
     #[test]
     fn range_status_separates_untracked_assigned_and_free_pages() {
-        let ram = Ram([0; 4 * PAGE_SIZE]);
-        let base = ram.0.as_ptr() as usize;
+        let mut ram = Ram([0; 4 * PAGE_SIZE]);
+        let base = ram.0.as_mut_ptr() as usize;
         let platform = platform_with_ram(base, 4);
         let mut tracker = PageTracker::new();
         let mut mpt = ScriptedBackend::new();
@@ -1249,8 +1526,8 @@ mod tests {
 
     #[test]
     fn assignment_helpers_track_ownership() {
-        let ram = Ram([0; 4 * PAGE_SIZE]);
-        let base = ram.0.as_ptr() as usize;
+        let mut ram = Ram([0; 4 * PAGE_SIZE]);
+        let base = ram.0.as_mut_ptr() as usize;
         let platform = platform_with_ram(base, 4);
         let mut tracker = PageTracker::new();
         let mut mpt = ScriptedBackend::new();
@@ -1282,8 +1559,8 @@ mod tests {
 
     #[test]
     fn payload_lookup_predicates_and_forget() {
-        let ram = Ram([0; 4 * PAGE_SIZE]);
-        let base = ram.0.as_ptr() as usize;
+        let mut ram = Ram([0; 4 * PAGE_SIZE]);
+        let base = ram.0.as_mut_ptr() as usize;
         let platform = platform_with_ram(base, 4);
         let mut tracker = PageTracker::new();
         let mut mpt = ScriptedBackend::new();
@@ -1371,5 +1648,172 @@ mod tests {
         let imsic_less = PlatformLayout::from_parts([(0, 0), (0, 0)], no_imsic());
         assert!(!imsic_less.is_imsic_range(0x3000_D000, PAGE_SIZE));
         assert!(imsic_less.imsic_geometry().is_none());
+    }
+
+    #[test]
+    fn interrupt_file_decode_survives_absurd_geometries() {
+        // Each geometry below is either unusable or shifts past the address
+        // width; the decode must refuse every address instead of panicking.
+        let absurd = [
+            // No guest files at all.
+            RdsmImsicGeometry { range_start: 0x3000_8000, range_end: 0x3010_0000, domain_index_shift: 14, guest_index_bits: 0, hart_index_bits: 1 },
+            // Domain shift at or beyond the address width.
+            RdsmImsicGeometry { range_start: 0x3000_8000, range_end: 0x3010_0000, domain_index_shift: 64, guest_index_bits: 1, hart_index_bits: 1 },
+            RdsmImsicGeometry { range_start: 0x3000_8000, range_end: 0x3010_0000, domain_index_shift: usize::MAX, guest_index_bits: 1, hart_index_bits: 1 },
+            // Guest field too wide for the hart field to fit above it.
+            RdsmImsicGeometry { range_start: 0x3000_8000, range_end: 0x3010_0000, domain_index_shift: 14, guest_index_bits: 63, hart_index_bits: 1 },
+            RdsmImsicGeometry { range_start: 0x3000_8000, range_end: 0x3010_0000, domain_index_shift: 14, guest_index_bits: 64, hart_index_bits: 1 },
+            RdsmImsicGeometry { range_start: 0x3000_8000, range_end: 0x3010_0000, domain_index_shift: 14, guest_index_bits: usize::MAX, hart_index_bits: 1 },
+            // Hart field at the address width: the geometry is unusable.
+            RdsmImsicGeometry { range_start: 0x3000_8000, range_end: 0x3010_0000, domain_index_shift: 14, guest_index_bits: 1, hart_index_bits: 64 },
+        ];
+        let mut tracker = PageTracker::new();
+        let mut mpt = ScriptedBackend::new();
+        for geometry in absurd {
+            let platform = PlatformLayout::from_parts([(0, 0), (0, 0)], geometry);
+            for paddr in [0x3000_D000, 0x3000_F004, 0x3000_7FF8, usize::MAX] {
+                assert_eq!(
+                    tracker.convert_imsic_page(&platform, &mut mpt, paddr),
+                    SbiRet::invalid_address(),
+                    "geometry {:?}, address {:#x}",
+                    geometry,
+                    paddr
+                );
+                assert_eq!(
+                    tracker.reclaim_imsic_page(&platform, &mut mpt, paddr),
+                    SbiRet::invalid_address(),
+                    "geometry {:x?}, address {:#x}",
+                    geometry,
+                    paddr
+                );
+            }
+        }
+        assert!(mpt.sets.is_empty());
+
+        // A single-hart geometry is usable: every guest file of the
+        // confidential domain decodes as hart 0.
+        let single_hart = RdsmImsicGeometry {
+            range_start: 0x3000_8000,
+            range_end: 0x3010_0000,
+            domain_index_shift: 14,
+            guest_index_bits: 1,
+            hart_index_bits: 0,
+        };
+        let platform = PlatformLayout::from_parts([(0, 0), (0, 0)], single_hart);
+        assert_eq!(
+            confidential_guest_file(&platform, 0x3000_D000),
+            Some((CONF_SDID, 0, 1))
+        );
+        assert_eq!(confidential_guest_file(&platform, 0x3000_F000), None);
+    }
+
+    #[test]
+    fn a_failed_rollback_leaves_ram_pages_to_the_no_op_reclaim() {
+        let mut ram = Ram([0; 4 * PAGE_SIZE]);
+        let base = ram.0.as_mut_ptr() as usize;
+        let platform = platform_with_ram(base, 4);
+        let mut tracker = PageTracker::new();
+
+        // The grant fails and so does the restore: no fence, no entry.
+        let mut mpt = ScriptedBackend::failing_all(&[2, 3]);
+        assert_eq!(
+            tracker.convert_pages(&platform, &mut mpt, base, 2),
+            SbiRet::failed()
+        );
+        assert_eq!(
+            mpt.sets,
+            std::vec![
+                (HOST_SDID, base, 2 * PAGE_SIZE, 0),
+                (CONF_SDID, base, 2 * PAGE_SIZE, 7),
+                (HOST_SDID, base, 2 * PAGE_SIZE, 0b111),
+            ]
+        );
+        assert!(mpt.fences.is_empty());
+        assert!(tracker.lookup(base).is_none());
+
+        // The pages are untracked host memory now: reclaiming them is the
+        // documented way back, and it only restores the host's access.
+        let mut mpt = ScriptedBackend::new();
+        assert_eq!(
+            tracker.reclaim_pages(&platform, &mut mpt, base, 2),
+            SbiRet::success(0)
+        );
+        assert_eq!(mpt.sets, std::vec![(HOST_SDID, base, 2 * PAGE_SIZE, 0b111)]);
+        assert_eq!(mpt.fences, std::vec![(0, 0)]);
+    }
+
+    #[test]
+    fn a_failed_rollback_leaves_an_interrupt_file_convertible_again() {
+        let platform = PlatformLayout::from_parts([(0, 0), (0, 0)], test_imsic_geometry());
+        let paddr = 0x3000_D000;
+        let mut tracker = PageTracker::new();
+
+        // The grant fails and so does the restore: no fence, no entry.
+        let mut mpt = ScriptedBackend::failing_all(&[2, 3]);
+        assert_eq!(
+            tracker.convert_imsic_page(&platform, &mut mpt, paddr),
+            SbiRet::failed()
+        );
+        assert_eq!(
+            mpt.sets,
+            std::vec![
+                (HOST_SDID, paddr, PAGE_SIZE, 0),
+                (CONF_SDID, paddr, PAGE_SIZE, 0b011),
+                (HOST_SDID, paddr, PAGE_SIZE, 0b111),
+            ]
+        );
+        assert!(mpt.fences.is_empty());
+        assert!(tracker.lookup(paddr).is_none());
+
+        // The file is untracked, so the host can convert it again.
+        let mut mpt = ScriptedBackend::new();
+        assert_eq!(
+            tracker.convert_imsic_page(&platform, &mut mpt, paddr),
+            SbiRet::success(0)
+        );
+        assert!(tracker.is_free_imsic_page(paddr));
+    }
+
+    #[test]
+    fn a_failed_rollback_leaves_an_interrupt_file_reclaimable_again() {
+        let platform = PlatformLayout::from_parts([(0, 0), (0, 0)], test_imsic_geometry());
+        let paddr = 0x3000_D000;
+        let mut tracker = PageTracker::new();
+        let mut mpt = ScriptedBackend::new();
+        assert_eq!(
+            tracker.convert_imsic_page(&platform, &mut mpt, paddr),
+            SbiRet::success(0)
+        );
+
+        // The confidential access is gone, the host restore fails and so
+        // does taking the file back: no fence, the entry stays.
+        let mut mpt = ScriptedBackend::failing_all(&[2, 3]);
+        assert_eq!(
+            tracker.reclaim_imsic_page(&platform, &mut mpt, paddr),
+            SbiRet::failed()
+        );
+        assert_eq!(
+            mpt.sets,
+            std::vec![
+                (CONF_SDID, paddr, PAGE_SIZE, 0),
+                (HOST_SDID, paddr, PAGE_SIZE, 0b111),
+                (CONF_SDID, paddr, PAGE_SIZE, 0b011),
+            ]
+        );
+        assert!(mpt.fences.is_empty());
+        assert!(tracker.is_free_imsic_page(paddr));
+
+        // A retried reclaim starts from the entry and completes.
+        let mut mpt = ScriptedBackend::new();
+        assert_eq!(
+            tracker.reclaim_imsic_page(&platform, &mut mpt, paddr),
+            SbiRet::success(0)
+        );
+        assert_eq!(
+            mpt.sets,
+            std::vec![(CONF_SDID, paddr, PAGE_SIZE, 0), (HOST_SDID, paddr, PAGE_SIZE, 0b111)]
+        );
+        assert_eq!(mpt.fences, std::vec![(0, 0)]);
+        assert!(tracker.lookup(paddr).is_none());
     }
 }

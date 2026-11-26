@@ -2229,6 +2229,10 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
     const CONF_GUEST_FILE: usize = 0x3000_D000;
     const SUPERVISOR_FILE_SIDN0: usize = 0x3000_8000;
     const MACHINE_HART1_FILE: usize = 0x3000_1000;
+    // The host's own guest interrupt file (SIDN0, hart0, G0).
+    const HOST_GUEST_FILE: usize = 0x3000_9000;
+    // The confidential domain's hart1 guest interrupt file.
+    const CONF_HART1_GUEST_FILE: usize = 0x3000_F000;
 
     // C1: addresses outside the IMSIC whitelist are rejected outright.
     let (err, _) = sbi_covi_convert_aia_imsic(0x9000_0000);
@@ -2259,6 +2263,33 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
         "supervisor-file convert must be SBI_ERR_INVALID_ADDRESS"
     );
 
+    // CV-N03: the host's own guest file is a guest interrupt file, but a
+    // vCPU can only be bound to a file of the confidential domain (§11.5),
+    // so converting the host's file would take it from the host for
+    // nothing. Table 35 makes it an invalid address.
+    let (err, _) = sbi_covi_convert_aia_imsic(HOST_GUEST_FILE);
+    assert_eq!(
+        err,
+        (-5isize) as usize,
+        "converting the host's guest file must be SBI_ERR_INVALID_ADDRESS"
+    );
+    println!("[HOST] CV-N03 OK: converting the host's guest file rejected");
+
+    // CV-N04: reclaim validates the address before the tracker (Table 36).
+    // The host's own guest file and the confidential domain's hart1
+    // supervisor file are not confidential-domain guest files, and
+    // 0x9000_0000 is outside the IMSIC whitelist, so all three are
+    // INVALID_ADDRESS rather than the state error an untracked page gets.
+    for paddr in [HOST_GUEST_FILE, CONF_GUEST_FILE + 0x1000, 0x9000_0000] {
+        let (err, _) = sbi_covi_reclaim_tvm_aia_imsic(paddr);
+        assert_eq!(
+            err,
+            (-5isize) as usize,
+            "reclaim of a non-confidential-guest file must be SBI_ERR_INVALID_ADDRESS"
+        );
+    }
+    println!("[HOST] CV-N04 OK: reclaim rejects non-confidential guest files");
+
     // C3: the positive path — convert, fence, reclaim (CoVE 11.3 order),
     // with the tracker-state violations interleaved.
     let (err, _) = sbi_covi_convert_aia_imsic(CONF_GUEST_FILE);
@@ -2273,12 +2304,6 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
     assert_eq!(err, 0, "post-convert global fence must succeed");
     let (err, _) = sbi_covh_local_fence();
     assert_eq!(err, 0, "post-convert local fence must succeed");
-    let (err, _) = sbi_covi_reclaim_tvm_aia_imsic(CONF_GUEST_FILE + 0x1000);
-    assert_eq!(
-        err,
-        (-3isize) as usize,
-        "reclaim of an untracked page must be SBI_ERR_INVALID_PARAM"
-    );
     let (err, _) = sbi_covi_reclaim_tvm_aia_imsic(CONF_GUEST_FILE);
     assert_eq!(err, 0, "reclaim_tvm_aia_imsic must succeed");
     let (err, _) = sbi_covi_reclaim_tvm_aia_imsic(CONF_GUEST_FILE);
@@ -2287,6 +2312,31 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
         (-3isize) as usize,
         "double reclaim must be SBI_ERR_INVALID_PARAM"
     );
+
+    // CV-P03: an untracked confidential-domain guest file is refused as a
+    // state error, not an address error, and the hart1 file completes the
+    // full convert/fence/reclaim round trip.
+    let (err, _) = sbi_covi_reclaim_tvm_aia_imsic(CONF_HART1_GUEST_FILE);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "reclaim of an untracked guest file must be SBI_ERR_INVALID_PARAM"
+    );
+    let (err, _) = sbi_covi_convert_aia_imsic(CONF_HART1_GUEST_FILE);
+    assert_eq!(err, 0, "hart1 guest-file convert must succeed");
+    let (err, _) = sbi_covh_global_fence();
+    assert_eq!(err, 0, "post-convert global fence must succeed");
+    let (err, _) = sbi_covh_local_fence();
+    assert_eq!(err, 0, "post-convert local fence must succeed");
+    let (err, _) = sbi_covi_reclaim_tvm_aia_imsic(CONF_HART1_GUEST_FILE);
+    assert_eq!(err, 0, "hart1 guest-file reclaim must succeed");
+    let (err, _) = sbi_covi_reclaim_tvm_aia_imsic(CONF_HART1_GUEST_FILE);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "double reclaim of the hart1 guest file must be SBI_ERR_INVALID_PARAM"
+    );
+    println!("[HOST] CV-P03 OK: confidential guest file round trip on hart 1");
 
     // C4: COVI FIDs outside the implemented set report not-supported.
     let (err, _) = sbi_covi_raw_fid(riscv_cove::interrupt::UNBIND_AIA_IMSIC_BEGIN);

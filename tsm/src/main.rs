@@ -339,7 +339,7 @@ pub extern "C" fn tsm_dispatch(
                 tracker_op(|tracker, platform, mpt| tracker.convert_imsic_page(platform, mpt, a0))
             }
             riscv_cove::interrupt::RECLAIM_TVM_AIA_IMSIC => {
-                tracker_op(|tracker, _platform, mpt| tracker.reclaim_imsic_page(mpt, a0))
+                tracker_op(|tracker, platform, mpt| tracker.reclaim_imsic_page(platform, mpt, a0))
             }
             riscv_cove::interrupt::INIT_TVM_AIA => tvm_manager().init_tvm_aia(a0, a1, a2),
             riscv_cove::interrupt::SET_TVM_AIA_CPU_IMSIC_ADDR => {

@@ -5,7 +5,7 @@ use riscv_cove::interrupt::TvmAiaParams;
 use spin::{Mutex, MutexGuard};
 use tsm::aia;
 use tsm::mm::{
-    PAGE_SIZE, PageState, PageTracker, RangeStatus, imsic_geometry, is_host_range,
+    CONF_SDID, PAGE_SIZE, PageState, PageTracker, RangeStatus, imsic_geometry, is_host_range,
     page_tracker, platform,
 };
 use tsm::page_table::{self, GStagePageTable, leaf_is_present, leaf_pa};
@@ -838,13 +838,12 @@ impl TvmManager {
         // Single-SIDN pairing: init registers sidn0 -> host, sidn1 ->
         // confidential; the confidential domain owns domain block 1. A
         // per-domain allocator would replace the constant.
-        const CONF_SIDN: usize = 1;
-        if CONF_SIDN + 1 > domains {
+        if CONF_SDID + 1 > domains {
             return None;
         }
         Some(
             geometry.range_start
-                + CONF_SIDN * (1 << geometry.domain_index_shift)
+                + CONF_SDID * (1 << geometry.domain_index_shift)
                 + hart * (1 << hart_shift)
                 + vgein * PAGE_SIZE,
         )

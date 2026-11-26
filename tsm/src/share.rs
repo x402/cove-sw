@@ -17,14 +17,10 @@
 //! leaves nothing shared, and a failure that cannot be undone marks the TVM
 //! poisoned so it never runs again.
 
-use crate::mm::{MptBackend, PageTracker, PAGE_SIZE};
+use crate::mm::{HOST_SDID, MptBackend, PageTracker, PAGE_SIZE};
 use crate::page_table::{
     GStagePageTable, leaf_is_present, leaf_is_retained, leaf_pa,
 };
-
-/// Supervisor domain id of the non-confidential host domain, the MPT root
-/// the host accesses memory through.
-const HOST_SDID: usize = 0;
 
 /// A guest-physical range the TVM declared non-confidential with COVG share
 /// (§12.3). The TSM maps host pages into it on COVH demand and refuses any
