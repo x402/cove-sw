@@ -64,44 +64,85 @@ pub unsafe extern "C" fn _start() -> ! {
     )
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn guest_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
-    println!("[GUEST] Hello from Confidential TVM!");
-
-    // Write initial value to shared page
-    let shared = 0x8001_0000 as *mut u64;
-    unsafe {
-        shared.write_volatile(0xDEAD_BEEF);
-    }
-    println!("[GUEST] Wrote 0xDEADBEEF to shared page GPA 0x80010000");
-
-    // Share memory region with Host via COVG
-    println!("[GUEST] Calling COVG SHARE_MEMORY_REGION...");
+/// Issues one COVG ecall and returns `sbiret.error` (a0). The TSM answers a
+/// request it refuses itself, so such a call returns without an exit; an
+/// accepted request exits to the host and this returns after the resume,
+/// where the TSM has written SBI_SUCCESS into a0.
+fn covg(fid: usize, gpa: usize, len: usize) -> usize {
+    let error: usize;
     unsafe {
         asm!(
-            "li a7, 0x434F5647",
-            "li a6, 2",
-            "li a0, 0x80010000",
-            "li a1, 0x2000",
             "ecall",
-            lateout("a0") _,
+            in("a7") 0x434F_5647usize,
+            in("a6") fid,
+            in("a0") gpa,
+            in("a1") len,
+            lateout("a0") error,
             lateout("a1") _,
             lateout("a6") _,
             lateout("a7") _,
         );
     }
-    println!("[GUEST] Resumed after COVG share");
+    error
+}
 
-    // Host should have written MAGIC to the shared page
-    let val = unsafe { shared.read_volatile() };
-    if val == 0xCAFE_F00D {
-        println!("[GUEST] PHASE4: SHARED_MEMORY_OK (read 0x{:x})", val);
-    } else {
-        println!(
-            "[GUEST] PHASE4: SHARED_MEMORY_FAIL (read 0x{:x}, expected 0xCAFEF00D)",
-            val
+#[unsafe(no_mangle)]
+pub extern "C" fn guest_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
+    println!("[GUEST] Hello from Confidential TVM!");
+
+    // Write a marker into each of the three pages about to be shared. The
+    // TSM must scrub all three before the host regains access.
+    let shared = 0x8001_0000 as *mut u64;
+    unsafe {
+        shared.write_volatile(0xDEAD_BEEF);
+        shared.add(512).write_volatile(0xBEEF_0001); // GPA 0x8001_1000
+        shared.add(1024).write_volatile(0xBEEF_0002); // GPA 0x8001_2000
+    }
+    println!("[GUEST] Wrote 0xDEADBEEF to shared page GPA 0x80010000");
+
+    // Requests the TSM refuses itself never reach the host; the error comes
+    // back in a0 (Table 46). A leaked accept would hand the host an exit the
+    // rest of the flow cannot handle.
+    assert_eq!(
+        covg(2, 0x8001_0008, 0x3000),
+        (-5isize) as usize,
+        "a misaligned share address must be SBI_ERR_INVALID_ADDRESS"
+    );
+    println!("[GUEST] PHASE4: SHARE_REFUSED_OK (sbiret.error=-5)");
+    assert_eq!(
+        covg(2, 0x9000_0000, 0x1000),
+        (-3isize) as usize,
+        "a share outside every confidential region must be SBI_ERR_INVALID_PARAM"
+    );
+    println!("[GUEST] PHASE4: SHARE_REFUSED_OK (sbiret.error=-3)");
+
+    // Share memory region with Host via COVG
+    println!("[GUEST] Calling COVG SHARE_MEMORY_REGION...");
+    let a0: usize;
+    unsafe {
+        asm!(
+            "li a7, 0x434F5647",
+            "li a6, 2",
+            "li a0, 0x80010000",
+            "li a1, 0x3000",
+            "ecall",
+            lateout("a0") a0,
+            lateout("a1") _,
+            lateout("a6") _,
+            lateout("a7") _,
         );
     }
+    assert_eq!(a0, 0, "COVG share must succeed");
+    println!("[GUEST] Resumed after COVG share");
+
+    // Host should have written one magic value per shared page.
+    let v0 = unsafe { shared.read_volatile() };
+    let v1 = unsafe { shared.add(512).read_volatile() };
+    let v2 = unsafe { shared.add(1024).read_volatile() };
+    assert_eq!(v0, 0xCAFE_F00D, "first shared page must carry the host value");
+    assert_eq!(v1, 0xCAFE_0001, "second shared page must carry the host value");
+    assert_eq!(v2, 0xCAFE_0002, "third shared page must carry the host value");
+    println!("[GUEST] PHASE4: SHARED_MEMORY_OK (read 0x{:x})", v0);
 
     println!("[GUEST] PHASE4 PASS: FENCE_EXIT_OK");
 
@@ -117,22 +158,44 @@ pub extern "C" fn guest_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
         println!("[GUEST] PHASE4: DEMAND_ZERO_FAIL (read 0x{:x})", dz_val);
     }
 
-    // Return the shared region to confidential ownership before clean exit.
+    // A length that is not page-granular is refused with Table 47
+    // INVALID_PARAM before the real unshare below.
+    assert_eq!(
+        covg(3, 0x8001_1000, 0x1008),
+        (-3isize) as usize,
+        "a non-page-granular unshare length must be SBI_ERR_INVALID_PARAM"
+    );
+    println!("[GUEST] PHASE4: UNSHARE_REFUSED_OK (sbiret.error=-3)");
+
+    // Return the third page of the shared region to confidential ownership
+    // before clean exit.
     println!("[GUEST] Calling COVG UNSHARE_MEMORY_REGION...");
+    let a0: usize;
     unsafe {
         asm!(
             "li a7, 0x434F5647",
             "li a6, 3",
-            "li a0, 0x80010000",
-            "li a1, 0x2000",
+            "li a0, 0x80012000",
+            "li a1, 0x1000",
             "ecall",
-            lateout("a0") _,
+            lateout("a0") a0,
             lateout("a1") _,
             lateout("a6") _,
             lateout("a7") _,
         );
     }
+    assert_eq!(a0, 0, "COVG unshare must succeed");
     println!("[GUEST] Resumed after COVG unshare");
+
+    // The unshared page is no longer mapped, so this access faults and the
+    // TSM serves it with a fresh, cleared confidential page.
+    let unshared = unsafe { (0x8001_2000 as *const u64).read_volatile() };
+    assert_eq!(unshared, 0, "an unshared page must come back cleared");
+    println!("[GUEST] PHASE4: UNSHARE_OK (read 0x0)");
+    // The page outside the unshared range is still shared host memory.
+    let remains = unsafe { (0x8001_1000 as *const u64).read_volatile() };
+    assert_eq!(remains, 0xCAFE_0001, "a shared page must keep its contents");
+    println!("[GUEST] PHASE4: SHARED_REMAINS_OK");
 
     // ── PHASE 7: COVI injected external interrupt ──
     // Arm the guest interrupt file (eie identity 1, eidelivery on), route

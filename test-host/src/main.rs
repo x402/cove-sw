@@ -335,10 +335,10 @@ pub fn sbi_covh_add_tvm_zero_pages(
 
 pub fn sbi_covh_add_tvm_shared_pages(
     tvm_id: usize,
-    src_paddr: usize,
-    dst_paddr: usize,
+    base_page_address: usize,
+    tsm_page_type: usize,
     num_pages: usize,
-    gpa: usize,
+    tvm_base_page_address: usize,
 ) -> (usize, usize) {
     let mut error: usize;
     let mut value: usize;
@@ -348,10 +348,10 @@ pub fn sbi_covh_add_tvm_shared_pages(
             in("a7") riscv_cove::host::EID_COVH,
             in("a6") riscv_cove::host::ADD_TVM_SHARED_PAGES,
             inout("a0") tvm_id => error,
-            inout("a1") src_paddr => value,
-            in("a2") dst_paddr,
+            inout("a1") base_page_address => value,
+            in("a2") tsm_page_type,
             in("a3") num_pages,
-            in("a4") gpa,
+            in("a4") tvm_base_page_address,
         );
     }
     (error, value)
@@ -751,8 +751,9 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
     // [0x8000..0xA000)  (2 pages): vCPU 0 State (8KB)
     // [0xA000..0xE000)  (4 pages): TVM Page Table Pool (16KB)
     // [0xE000..0x12000) (4 pages): TVM Measured Guest Payload (16KB)
-    // [0x12000..0x14000)(2 pages): TVM Shared Memory Zero Pages (8KB)
-    // Remaining 6 pages: free pool for demand-zero
+    // [0x12000..0x15000)(3 pages): TVM Shared Memory Zero Pages (12KB),
+    //                              mapped after finalize (§10.14)
+    // Remaining 5 pages: free pool for demand-zero
     let base_paddr = core::ptr::addr_of_mut!(HOST_PAGES) as usize;
     assert_eq!(base_paddr % 16384, 0, "Base paddr must be 16KB aligned");
 
@@ -818,13 +819,67 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
     );
     assert_eq!(err, 0, "add_tvm_measured_pages must succeed");
 
-    // 7b. Add Zero Pages for shared memory (2 pages at GPA 0x80010000)
-    println!(
-        "[HOST] Adding 2 zero pages (GPA 0x80010000 -> SPA 0x{:x})...",
-        shared_paddr
+    // MP-N01: Table 24 answers an invalid page count with INVALID_PARAM and
+    // an unusable address with INVALID_ADDRESS. `shared_paddr` is still a
+    // free converted page here, so the tracker cannot be what refuses these
+    // calls: only the argument under test does.
+    let (err, _) =
+        sbi_covh_add_tvm_measured_pages(tvm_id, guest_src_paddr, shared_paddr, 0, 0, 0x8000_4000);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "measured pages with a zero page count must be SBI_ERR_INVALID_PARAM"
     );
-    let (err, _) = sbi_covh_add_tvm_zero_pages(tvm_id, shared_paddr, 0, 2, 0x8001_0000);
-    assert_eq!(err, 0, "add_tvm_zero_pages must succeed");
+    let (err, _) =
+        sbi_covh_add_tvm_measured_pages(tvm_id, guest_src_paddr, shared_paddr, 0, 1, 0x8000_0000);
+    assert_eq!(
+        err,
+        (-5isize) as usize,
+        "measured pages onto an occupied guest page must be SBI_ERR_INVALID_ADDRESS"
+    );
+    let (err, _) =
+        sbi_covh_add_tvm_measured_pages(tvm_id, guest_src_paddr, shared_paddr, 0, 1, 0x9000_0000);
+    assert_eq!(
+        err,
+        (-5isize) as usize,
+        "measured pages outside every memory region must be SBI_ERR_INVALID_ADDRESS"
+    );
+    println!("[HOST] MP-N01 OK: measured-page argument errors rejected");
+
+    // MP-N02: destination and page-type codes of Table 24. `guest_src_paddr`
+    // is host memory that was never converted, `base_paddr` is the TVM's own
+    // root page table (converted and assigned), and 0x8000_4000 is a free
+    // guest page inside the memory region, so each call is refused by the
+    // guard under test alone.
+    let (err, _) = sbi_covh_add_tvm_measured_pages(
+        tvm_id,
+        guest_src_paddr,
+        guest_src_paddr,
+        0,
+        1,
+        0x8000_4000,
+    );
+    assert_eq!(
+        err,
+        (-5isize) as usize,
+        "measured pages onto an unconverted destination must be SBI_ERR_INVALID_ADDRESS"
+    );
+    let (err, _) = sbi_covh_add_tvm_measured_pages(tvm_id, guest_src_paddr, base_paddr, 0, 1, 0x8000_4000);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "measured pages onto an assigned destination must be SBI_ERR_INVALID_PARAM"
+    );
+    let (err, _) = sbi_covh_add_tvm_measured_pages(tvm_id, guest_src_paddr, shared_paddr, 9, 1, 0x8000_4000);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "measured pages with an out-of-enum page type must be SBI_ERR_INVALID_PARAM"
+    );
+    println!("[HOST] MP-N02 OK: measured-page destination and page-type errors rejected");
+
+    // 7b. Zero pages for the shared region are added after finalize (step
+    // 10a-prec below): §10.14 only allows them once the TVM is finalized.
     println!(
         "[MARKER 07] HOST: TVM #{} memory regions & measured pages populated.",
         tvm_id
@@ -1363,6 +1418,20 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
     );
     println!("[HOST] COVI-N25 OK: finalize with an unusable identity address rejected");
 
+    // ZP-N01: §10.14 allows zero pages "only after calling
+    // sbi_covh_finalize_tvm()". Table 25 names no state error; invalid_param
+    // is the project mapping used by the memory-region and measured-page
+    // handlers for the same state. The GPA range is valid, its pages are
+    // converted and no other argument is wrong, so only the state guard can
+    // reject the call.
+    let (err, _) = sbi_covh_add_tvm_zero_pages(tvm_id, shared_paddr, 0, 3, 0x8001_0000);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "zero pages before finalize must be SBI_ERR_INVALID_PARAM"
+    );
+    println!("[HOST] ZP-N01 OK: zero pages before finalize rejected");
+
     // 10. Finalize TVM
     println!("[HOST] Finalizing TVM with entry PC 0x80000000...");
     let (err, _) = sbi_covh_finalize_tvm(tvm_id, 0x8000_0000, 0, 0);
@@ -1464,6 +1533,60 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
     );
     println!("[HOST] COVI-N09 OK: FID 7 out-of-range identity rejected");
 
+    // 10a-prec. §10.14: the shared region's zero pages can only be added now
+    // that the TVM is finalized. They stay present until the guest yields the
+    // range with COVG share.
+    println!(
+        "[HOST] Adding 3 zero pages (GPA 0x80010000 -> SPA 0x{:x})...",
+        shared_paddr
+    );
+    let (err, _) = sbi_covh_add_tvm_zero_pages(tvm_id, shared_paddr, 0, 3, 0x8001_0000);
+    assert_eq!(err, 0, "add_tvm_zero_pages must succeed");
+
+    // ZP-N02..N04: the argument rules of Table 25, with a free converted
+    // page as the destination so that only the argument under test can
+    // refuse the call. A guest page outside every memory region must be
+    // refused outright: nothing bounds where a zero page may land otherwise.
+    let free_paddr = base_paddr + 0x15000;
+    let (err, _) = sbi_covh_add_tvm_zero_pages(tvm_id, free_paddr, 0, 0, 0x8002_0000);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "zero pages with a zero page count must be SBI_ERR_INVALID_PARAM"
+    );
+    println!("[HOST] ZP-N02 OK: zero pages with a zero page count rejected");
+    let (err, _) = sbi_covh_add_tvm_zero_pages(tvm_id, free_paddr, 0, 1, 0x8001_0000);
+    assert_eq!(
+        err,
+        (-5isize) as usize,
+        "zero pages onto an occupied guest page must be SBI_ERR_INVALID_ADDRESS"
+    );
+    println!("[HOST] ZP-N03 OK: zero pages onto an occupied guest page rejected");
+    let (err, _) = sbi_covh_add_tvm_zero_pages(tvm_id, free_paddr, 0, 1, 0x9000_0000);
+    assert_eq!(
+        err,
+        (-5isize) as usize,
+        "zero pages outside every memory region must be SBI_ERR_INVALID_ADDRESS"
+    );
+    println!("[HOST] ZP-N04 OK: zero pages outside every memory region rejected");
+
+    // ZP-N05: the destination and page-type codes of Table 25. The guest page
+    // 0x8002_0000 is free and inside the memory region, so only the guard
+    // under test can refuse each call.
+    let (err, _) = sbi_covh_add_tvm_zero_pages(tvm_id, guest_src_paddr, 0, 1, 0x8002_0000);
+    assert_eq!(
+        err,
+        (-5isize) as usize,
+        "zero pages onto an unconverted destination must be SBI_ERR_INVALID_ADDRESS"
+    );
+    let (err, _) = sbi_covh_add_tvm_zero_pages(tvm_id, free_paddr, 9, 1, 0x8002_0000);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "zero pages with an out-of-enum page type must be SBI_ERR_INVALID_PARAM"
+    );
+    println!("[HOST] ZP-N05 OK: zero-page destination and page-type errors rejected");
+
     // 10a-prec. COVI bind: the vCPU binds to the hart's guest interrupt
     // file (mask bit 1 = G0, VGEIN 1) and becomes runnable (§11.5).
     let (err, _) = sbi_covi_bind_aia_imsic(tvm_id, 0, 0b10);
@@ -1503,61 +1626,298 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
     assert_eq!(err, 0, "run_tvm_vcpu must return success");
     assert_eq!(val, 1, "First exit must be EXIT_COVG_SHARE (=1)");
 
-    // 10b. Host writes MAGIC to the shared SPA (Host has MPT access after COVG share)
+    // 10b. The TSM scrubbed every yielded page before it restored the host's
+    // access: all three shared SPAs must read zero, whatever the guest left.
+    let mut scrubbed = true;
+    for i in 0..3 {
+        let value = unsafe { core::ptr::read_volatile((shared_paddr + i * 0x1000) as *const u64) };
+        if value != 0 {
+            scrubbed = false;
+        }
+    }
+    assert!(
+        scrubbed,
+        "the TSM must scrub every page yielded by COVG share"
+    );
+    println!("[HOST] SH-P01 OK: the three shared SPAs were scrubbed to zero");
     println!(
-        "[HOST] Writing MAGIC 0xCAFEF00D to shared SPA 0x{:x}...",
-        shared_paddr
+        "[HOST] Writing host magic values to shared SPAs 0x{:x}..0x{:x}...",
+        shared_paddr,
+        shared_paddr + 0x3000
     );
     unsafe {
         core::ptr::write_volatile(shared_paddr as *mut u64, 0xCAFE_F00D);
+        core::ptr::write_volatile((shared_paddr + 0x1000) as *mut u64, 0xCAFE_0001);
+        core::ptr::write_volatile((shared_paddr + 0x2000) as *mut u64, 0xCAFE_0002);
     }
 
-    // 10c. Re-add shared pages to restore G-stage mapping for guest
+    // ── COVH shared-pages negatives on the live TVM ──
+    // The shared region 0x8001_0000..0x8001_3000 exists (the guest defined
+    // it) and has no mappings yet. Each call differs from the positive one
+    // below in exactly the argument under test.
+    let (err, _) = sbi_covh_add_tvm_shared_pages(tvm_id, shared_paddr, 1, 3, 0x8001_0000);
+    assert_eq!(
+        err,
+        (-2isize) as usize,
+        "tsm_page_type PAGE_2MB must be SBI_ERR_NOT_SUPPORTED"
+    );
+    let (err, _) = sbi_covh_add_tvm_shared_pages(tvm_id, shared_paddr, 9, 3, 0x8001_0000);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "a tsm_page_type outside the enum must be SBI_ERR_INVALID_PARAM"
+    );
+    println!("[HOST] SH-N02 OK: unsupported and out-of-enum page types rejected");
+    let (err, _) = sbi_covh_add_tvm_shared_pages(tvm_id, shared_paddr, 0, 0, 0x8001_0000);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "num_pages = 0 must be SBI_ERR_INVALID_PARAM"
+    );
+    println!("[HOST] SH-N03 OK: zero page count rejected");
+    let (err, _) = sbi_covh_add_tvm_shared_pages(tvm_id, shared_paddr + 8, 0, 3, 0x8001_0000);
+    assert_eq!(
+        err,
+        (-5isize) as usize,
+        "a misaligned base_page_address must be SBI_ERR_INVALID_ADDRESS"
+    );
+    let (err, _) = sbi_covh_add_tvm_shared_pages(tvm_id, shared_paddr, 0, 3, 0x8001_0008);
+    assert_eq!(
+        err,
+        (-5isize) as usize,
+        "a misaligned tvm_base_page_address must be SBI_ERR_INVALID_ADDRESS"
+    );
+    println!("[HOST] SH-N04 OK: misaligned shared addresses rejected");
+    let (err, _) = sbi_covh_add_tvm_shared_pages(tvm_id, 0x8040_0000, 0, 3, 0x8001_0000);
+    assert_eq!(
+        err,
+        (-5isize) as usize,
+        "shared pages inside the TSM image must be SBI_ERR_INVALID_ADDRESS"
+    );
+    println!("[HOST] SH-N05 OK: shared pages in the TSM image rejected");
+    let (err, _) = sbi_covh_add_tvm_shared_pages(tvm_id, base_paddr, 0, 3, 0x8001_0000);
+    assert_eq!(
+        err,
+        (-5isize) as usize,
+        "a tracked confidential page must be SBI_ERR_INVALID_ADDRESS"
+    );
+    println!("[HOST] SH-N06 OK: confidential pages as shared memory rejected");
+    let (err, _) = sbi_covh_add_tvm_shared_pages(tvm_id, shared_paddr, 0, 3, 0x8000_0000);
+    assert_eq!(
+        err,
+        (-5isize) as usize,
+        "a GPA outside the shared region must be SBI_ERR_INVALID_ADDRESS"
+    );
+    println!("[HOST] SH-N07 OK: GPA outside the shared region rejected");
+    let (err, _) = sbi_covh_add_tvm_shared_pages(tvm_id, shared_paddr, 0, 2, 0x8001_2000);
+    assert_eq!(
+        err,
+        (-5isize) as usize,
+        "a GPA range crossing the shared region end must be SBI_ERR_INVALID_ADDRESS"
+    );
+    println!("[HOST] SH-N08 OK: GPA range crossing the shared region end rejected");
+
+    // PG-N01: the shared page is not populated yet, so the trio has nothing
+    // to invalidate.
+    let (err, _) = sbi_covh_tvm_invalidate_pages(tvm_id, 0x8001_0000, 0x1000);
+    assert_eq!(
+        err,
+        (-5isize) as usize,
+        "invalidating an unpopulated shared page must be SBI_ERR_INVALID_ADDRESS"
+    );
+    println!("[HOST] PG-N01 OK: invalidate of an unmapped shared page rejected");
+
+    // 10c. SH-P02: run the guest again before mapping anything. Its first
+    // read of the shared range faults on a page the host owns, which the
+    // TSM reports with its own exit code instead of serving a zero page.
+    println!("[HOST] Running TVM vCPU 0 (second run: fault on shared page)...");
+    let (err, val) = sbi_covh_run_tvm_vcpu(tvm_id, 0);
+    println!("[HOST] TVM vCPU 0 exited with err={}, val={}", err, val);
+    assert_eq!(err, 0, "run over an unpopulated shared page must return success");
+    // The value carries the reason in bits 0-6 and the faulting guest page
+    // above them, so the host knows which page to map.
+    assert_eq!(
+        val,
+        (0x8001_0000usize << 7) | 8,
+        "the fault page and EXIT_GUEST_PAGE_FAULT must be encoded in the run value"
+    );
+    let fault_page = val >> 7;
+    assert_eq!(fault_page, 0x8001_0000, "decoded fault page must be the shared range");
     println!(
-        "[HOST] Re-adding shared pages (GPA 0x80010000 -> SPA 0x{:x})...",
+        "[HOST] SH-P02 OK: a fault on an unpopulated shared page is reported to the host (exit 8, gpa 0x{:x})",
+        fault_page
+    );
+
+    // 10d. Map the first host page into the shared region.
+    println!(
+        "[HOST] Adding shared page (GPA 0x80010000 -> SPA 0x{:x})...",
         shared_paddr
     );
-    let (err, _) =
-        sbi_covh_add_tvm_shared_pages(tvm_id, shared_paddr, shared_paddr, 2, 0x8001_0000);
+    let (err, _) = sbi_covh_add_tvm_shared_pages(tvm_id, shared_paddr, 0, 1, 0x8001_0000);
     assert_eq!(err, 0, "add_tvm_shared_pages must succeed");
+    // SH-N10: the same host page at the next empty shared address would give
+    // it two guest mappings, so the alias guard must refuse it.
+    let (err, _) = sbi_covh_add_tvm_shared_pages(tvm_id, shared_paddr, 0, 1, 0x8001_1000);
+    assert_eq!(
+        err,
+        (-5isize) as usize,
+        "aliasing one host page at two guest addresses must be SBI_ERR_INVALID_ADDRESS"
+    );
+    println!("[HOST] SH-N10 OK: aliasing a shared host page rejected");
+    // SH-N09: 0x8001_0000 now carries a mapping, so a different host page at
+    // that address must be refused as an invalid tvm_base_page_address
+    // (Table 26 names only tvm_guest_id, tsm_page_type and num_pages under
+    // INVALID_PARAM). `guest_src_paddr` is untracked host memory, so only the
+    // leaf guard can reject this call.
+    let (err, _) = sbi_covh_add_tvm_shared_pages(tvm_id, guest_src_paddr, 0, 1, 0x8001_0000);
+    assert_eq!(
+        err,
+        (-5isize) as usize,
+        "mapping onto an occupied guest address must be SBI_ERR_INVALID_ADDRESS"
+    );
+    println!("[HOST] SH-N09 OK: occupied shared-page address rejected");
+    // The remaining two host pages.
+    let (err, _) = sbi_covh_add_tvm_shared_pages(
+        tvm_id,
+        shared_paddr + 0x1000,
+        0,
+        2,
+        0x8001_1000,
+    );
+    assert_eq!(err, 0, "mapping the remaining shared pages must succeed");
+
+    // CV-N01: the TVM maps these host pages, so the host may not convert
+    // them. They are untracked, so without the page-table check the
+    // conversion would succeed and the pages could be assigned back to the
+    // TVM as confidential memory while the guest mapping stayed.
+    let (err, _) = sbi_covh_convert_pages(shared_paddr, 3);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "converting pages a TVM maps must be SBI_ERR_INVALID_PARAM"
+    );
+    println!("[HOST] CV-N01 OK: pages a TVM maps cannot be converted");
 
     // Exercise the complete fence sequence with byte lengths, as specified by COVH.
     println!("[HOST] Invalidate + fence + validate shared pages...");
-    let (err, _) = sbi_covh_tvm_invalidate_pages(tvm_id, 0x8001_0000, 0x2000);
+    let (err, _) = sbi_covh_tvm_invalidate_pages(tvm_id, 0x8001_0000, 0x3000);
     assert_eq!(err, 0, "tvm_invalidate_pages must succeed");
     let (err, _) = sbi_covh_tvm_fence(tvm_id);
     assert_eq!(err, 0, "tvm_fence must succeed");
-    let (err, _) = sbi_covh_tvm_validate_pages(tvm_id, 0x8001_0000, 0x2000);
+    // CV-N02: the entries are retained, not cleared, and each still names the
+    // host page the TVM would write through once validated. Converting those
+    // pages would make the guest write a tracked page, so the call must fail
+    // even though `maps_any` sees no present leaf.
+    let (err, _) = sbi_covh_convert_pages(shared_paddr, 3);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "converting pages a TVM maps through retained leaves must be SBI_ERR_INVALID_PARAM"
+    );
+    println!("[HOST] CV-N02 OK: retained shared mappings still block conversion");
+    let (err, _) = sbi_covh_tvm_validate_pages(tvm_id, 0x8001_0000, 0x3000);
     assert_eq!(err, 0, "tvm_validate_pages must succeed");
 
-    // 10d. Run TVM vCPU 0 again (verify shared memory, demand-zero, unshare)
-    println!("[HOST] Running TVM vCPU 0 (second run: verify + demand-zero + unshare)...");
-    let (err, val) = sbi_covh_run_tvm_vcpu(tvm_id, 0);
-    println!("[HOST] TVM vCPU 0 exited with err={}, val={}", err, val);
-    assert_eq!(err, 0, "second run_tvm_vcpu must return success");
-    assert_eq!(val, 2, "Second exit must be EXIT_COVG_UNSHARE (=2)");
+    // ── COVH invalidate/validate/remove negatives ──
+    // PG-N02: a confidential page is not the host's to invalidate (project
+    // policy: the trio only operates on shared regions). 0x8000_0000 has a
+    // present confidential leaf; 0x8004_0000 has no leaf at all and lies
+    // outside every shared region, so only the region guard can answer
+    // invalid_param for it (without that guard it would be invalid_address).
+    let (err, _) = sbi_covh_tvm_invalidate_pages(tvm_id, 0x8000_0000, 0x1000);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "invalidating a confidential page must be SBI_ERR_INVALID_PARAM"
+    );
+    let (err, _) = sbi_covh_tvm_invalidate_pages(tvm_id, 0x8004_0000, 0x1000);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "invalidating an unmapped page outside every shared region must be SBI_ERR_INVALID_PARAM"
+    );
+    println!("[HOST] PG-N02 OK: invalidate of a confidential page rejected");
+    // PG-N03: Tables 30-32 map a bad length to INVALID_PARAM.
+    let (err, _) = sbi_covh_tvm_invalidate_pages(tvm_id, 0x8001_0000, 0);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "a zero length must be SBI_ERR_INVALID_PARAM"
+    );
+    let (err, _) = sbi_covh_tvm_invalidate_pages(tvm_id, 0x8001_0000, 0x1800);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "a non-page-multiple length must be SBI_ERR_INVALID_PARAM"
+    );
+    println!("[HOST] PG-N03 OK: invalidate with a bad length rejected");
+    // PG-N04: one page of the range falls outside the shared region, so the
+    // whole call is refused and the leaves stay present; the full range
+    // still invalidates afterwards.
+    let (err, _) = sbi_covh_tvm_invalidate_pages(tvm_id, 0x8001_2000, 0x2000);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "a range leaving the shared region must be SBI_ERR_INVALID_PARAM"
+    );
+    let (err, _) = sbi_covh_tvm_invalidate_pages(tvm_id, 0x8001_0000, 0x3000);
+    assert_eq!(err, 0, "the full shared range must still invalidate");
+    let (err, _) = sbi_covh_tvm_fence(tvm_id);
+    assert_eq!(err, 0, "post-negative fence must succeed");
+    println!("[HOST] PG-N04 OK: out-of-region range rejected without touching the leaves");
+    // PG-N05: validate needs a retained leaf.
+    let (err, _) = sbi_covh_tvm_validate_pages(tvm_id, 0x8001_0000, 0x1000);
+    assert_eq!(err, 0, "validating the retained range must succeed");
+    let (err, _) = sbi_covh_tvm_validate_pages(tvm_id, 0x8001_0000, 0x1000);
+    assert_eq!(
+        err,
+        (-5isize) as usize,
+        "validating a present leaf must be SBI_ERR_INVALID_ADDRESS"
+    );
+    println!("[HOST] PG-N05 OK: validate of a present leaf rejected");
+    // PG-N06: remove needs a retained leaf as well.
+    let (err, _) = sbi_covh_tvm_remove_pages(tvm_id, 0x8001_0000, 0x1000);
+    assert_eq!(
+        err,
+        (-5isize) as usize,
+        "removing a present leaf must be SBI_ERR_INVALID_ADDRESS"
+    );
+    println!("[HOST] PG-N06 OK: remove of a present leaf rejected");
 
-    // 10e. Third run: the guest arms VS delivery and allows identity 1
-    // (COVG FID 4), which exits back to the host (§12.5 implies exit +
-    // resume).
-    println!("[HOST] Running TVM vCPU 0 (third run: COVG allow external)...");
+    // PG-N05 restored page 0; pages 1 and 2 are still retained from the
+    // all-or-nothing check. Leave every shared leaf present for the next run.
+    let (err, _) = sbi_covh_tvm_validate_pages(tvm_id, 0x8001_1000, 0x2000);
+    assert_eq!(err, 0, "restoring the retained shared leaves must succeed");
+
+    // 10e. Run TVM vCPU 0 again: the guest retries the faulting read, sees
+    // the host's values, then demand-zero tests and unshares.
+    println!("[HOST] Running TVM vCPU 0 (third run: verify + demand-zero + unshare)...");
     let (err, val) = sbi_covh_run_tvm_vcpu(tvm_id, 0);
     println!("[HOST] TVM vCPU 0 exited with err={}, val={}", err, val);
     assert_eq!(err, 0, "third run_tvm_vcpu must return success");
+    assert_eq!(val, 2, "Third exit must be EXIT_COVG_UNSHARE (=2)");
+
+    // 10f. Fourth run: the guest arms VS delivery and allows identity 1
+    // (COVG FID 4), which exits back to the host (§12.5 implies exit +
+    // resume).
+    println!("[HOST] Running TVM vCPU 0 (fourth run: COVG allow external)...");
+    let (err, val) = sbi_covh_run_tvm_vcpu(tvm_id, 0);
+    println!("[HOST] TVM vCPU 0 exited with err={}, val={}", err, val);
+    assert_eq!(err, 0, "fourth run_tvm_vcpu must return success");
     assert_eq!(val, 6, "allow exit must be EXIT_COVG_ALLOW_EXT (=6)");
 
-    // 10f. Inject identity 1 through the guest interrupt file (§11.8):
+    // 10g. Inject identity 1 through the guest interrupt file (§11.8):
     // the pending MSI is taken as soon as the vCPU re-enters VS.
     let (err, _) = sbi_covi_inject_tvm_cpu(tvm_id, 0, 1);
     assert_eq!(err, 0, "inject of an allowed identity must succeed");
 
-    println!("[HOST] Running TVM vCPU 0 (fourth run: VS handler + allow identity 2)...");
+    println!("[HOST] Running TVM vCPU 0 (fifth run: VS handler + allow identity 2)...");
     let (err, val) = sbi_covh_run_tvm_vcpu(tvm_id, 0);
     println!("[HOST] TVM vCPU 0 exited with err={}, val={}", err, val);
-    assert_eq!(err, 0, "fourth run_tvm_vcpu must return success");
+    assert_eq!(err, 0, "fifth run_tvm_vcpu must return success");
     assert_eq!(val, 6, "allow-2 exit must be EXIT_COVG_ALLOW_EXT (=6)");
 
-    // 10f-2. Park a pending MSI the guest never enables or claims:
+    // 10g-2. Park a pending MSI the guest never enables or claims:
     // identity 2 is allowed (COVG FID 4 above) but not in the guest's
     // eie, so the pending bit stays in the file across every later run
     // and destroy's guest-file scrub must claim it.
@@ -1590,13 +1950,13 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
     );
     println!("[HOST] COVI-N03c OK: FID 7 unknown vCPU id rejected");
 
-    println!("[HOST] Running TVM vCPU 0 (fifth run: deny identity 1)...");
+    println!("[HOST] Running TVM vCPU 0 (sixth run: deny identity 1)...");
     let (err, val) = sbi_covh_run_tvm_vcpu(tvm_id, 0);
     println!("[HOST] TVM vCPU 0 exited with err={}, val={}", err, val);
-    assert_eq!(err, 0, "fifth run_tvm_vcpu must return success");
+    assert_eq!(err, 0, "sixth run_tvm_vcpu must return success");
     assert_eq!(val, 7, "deny exit must be EXIT_COVG_DENY_EXT (=7)");
 
-    // 10g. After the guest denied identity 1 (COVG FID 5) the same
+    // 10h. After the guest denied identity 1 (COVG FID 5) the same
     // injection must be refused (project mapping: denied identity ->
     // invalid input).
     let (err, _) = sbi_covi_inject_tvm_cpu(tvm_id, 0, 1);
@@ -1619,11 +1979,11 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
     println!("[MARKER 19] HOST: COVI inject gating validated.");
     println!("[MARKER 20] HOST: COVI init/addr/bind/inject/run/reclaim negative paths PASSED.");
 
-    // 10h. Run once more: the guest exits clean via SRST.
-    println!("[HOST] Running TVM vCPU 0 (sixth run: clean exit)...");
+    // 10i. Run once more: the guest exits clean via SRST.
+    println!("[HOST] Running TVM vCPU 0 (seventh run: clean exit)...");
     let (err, val) = sbi_covh_run_tvm_vcpu(tvm_id, 0);
     println!("[HOST] TVM vCPU 0 exited with err={}, val={}", err, val);
-    assert_eq!(err, 0, "sixth run_tvm_vcpu must return success");
+    assert_eq!(err, 0, "seventh run_tvm_vcpu must return success");
     assert_eq!(val, 0, "Final exit must be EXIT_CLEAN (=0)");
     println!(
         "[MARKER 14] HOST: Received TVM exit, tearing down TVM #{}.",
@@ -1632,6 +1992,17 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
 
     // 11. Remove the shared mappings, then destroy the TVM and reclaim pages.
     println!("[HOST] Removing shared pages...");
+    // PG-N07: the guest unshared 0x8001_2000 and then faulted it back in as
+    // a demand-zero confidential page, so the trio refuses it either way: the
+    // page is outside every shared region (invalid_param) and it maps a
+    // tracked page (also invalid_param).
+    let (err, _) = sbi_covh_tvm_invalidate_pages(tvm_id, 0x8001_2000, 0x1000);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "invalidating the unshared page must be SBI_ERR_INVALID_PARAM"
+    );
+    println!("[HOST] PG-N07 OK: invalidate of the unshared page rejected");
     let (err, _) = sbi_covh_tvm_invalidate_pages(tvm_id, 0x8001_0000, 0x2000);
     assert_eq!(err, 0, "pre-remove invalidate must succeed");
     let (err, _) = sbi_covh_tvm_fence(tvm_id);
@@ -1648,12 +2019,33 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
     // released the bound file back to the unassigned pool (CoVE 11.4).
     let (err, _) = sbi_covi_reclaim_tvm_aia_imsic(CONF_GUEST_FILE);
     assert_eq!(err, 0, "reclaim of the released guest file must succeed");
-    println!(
-        "[HOST] Reclaiming {} pages at 0x{:x}...",
-        NUM_PAGES, base_paddr
+    // RC-N01: the pages the guest yielded are host memory now. §7.5 makes
+    // reclaiming non-confidential pages a no-operation, so the call succeeds
+    // and their contents stay untouched. The second shared page still holds
+    // the magic the host wrote in step 10b, which a reclaim that scrubbed
+    // non-confidential pages would clear.
+    let second_page_magic =
+        unsafe { core::ptr::read_volatile((shared_paddr + 0x1000) as *const u64) };
+    assert_eq!(
+        second_page_magic, 0xCAFE_0001,
+        "a shared page must still carry the host's value before the reclaim"
     );
+    let (err, _) = sbi_covh_reclaim_pages(shared_paddr, 3);
+    assert_eq!(
+        err, 0,
+        "reclaiming non-confidential pages must be a no-op"
+    );
+    println!("[HOST] RC-N01 OK: reclaim of non-confidential shared pages is a no-op");
+    // The three shared pages are the non-confidential part of the range, so
+    // one reclaim covers all 26 pages.
     let (err, _) = sbi_covh_reclaim_pages(base_paddr, NUM_PAGES);
     assert_eq!(err, 0, "reclaim_pages must succeed");
+    let second_page_magic =
+        unsafe { core::ptr::read_volatile((shared_paddr + 0x1000) as *const u64) };
+    assert_eq!(
+        second_page_magic, 0xCAFE_0001,
+        "the reclaim must not scrub a non-confidential shared page"
+    );
 
     // 13. Verify Host memory access after reclaim
     unsafe {
@@ -1662,6 +2054,15 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
         assert_eq!(
             read_val, 0x1234_5678_9ABC_DEF0,
             "Host memory access after reclaim must succeed"
+        );
+        // The yielded pages were handed back at share time (the scrub proof
+        // is the SH-P01 read), and the 26-page reclaim above left them alone
+        // as non-confidential pages, so the host can still use them.
+        core::ptr::write_volatile(shared_paddr as *mut u64, 0x1234_5678_9ABC_DEF1);
+        let read_val = core::ptr::read_volatile(shared_paddr as *const u64);
+        assert_eq!(
+            read_val, 0x1234_5678_9ABC_DEF1,
+            "Host memory access to yielded shared pages must succeed"
         );
     }
     println!("[MARKER 15] HOST: All confidential pages reclaimed successfully.");
@@ -1701,7 +2102,7 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
     assert_ne!(err, 0, "create_tvm with TSM-region params must fail");
     println!("[HOST] P55-N4 OK: create_tvm hostile params rejected");
 
-    // N5: a second TVM with hostile measured-source / shared-target pages.
+    // N5: a second TVM with hostile measured-source pages.
     let (err, _) = sbi_covh_convert_pages(base_paddr, NUM_PAGES);
     assert_eq!(err, 0, "reconvert for phase 5.5 TVM must succeed");
     let (err, _) = sbi_covh_global_fence();
@@ -1728,11 +2129,18 @@ pub extern "C" fn host_main(_hart_id: usize, _fdt_paddr: usize) -> ! {
         0x8000_0000,
     );
     assert_ne!(err, 0, "measured pages from TSM memory must fail");
-    // N5b: shared pages targeting TSM image memory must be rejected.
-    let (err, _) =
-        sbi_covh_add_tvm_shared_pages(tvm2, 0x8040_0000, 0x8040_0000, 1, 0x8001_1000);
-    assert_ne!(err, 0, "shared pages from TSM memory must fail");
-    println!("[HOST] P55-N5 OK: hostile measured/shared pages rejected");
+    // SH-N01: §10.15 allows shared pages only after the TVM begins
+    // execution. Table 26 names no state error; invalid_param is the project
+    // mapping. tvm2 is still Initializing and its memory region is
+    // registered, so the state guard is the one that fires.
+    let (err, _) = sbi_covh_add_tvm_shared_pages(tvm2, shared_paddr, 0, 1, 0x8001_0000);
+    assert_eq!(
+        err,
+        (-3isize) as usize,
+        "shared pages before the TVM begins execution must be SBI_ERR_INVALID_PARAM"
+    );
+    println!("[HOST] SH-N01 OK: shared pages before the TVM runs rejected");
+    println!("[HOST] P55-N5 OK: hostile measured pages rejected");
 
     // N8: running a vCPU of a not-yet-finalized TVM must be rejected
     // (tvm2 is still in the Initializing state at this point).

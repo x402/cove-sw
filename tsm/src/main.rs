@@ -294,11 +294,9 @@ pub extern "C" fn tsm_dispatch(
     match eid {
         riscv_cove::host::EID_COVH => match fid {
             riscv_cove::host::GET_TSM_INFO => handle_get_tsm_info(a0, a1),
-            riscv_cove::host::CONVERT_PAGES => {
-                tracker_op(|tracker, platform, mpt| tracker.convert_pages(platform, mpt, a0, a1))
-            }
+            riscv_cove::host::CONVERT_PAGES => tvm_manager().convert_pages(a0, a1),
             riscv_cove::host::RECLAIM_PAGES => {
-                tracker_op(|tracker, _platform, mpt| tracker.reclaim_pages(mpt, a0, a1))
+                tracker_op(|tracker, platform, mpt| tracker.reclaim_pages(platform, mpt, a0, a1))
             }
             riscv_cove::host::GLOBAL_FENCE => {
                 let _ = rdsm_mfence_pa(0, 0);

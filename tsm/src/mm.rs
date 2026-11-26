@@ -121,20 +121,31 @@ pub trait MptBackend {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PageState {
-    NonConfidential,
     ConvertedClean,
     AssignedTvmRoot,
     AssignedTvmState,
     AssignedVcpuState,
     AssignedPageTable,
     AssignedPayload,
-    Shared,
     /// IMSIC guest/manager interrupt file page owned by the TSM (COVI).
     /// Device MMIO: contents are never read or written by software here.
     ImsicFile,
 }
 
-#[derive(Clone, Copy, Debug)]
+/// Status of a physical range for a handler that needs converted pages it
+/// may assign.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RangeStatus {
+    /// Every page is converted, unowned and clean.
+    Free,
+    /// The first page of the range is not tracked at all: it is not
+    /// confidential memory of this TSM.
+    NotConverted,
+    /// A page is tracked but is not an unowned converted-clean page.
+    InUse,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PageEntry {
     pub paddr: usize,
     pub state: PageState,
@@ -224,64 +235,81 @@ impl PageTracker {
         SbiRet::success(0)
     }
 
+    /// COVH reclaim_pages (CoVE §10.4, §7.5): returns converted pages to the
+    /// host. Pages that were never converted are non-confidential already and
+    /// need no work, so a range may mix both kinds.
+    ///
+    /// Table 14: a misaligned `base_page_address` is INVALID_ADDRESS; a zero
+    /// or unrepresentable page count is INVALID_PARAM. A page that is not in
+    /// host-allocatable memory and not tracked is also INVALID_ADDRESS (there
+    /// is no page there to hand back). Any other tracked state is
+    /// INVALID_PARAM, the project mapping for the codes Table 14 does not
+    /// name.
     pub fn reclaim_pages(
         &mut self,
+        platform: &PlatformLayout,
         mpt: &mut impl MptBackend,
         base_paddr: usize,
         num_pages: usize,
     ) -> SbiRet {
-        if base_paddr % PAGE_SIZE != 0 || num_pages == 0 {
+        if base_paddr % PAGE_SIZE != 0 {
+            return SbiRet::invalid_address();
+        }
+        if num_pages == 0 {
             return SbiRet::invalid_param();
         }
-
-        // Verify all pages exist, are ConvertedClean, and have no owner
-        for i in 0..num_pages {
-            let paddr = base_paddr + i * PAGE_SIZE;
-            let mut found = false;
-            for slot in self.entries.iter().flatten() {
-                if slot.paddr == paddr {
-                    if slot.owner_tvm_id.is_some() || slot.state != PageState::ConvertedClean {
-                        return SbiRet::invalid_param();
-                    }
-                    found = true;
-                    break;
-                }
-            }
-            if !found {
-                return SbiRet::invalid_param();
-            }
-        }
-
         let len = match num_pages.checked_mul(PAGE_SIZE) {
-            Some(l) => l,
+            Some(len) => len,
+            None => return SbiRet::invalid_param(),
+        };
+        let end = match base_paddr.checked_add(len) {
+            Some(end) => end,
             None => return SbiRet::invalid_param(),
         };
 
-        // 0. Scrub confidential page contents before restoring Host access (CoVE 5.2.4)
+        // Classify every page before anything changes (§7.5): untracked
+        // pages inside host memory are non-confidential (no operation),
+        // untracked pages elsewhere do not exist for the host, and only a
+        // converted, unowned page is confidential-unassigned.
         for i in 0..num_pages {
             let paddr = base_paddr + i * PAGE_SIZE;
-            unsafe {
-                core::ptr::write_bytes(paddr as *mut u8, 0, PAGE_SIZE);
+            match self.lookup(paddr) {
+                Some(entry) => {
+                    if entry.owner_tvm_id.is_some() || entry.state != PageState::ConvertedClean {
+                        return SbiRet::invalid_param();
+                    }
+                }
+                None => {
+                    if !platform.is_host_range(paddr, PAGE_SIZE) {
+                        return SbiRet::invalid_address();
+                    }
+                }
             }
         }
 
-        // 1. Restore Host access (SDID=0, RWX).
-        if mpt.mpt_set(0, base_paddr, len, 7).is_err() {
-            return SbiRet::failed();
-        }
-
-        // 2. Fence
-        mpt.mfence_pa(0, 0);
-
-        // 3. Remove entries
+        // Scrub the confidential pages before the host regains access
+        // (§5.2.4). Non-confidential pages hold host data and are untouched.
         for i in 0..num_pages {
             let paddr = base_paddr + i * PAGE_SIZE;
-            for slot in self.entries.iter_mut() {
-                if let Some(e) = slot {
-                    if e.paddr == paddr {
-                        *slot = None;
-                        break;
-                    }
+            if self.lookup(paddr).is_some() {
+                unsafe {
+                    core::ptr::write_bytes(paddr as *mut u8, 0, PAGE_SIZE);
+                }
+            }
+        }
+
+        // Restore Host access (SDID=0, RWX) over the whole range; the
+        // non-confidential pages already carry it.
+        if mpt.mpt_set(0, base_paddr, len, 0b111).is_err() {
+            return SbiRet::failed();
+        }
+        mpt.mfence_pa(0, 0);
+
+        // The reclaimed pages are the host's now: drop their records.
+        for slot in self.entries.iter_mut() {
+            if let Some(entry) = slot {
+                if entry.paddr >= base_paddr && entry.paddr < end {
+                    *slot = None;
                 }
             }
         }
@@ -455,6 +483,7 @@ impl PageTracker {
         false
     }
 
+    /// Whether every page of the range is converted, unowned and clean.
     pub fn is_converted_and_free(&self, base_paddr: usize, num_pages: usize) -> bool {
         for i in 0..num_pages {
             let paddr = base_paddr + i * PAGE_SIZE;
@@ -472,6 +501,27 @@ impl PageTracker {
             }
         }
         true
+    }
+
+    /// Status of `[base_paddr, base_paddr + num_pages * PAGE_SIZE)`: the
+    /// first page that is not an unowned converted-clean page decides.
+    pub fn status_of_range(&self, base_paddr: usize, num_pages: usize) -> RangeStatus {
+        for i in 0..num_pages {
+            let paddr = match i.checked_mul(PAGE_SIZE).and_then(|off| base_paddr.checked_add(off))
+            {
+                Some(paddr) => paddr,
+                None => return RangeStatus::NotConverted,
+            };
+            match self.lookup(paddr) {
+                None => return RangeStatus::NotConverted,
+                Some(entry) => {
+                    if entry.owner_tvm_id.is_some() || entry.state != PageState::ConvertedClean {
+                        return RangeStatus::InUse;
+                    }
+                }
+            }
+        }
+        RangeStatus::Free
     }
 
     pub fn assign_range(
@@ -521,51 +571,74 @@ impl PageTracker {
         false
     }
 
-    pub fn set_shared(&mut self, paddr: usize, gpa: usize, tvm_id: usize) -> bool {
-        for slot in self.entries.iter_mut().flatten() {
-            if slot.paddr == paddr && slot.owner_tvm_id == Some(tvm_id) {
-                slot.state = PageState::Shared;
-                slot.gpa = Some(gpa);
-                return true;
-            }
-        }
-        false
-    }
-
-    pub fn find_shared_by_gpa(&self, gpa: usize, tvm_id: usize) -> Option<usize> {
+    /// The tracker entry for `paddr`, if the page is tracked at all.
+    pub fn lookup(&self, paddr: usize) -> Option<PageEntry> {
         self.entries
             .iter()
             .flatten()
-            .find(|slot| {
-                slot.owner_tvm_id == Some(tvm_id)
-                    && slot.state == PageState::Shared
-                    && slot.gpa == Some(gpa)
-            })
-            .map(|slot| slot.paddr)
+            .find(|slot| slot.paddr == paddr)
+            .copied()
     }
 
-    pub fn clear_shared(&mut self, paddr: usize, tvm_id: usize) -> bool {
-        for slot in self.entries.iter_mut().flatten() {
-            if slot.paddr == paddr && slot.owner_tvm_id == Some(tvm_id) {
-                if slot.state != PageState::Shared {
-                    return false;
+    /// Whether `paddr` is payload memory that `tvm_id` owns.
+    pub fn is_tvms_payload(&self, paddr: usize, tvm_id: usize) -> bool {
+        self.lookup(paddr).is_some_and(|e| {
+            e.state == PageState::AssignedPayload && e.owner_tvm_id == Some(tvm_id)
+        })
+    }
+
+    /// Drops the record of a payload page of `tvm_id`. The page has become
+    /// ordinary host memory, so nothing here describes it any more.
+    pub fn forget_page(&mut self, paddr: usize, tvm_id: usize) -> bool {
+        for slot in self.entries.iter_mut() {
+            if let Some(e) = slot {
+                if e.paddr == paddr
+                    && e.state == PageState::AssignedPayload
+                    && e.owner_tvm_id == Some(tvm_id)
+                {
+                    *slot = None;
+                    return true;
                 }
-                slot.state = PageState::AssignedPayload;
-                slot.gpa = None;
-                return true;
             }
         }
         false
     }
 
-    pub fn release_page(&mut self, paddr: usize, tvm_id: usize) {
-        for slot in self.entries.iter_mut().flatten() {
-            if slot.paddr == paddr && slot.owner_tvm_id == Some(tvm_id) {
-                slot.owner_tvm_id = None;
-                slot.state = PageState::ConvertedClean;
-                return;
+    /// Returns a payload page of `tvm_id` that its assignment took but no
+    /// mapping consumed, back to the free pool. Only the undo path of a
+    /// failed assignment within the same call uses this.
+    pub fn unassign_page(&mut self, paddr: usize, tvm_id: usize) {
+        for slot in self.entries.iter_mut() {
+            if let Some(e) = slot {
+                if e.paddr == paddr
+                    && e.state == PageState::AssignedPayload
+                    && e.owner_tvm_id == Some(tvm_id)
+                {
+                    e.state = PageState::ConvertedClean;
+                    e.owner_tvm_id = None;
+                    e.gpa = None;
+                    return;
+                }
             }
         }
+    }
+
+    /// Whether no tracked page lies in
+    /// `[base_paddr, base_paddr + num_pages * PAGE_SIZE)`.
+    pub fn range_is_untracked(&self, base_paddr: usize, num_pages: usize) -> bool {
+        let len = match num_pages.checked_mul(PAGE_SIZE) {
+            Some(l) => l,
+            None => return false,
+        };
+        let end = match base_paddr.checked_add(len) {
+            Some(e) => e,
+            None => return false,
+        };
+        !self
+            .entries
+            .iter()
+            .flatten()
+            .any(|e| e.paddr >= base_paddr && e.paddr < end)
     }
 
     pub fn release_tvm_pages(&mut self, tvm_id: usize) {
@@ -624,11 +697,15 @@ mod tests {
     }
 
     /// MPT backend that records the tracker's calls. `fail_at` makes the
-    /// n-th `mpt_set` call (1-based) fail.
+    /// n-th `mpt_set` call (1-based) fail. `watch` names a byte range whose
+    /// contents are recorded at every call, which pins the order of a scrub
+    /// and a permission change.
     struct ScriptedBackend {
         sets: Vec<(usize, usize, usize, u8)>,
         fences: Vec<(usize, usize)>,
         fail_at: Option<usize>,
+        watch: Option<(usize, usize)>,
+        watched_zero: Vec<bool>,
     }
 
     impl ScriptedBackend {
@@ -637,6 +714,8 @@ mod tests {
                 sets: Vec::new(),
                 fences: Vec::new(),
                 fail_at: None,
+                watch: None,
+                watched_zero: Vec::new(),
             }
         }
 
@@ -656,6 +735,11 @@ mod tests {
             len: usize,
             perm: u8,
         ) -> Result<(), ()> {
+            if let Some((start, watch_len)) = self.watch {
+                let zero = (0..watch_len)
+                    .all(|i| unsafe { *((start + i) as *const u8) } == 0);
+                self.watched_zero.push(zero);
+            }
             self.sets.push((target_sdid, paddr, len, perm));
             if self.fail_at == Some(self.sets.len()) {
                 Err(())
@@ -803,7 +887,10 @@ mod tests {
             SbiRet::success(0)
         );
 
-        assert_eq!(tracker.reclaim_pages(&mut mpt, base, 2), SbiRet::success(0));
+        assert_eq!(
+            tracker.reclaim_pages(&platform, &mut mpt, base, 2),
+            SbiRet::success(0)
+        );
         assert!(ram.0[..2 * PAGE_SIZE].iter().all(|&b| b == 0));
         assert_eq!(
             mpt.sets,
@@ -818,7 +905,103 @@ mod tests {
     }
 
     #[test]
-    fn reclaim_pages_refuses_owned_or_untracked_pages() {
+    fn reclaim_scrubs_before_the_host_regains_access() {
+        let mut ram = Ram([0; 4 * PAGE_SIZE]);
+        let base = ram.0.as_ptr() as usize;
+        let platform = platform_with_ram(base, 4);
+        let mut tracker = PageTracker::new();
+        let mut mpt = ScriptedBackend::new();
+
+        ram.0.fill(0xAA);
+        assert_eq!(
+            tracker.convert_pages(&platform, &mut mpt, base, 1),
+            SbiRet::success(0)
+        );
+        mpt.watch = Some((base, PAGE_SIZE));
+
+        assert_eq!(
+            tracker.reclaim_pages(&platform, &mut mpt, base, 1),
+            SbiRet::success(0)
+        );
+        // The only permission change of the reclaim must already see zeros.
+        assert_eq!(mpt.watched_zero, std::vec![true]);
+    }
+
+    #[test]
+    fn reclaim_leaves_non_confidential_pages_alone() {
+        let mut ram = Ram([0; 4 * PAGE_SIZE]);
+        let base = ram.0.as_ptr() as usize;
+        let platform = platform_with_ram(base, 4);
+        let mut tracker = PageTracker::new();
+        let mut mpt = ScriptedBackend::new();
+
+        // Nothing converted: the whole range is non-confidential already
+        // (§7.5 "No-operation").
+        ram.0.fill(0x5A);
+        assert_eq!(
+            tracker.reclaim_pages(&platform, &mut mpt, base, 2),
+            SbiRet::success(0)
+        );
+        assert!(ram.0.iter().all(|&b| b == 0x5A));
+        assert!(tracker.entries.iter().all(|slot| slot.is_none()));
+        assert_eq!(mpt.sets, std::vec![(0, base, 2 * PAGE_SIZE, 7)]);
+        assert_eq!(mpt.fences, std::vec![(0, 0)]);
+    }
+
+    #[test]
+    fn reclaim_scrubs_only_the_confidential_pages_of_a_mixed_range() {
+        let mut ram = Ram([0; 4 * PAGE_SIZE]);
+        let base = ram.0.as_ptr() as usize;
+        let platform = platform_with_ram(base, 4);
+        let mut tracker = PageTracker::new();
+        let mut mpt = ScriptedBackend::new();
+
+        ram.0.fill(0xAA);
+        assert_eq!(
+            tracker.convert_pages(&platform, &mut mpt, base, 2),
+            SbiRet::success(0)
+        );
+
+        assert_eq!(
+            tracker.reclaim_pages(&platform, &mut mpt, base, 3),
+            SbiRet::success(0)
+        );
+        assert!(ram.0[..2 * PAGE_SIZE].iter().all(|&b| b == 0));
+        assert!(ram.0[2 * PAGE_SIZE..3 * PAGE_SIZE].iter().all(|&b| b == 0xAA));
+        assert_eq!(
+            mpt.sets,
+            std::vec![
+                (0, base, 2 * PAGE_SIZE, 0),
+                (1, base, 2 * PAGE_SIZE, 7),
+                (0, base, 3 * PAGE_SIZE, 7),
+            ]
+        );
+        assert_eq!(mpt.fences, std::vec![(0, 0)]);
+        assert!(tracker.entries.iter().all(|slot| slot.is_none()));
+    }
+
+    #[test]
+    fn reclaim_refuses_untracked_pages_outside_host_memory() {
+        let mut ram = Ram([0; 4 * PAGE_SIZE]);
+        let base = ram.0.as_ptr() as usize;
+        // Only the first page is host-allocatable; the second is untracked
+        // and outside the platform's host range.
+        let platform = platform_with_ram(base, 1);
+        let mut tracker = PageTracker::new();
+        let mut mpt = ScriptedBackend::new();
+
+        ram.0.fill(0xAA);
+        assert_eq!(
+            tracker.reclaim_pages(&platform, &mut mpt, base, 2),
+            SbiRet::invalid_address()
+        );
+        assert!(mpt.sets.is_empty());
+        assert!(mpt.fences.is_empty());
+        assert!(ram.0.iter().all(|&b| b == 0xAA));
+    }
+
+    #[test]
+    fn reclaim_refuses_pages_owned_by_a_tvm() {
         let mut ram = Ram([0; 4 * PAGE_SIZE]);
         let base = ram.0.as_ptr() as usize;
         let platform = platform_with_ram(base, 4);
@@ -834,17 +1017,35 @@ mod tests {
         let calls_before = mpt.sets.len();
 
         assert_eq!(
-            tracker.reclaim_pages(&mut mpt, base, 2),
+            tracker.reclaim_pages(&platform, &mut mpt, base, 2),
             SbiRet::invalid_param()
         );
         assert_eq!(mpt.sets.len(), calls_before);
         assert!(ram.0[..2 * PAGE_SIZE].iter().all(|&b| b == 0xAA));
+        assert!(tracker.is_tvms_payload(base, 7));
+    }
+
+    #[test]
+    fn reclaim_validates_its_range() {
+        let ram = Ram([0; 4 * PAGE_SIZE]);
+        let base = ram.0.as_ptr() as usize;
+        let platform = platform_with_ram(base, 4);
+        let mut tracker = PageTracker::new();
+        let mut mpt = ScriptedBackend::new();
 
         assert_eq!(
-            tracker.reclaim_pages(&mut mpt, base + 2 * PAGE_SIZE, 1),
+            tracker.reclaim_pages(&platform, &mut mpt, base + 8, 1),
+            SbiRet::invalid_address()
+        );
+        assert_eq!(
+            tracker.reclaim_pages(&platform, &mut mpt, base, 0),
             SbiRet::invalid_param()
         );
-        assert_eq!(mpt.sets.len(), calls_before);
+        assert_eq!(
+            tracker.reclaim_pages(&platform, &mut mpt, base, usize::MAX),
+            SbiRet::invalid_param()
+        );
+        assert!(mpt.sets.is_empty());
     }
 
     #[test]
@@ -861,7 +1062,10 @@ mod tests {
             SbiRet::success(0)
         );
 
-        assert_eq!(tracker.reclaim_pages(&mut mpt, base, 2), SbiRet::failed());
+        assert_eq!(
+            tracker.reclaim_pages(&platform, &mut mpt, base, 2),
+            SbiRet::failed()
+        );
         assert!(mpt.fences.is_empty());
         assert!(tracker.is_converted_and_free(base, 2));
     }
@@ -1015,6 +1219,35 @@ mod tests {
     }
 
     #[test]
+    fn range_status_separates_untracked_assigned_and_free_pages() {
+        let ram = Ram([0; 4 * PAGE_SIZE]);
+        let base = ram.0.as_ptr() as usize;
+        let platform = platform_with_ram(base, 4);
+        let mut tracker = PageTracker::new();
+        let mut mpt = ScriptedBackend::new();
+
+        // Nothing converted yet.
+        assert_eq!(tracker.status_of_range(base, 2), RangeStatus::NotConverted);
+        assert_eq!(
+            tracker.convert_pages(&platform, &mut mpt, base, 3),
+            SbiRet::success(0)
+        );
+        assert_eq!(tracker.status_of_range(base, 3), RangeStatus::Free);
+        assert_eq!(tracker.status_of_range(base, 4), RangeStatus::NotConverted);
+
+        // Any assigned page makes the range unusable, whatever its state.
+        assert!(tracker.assign_page(base + PAGE_SIZE, PageState::AssignedPayload, 7));
+        assert_eq!(tracker.status_of_range(base, 3), RangeStatus::InUse);
+        assert_eq!(tracker.status_of_range(base, 1), RangeStatus::Free);
+        assert!(tracker.assign_page(base + 2 * PAGE_SIZE, PageState::AssignedPageTable, 7));
+        assert_eq!(tracker.status_of_range(base, 3), RangeStatus::InUse);
+
+        // Once released they are free again.
+        tracker.release_tvm_pages(7);
+        assert_eq!(tracker.status_of_range(base, 3), RangeStatus::Free);
+    }
+
+    #[test]
     fn assignment_helpers_track_ownership() {
         let ram = Ram([0; 4 * PAGE_SIZE]);
         let base = ram.0.as_ptr() as usize;
@@ -1035,13 +1268,12 @@ mod tests {
         assert!(!tracker.assign_range(base + PAGE_SIZE, 2, PageState::AssignedPageTable, 7));
         assert!(!tracker.assign_range(base + 2 * PAGE_SIZE, 2, PageState::AssignedPageTable, 7));
 
-        tracker.release_page(base, 7);
-        let freed = entry(&tracker, base);
-        assert_eq!(freed.state, PageState::ConvertedClean);
-        assert_eq!(freed.owner_tvm_id, None);
+        tracker.release_tvm_pages(7);
+        let released = entry(&tracker, base);
+        assert_eq!(released.state, PageState::ConvertedClean);
+        assert_eq!(released.owner_tvm_id, None);
 
         assert!(tracker.assign_page(base, PageState::AssignedPayload, 8));
-        tracker.release_page(base + PAGE_SIZE, 7);
         assert!(tracker.assign_page(base + PAGE_SIZE, PageState::AssignedPayload, 3));
         tracker.release_tvm_pages(8);
         assert_eq!(entry(&tracker, base).owner_tvm_id, None);
@@ -1049,31 +1281,58 @@ mod tests {
     }
 
     #[test]
-    fn shared_page_bookkeeping() {
+    fn payload_lookup_predicates_and_forget() {
         let ram = Ram([0; 4 * PAGE_SIZE]);
         let base = ram.0.as_ptr() as usize;
         let platform = platform_with_ram(base, 4);
         let mut tracker = PageTracker::new();
         let mut mpt = ScriptedBackend::new();
-        let gpa = 0x8000_0000;
 
+        assert!(tracker.lookup(base).is_none());
         assert_eq!(
-            tracker.convert_pages(&platform, &mut mpt, base, 1),
+            tracker.convert_pages(&platform, &mut mpt, base, 3),
             SbiRet::success(0)
         );
-        // Sharing requires an owner.
-        assert!(!tracker.set_shared(base, gpa, 7));
-
         assert!(tracker.assign_page(base, PageState::AssignedPayload, 7));
-        assert!(tracker.set_shared(base, gpa, 7));
-        assert_eq!(tracker.find_shared_by_gpa(gpa, 7), Some(base));
-        assert_eq!(tracker.find_shared_by_gpa(gpa, 8), None);
+        assert!(tracker.assign_page(base + PAGE_SIZE, PageState::AssignedPayload, 8));
+        assert!(tracker.assign_page(base + 2 * PAGE_SIZE, PageState::AssignedPageTable, 7));
 
-        assert!(tracker.clear_shared(base, 7));
-        let cleared = entry(&tracker, base);
-        assert_eq!(cleared.state, PageState::AssignedPayload);
-        assert_eq!(cleared.gpa, None);
-        assert!(!tracker.clear_shared(base, 7));
+        let looked_up = tracker.lookup(base).expect("page is tracked");
+        assert_eq!(looked_up.paddr, base);
+        assert_eq!(looked_up.state, PageState::AssignedPayload);
+        assert_eq!(looked_up.owner_tvm_id, Some(7));
+        assert!(tracker.is_tvms_payload(base, 7));
+        assert!(!tracker.is_tvms_payload(base, 8));
+        assert!(!tracker.is_tvms_payload(base + PAGE_SIZE, 7));
+        assert!(!tracker.is_tvms_payload(base + 2 * PAGE_SIZE, 7));
+        assert!(!tracker.is_tvms_payload(base + 4 * PAGE_SIZE, 7));
+
+        // Only the owning TVM may forget a payload page.
+        assert!(!tracker.forget_page(base, 8));
+        assert!(!tracker.forget_page(base + PAGE_SIZE, 7));
+        assert!(!tracker.forget_page(base + 2 * PAGE_SIZE, 7));
+        assert_eq!(entry(&tracker, base).owner_tvm_id, Some(7));
+        assert!(tracker.forget_page(base, 7));
+        assert!(tracker.lookup(base).is_none());
+
+        // Undoing an assignment returns the page to the free pool.
+        tracker.unassign_page(base + PAGE_SIZE, 7);
+        assert_eq!(entry(&tracker, base + PAGE_SIZE).owner_tvm_id, Some(8));
+        tracker.unassign_page(base + PAGE_SIZE, 8);
+        let undone = entry(&tracker, base + PAGE_SIZE);
+        assert_eq!(undone.state, PageState::ConvertedClean);
+        assert_eq!(undone.owner_tvm_id, None);
+        assert_eq!(undone.gpa, None);
+        // A page-table page is not an undone assignment.
+        tracker.unassign_page(base + 2 * PAGE_SIZE, 7);
+        assert_eq!(entry(&tracker, base + 2 * PAGE_SIZE).state, PageState::AssignedPageTable);
+
+        assert!(tracker.range_is_untracked(base, 1));
+        assert!(!tracker.range_is_untracked(base, 2));
+        assert!(!tracker.range_is_untracked(base, 3));
+        assert!(tracker.range_is_untracked(base + 3 * PAGE_SIZE, 1));
+        assert!(tracker.range_is_untracked(base + 4 * PAGE_SIZE, 0));
+        assert!(!tracker.range_is_untracked(usize::MAX - PAGE_SIZE, 2));
     }
 
     #[test]

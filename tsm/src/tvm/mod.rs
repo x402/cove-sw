@@ -4,9 +4,15 @@ use riscv_cove::host::TvmCreateParams;
 use riscv_cove::interrupt::TvmAiaParams;
 use spin::{Mutex, MutexGuard};
 use tsm::aia;
-use tsm::mm::{PAGE_SIZE, PageState, imsic_geometry, is_host_range, page_tracker};
-use tsm::page_table::{self, GStagePageTable};
+use tsm::mm::{
+    PAGE_SIZE, PageState, PageTracker, RangeStatus, imsic_geometry, is_host_range,
+    page_tracker, platform,
+};
+use tsm::page_table::{self, GStagePageTable, leaf_is_present, leaf_pa};
 use tsm::sbi::SbiRet;
+use tsm::share::{
+    self, SharedRegion, UnsharePlanError, YieldFailure, apply_unshare, plan_unshare,
+};
 use vcpu::Vcpu;
 
 /// COVI AIA configuration of one TVM (CoVE v0.7 §11.1–§11.2).
@@ -130,7 +136,56 @@ fn scrub_guest_file(vgein: usize) -> usize {
 pub enum TvmState {
     Initializing,
     Runnable,
+    /// A share could not be rolled back and the TVM lost a page of its
+    /// memory. It must never run again.
+    Poisoned,
     Destroyed,
+}
+
+/// Outcome of a COVG share request (§12.3). Only [`ShareOutcome::Shared`] and
+/// [`ShareOutcome::Poisoned`] reach the host as an exit; a refused or failed
+/// request is answered to the guest itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShareOutcome {
+    Shared,
+    /// Table 46 INVALID_ADDRESS: the guest physical address is unusable.
+    BadAddress,
+    /// Table 46 INVALID_PARAM: the length or the request state is invalid.
+    BadParam,
+    Failed,
+    Poisoned,
+}
+
+/// Outcome of a COVG unshare request (§12.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnshareOutcome {
+    Unshared,
+    /// Table 47 INVALID_ADDRESS: the guest physical address is unusable.
+    BadAddress,
+    /// Table 47 INVALID_PARAM: the length, the range or the request state is
+    /// invalid.
+    BadParam,
+    Failed,
+}
+
+/// What the demand-zero handler did with a guest fault.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DemandZero {
+    /// A fresh confidential page was mapped; resume the guest.
+    Served,
+    /// The page is host-owned: it lies in a shared region or an MMIO
+    /// region, so the host must serve the fault.
+    HostPage,
+    /// Not a demand-zero candidate (outside memory, occupied, no pool page).
+    Refused,
+}
+
+/// Classification of one guest page for the invalidate/validate/remove trio.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SharedPage {
+    Absent,
+    Present,
+    Retained,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -141,12 +196,6 @@ pub struct TvmMemoryRegion {
 
 #[derive(Clone, Copy, Debug)]
 pub struct MmioRegion {
-    pub gpa_base: usize,
-    pub len: usize,
-}
-
-#[derive(Clone, Copy)]
-pub struct SharedRegion {
     pub gpa_base: usize,
     pub len: usize,
 }
@@ -264,6 +313,36 @@ impl TvmManager {
         SbiRet::success(tvm_id)
     }
 
+    /// COVH convert_pages (§10.3): takes host memory out of the host domain
+    /// so the host can assign it to a TVM.
+    ///
+    /// A page the live TVM maps is host memory the guest still writes to (a
+    /// shared page mapped by COVH FID 13). Converting it would make it
+    /// assignable as page-table or payload memory while that guest mapping
+    /// survives, so the call is refused. Table 13 names no code for this
+    /// state; invalid_param is the project mapping. The manager holds a
+    /// single TVM today; with several, every live TVM's page table would be
+    /// checked.
+    pub fn convert_pages(&mut self, base_paddr: usize, num_pages: usize) -> SbiRet {
+        if base_paddr % PAGE_SIZE == 0 && num_pages != 0 {
+            if let Some(len) = num_pages.checked_mul(PAGE_SIZE) {
+                if base_paddr.checked_add(len).is_some() {
+                    if let Some(tvm) = self.active_tvm.as_ref() {
+                        if tvm.page_table.maps_any(base_paddr, len) {
+                            return SbiRet::invalid_param();
+                        }
+                    }
+                }
+            }
+        }
+
+        let Some(layout) = platform() else {
+            return SbiRet::failed();
+        };
+        let mut mpt = crate::rdsm_shim::RdsmMpt;
+        page_tracker().convert_pages(layout, &mut mpt, base_paddr, num_pages)
+    }
+
     pub fn add_memory_region(&mut self, tvm_id: usize, gpa: usize, len: usize) -> SbiRet {
         let tvm = match self.active_tvm.as_mut() {
             Some(t) if t.id == tvm_id => t,
@@ -356,15 +435,22 @@ impl TvmManager {
         if tvm.state != TvmState::Initializing {
             return SbiRet::invalid_param();
         }
-        if page_type != 0 {
-            return SbiRet::not_supported();
+        // Table 24 covers an invalid tsm_page_type with INVALID_PARAM. Only
+        // 4 KiB pages are implemented: the larger enum values are legal but
+        // unsupported and answer not_supported; anything else is not a legal
+        // enum value.
+        match page_type {
+            0 => {}
+            1..=3 => return SbiRet::not_supported(),
+            _ => return SbiRet::invalid_param(),
         }
-        if src_paddr % PAGE_SIZE != 0
-            || dst_paddr % PAGE_SIZE != 0
-            || gpa % PAGE_SIZE != 0
-            || num_pages == 0
-        {
+        // Table 24: an unusable address is INVALID_ADDRESS, an invalid page
+        // count is INVALID_PARAM.
+        if src_paddr % PAGE_SIZE != 0 || dst_paddr % PAGE_SIZE != 0 || gpa % PAGE_SIZE != 0 {
             return SbiRet::invalid_address();
+        }
+        if num_pages == 0 {
+            return SbiRet::invalid_param();
         }
         // The source must be host-allocatable memory. Copying
         // from TSM-private or MPT-pool pages would leak confidential data
@@ -378,9 +464,9 @@ impl TvmManager {
         }
 
         // Verify GPA is in registered region
-        let gpa_end = match gpa.checked_add(num_pages * PAGE_SIZE) {
+        let gpa_end = match gpa.checked_add(copy_len) {
             Some(e) => e,
-            None => return SbiRet::invalid_param(),
+            None => return SbiRet::invalid_address(),
         };
 
         let mut in_region = false;
@@ -392,20 +478,43 @@ impl TvmManager {
             }
         }
         if !in_region {
-            return SbiRet::invalid_param();
+            return SbiRet::invalid_address();
+        }
+        // Table 24 INVALID_ADDRESS: a guest page that already carries a
+        // mapping cannot receive a measured page.
+        for i in 0..num_pages {
+            if tvm
+                .page_table
+                .leaf_4k(gpa + i * PAGE_SIZE)
+                .is_some_and(|pte| pte != 0)
+            {
+                return SbiRet::invalid_address();
+            }
         }
 
+        // Reserve the page tables for the whole range before anything
+        // changes: a refused plan must leave the tracker, the guest pages
+        // and the pool exactly as they were.
+        let needed = match tvm.page_table.plan_range_4k(gpa, num_pages) {
+            Ok(needed) => needed,
+            Err(()) => return SbiRet::failed(),
+        };
+        if tvm.pt_page_count.saturating_sub(tvm.pt_page_used) < needed {
+            return SbiRet::failed();
+        }
+
+        // Table 24 INVALID_ADDRESS: a destination that was never converted
+        // is not confidential memory. A converted page that is already in
+        // use is a state violation the tables name no code for, so it is the
+        // project's invalid_param.
         let mut tracker = page_tracker();
-        if !tracker.is_converted_and_free(dst_paddr, num_pages) {
-            return SbiRet::invalid_param();
+        match tracker.status_of_range(dst_paddr, num_pages) {
+            RangeStatus::Free => {}
+            RangeStatus::NotConverted => return SbiRet::invalid_address(),
+            RangeStatus::InUse => return SbiRet::invalid_param(),
         }
 
         tracker.assign_range(dst_paddr, num_pages, PageState::AssignedPayload, tvm_id);
-
-        let page_table = &tvm.page_table;
-        let pt_pages = &tvm.pt_pages;
-        let pt_page_used = &mut tvm.pt_page_used;
-        let pt_page_count = tvm.pt_page_count;
 
         for i in 0..num_pages {
             let s_addr = src_paddr + i * PAGE_SIZE;
@@ -417,24 +526,20 @@ impl TvmManager {
                 core::ptr::copy_nonoverlapping(s_addr as *const u8, d_addr as *mut u8, PAGE_SIZE);
             }
 
-            // Map into GStagePageTable
-            let mut alloc_fn = || {
-                if *pt_page_used < pt_page_count {
-                    let p = pt_pages[*pt_page_used];
-                    *pt_page_used += 1;
-                    Some(p)
-                } else {
-                    None
-                }
-            };
-            if page_table.map_4k(cur_gpa, d_addr, &mut alloc_fn).is_err() {
-                return SbiRet::failed();
-            }
+            // The whole range was planned and the pool supplies it, so the
+            // mapping cannot fail.
+            let mut pool =
+                page_table::PtPool::new(&tvm.pt_pages[..tvm.pt_page_count], &mut tvm.pt_page_used);
+            tvm.page_table
+                .map_4k(cur_gpa, d_addr, &mut pool)
+                .expect("page tables planned before the first write");
         }
 
         SbiRet::success(0)
     }
 
+    /// COVH FID 12 `add_zero_pages` (§10.14): maps fresh zero pages at a
+    /// guest range after finalization; the guest faults them in on access.
     pub fn add_zero_pages(
         &mut self,
         tvm_id: usize,
@@ -448,27 +553,102 @@ impl TvmManager {
             _ => return SbiRet::invalid_param(),
         };
 
-        if tvm.state != TvmState::Initializing {
+        // §10.14: "This call may be made only after calling
+        // sbi_covh_finalize_tvm()". Table 25 names no state error;
+        // invalid_param is the project mapping, as for the memory-region and
+        // measured-page handlers.
+        if tvm.state != TvmState::Runnable {
             return SbiRet::invalid_param();
         }
-        if page_type != 0 {
-            return SbiRet::not_supported();
+        // Table 25 covers an invalid tsm_page_type with INVALID_PARAM. Only
+        // 4 KiB pages are implemented: the larger enum values are legal but
+        // unsupported and answer not_supported; anything else is not a legal
+        // enum value.
+        match page_type {
+            0 => {}
+            1..=3 => return SbiRet::not_supported(),
+            _ => return SbiRet::invalid_param(),
         }
-        if dst_paddr % PAGE_SIZE != 0 || gpa % PAGE_SIZE != 0 || num_pages == 0 {
+        // Table 25: an unusable address is INVALID_ADDRESS, an invalid page
+        // count is INVALID_PARAM.
+        if dst_paddr % PAGE_SIZE != 0 || gpa % PAGE_SIZE != 0 {
+            return SbiRet::invalid_address();
+        }
+        if num_pages == 0 {
+            return SbiRet::invalid_param();
+        }
+        let len = match num_pages.checked_mul(PAGE_SIZE) {
+            Some(len) => len,
+            None => return SbiRet::invalid_param(),
+        };
+        let gpa_end = match gpa.checked_add(len) {
+            Some(end) if end <= (1usize << 41) => end,
+            _ => return SbiRet::invalid_address(),
+        };
+        // Table 25 INVALID_ADDRESS: the guest range must be TVM memory and
+        // must not be host-owned. A shared page is mapped by the host and an
+        // MMIO page is emulated by it; neither can become a confidential
+        // zero page.
+        let in_memory = tvm
+            .memory_regions
+            .iter()
+            .flatten()
+            .any(|r| gpa >= r.gpa_base && gpa_end <= r.gpa_base + r.len);
+        if !in_memory {
+            return SbiRet::invalid_address();
+        }
+        let overlaps = |base: usize, region_len: usize| gpa < base + region_len && base < gpa_end;
+        if tvm
+            .shared_regions
+            .iter()
+            .flatten()
+            .any(|r| overlaps(r.gpa_base, r.len))
+        {
+            return SbiRet::invalid_address();
+        }
+        if tvm
+            .mmio_regions
+            .iter()
+            .flatten()
+            .any(|r| overlaps(r.gpa_base, r.len))
+        {
             return SbiRet::invalid_address();
         }
 
+        // Table 25 INVALID_ADDRESS: a guest page that already carries a
+        // mapping cannot receive a zero page.
+        for i in 0..num_pages {
+            if tvm
+                .page_table
+                .leaf_4k(gpa + i * PAGE_SIZE)
+                .is_some_and(|pte| pte != 0)
+            {
+                return SbiRet::invalid_address();
+            }
+        }
+
+        // Reserve the page tables for the whole range before anything
+        // changes, as for measured pages.
+        let needed = match tvm.page_table.plan_range_4k(gpa, num_pages) {
+            Ok(needed) => needed,
+            Err(()) => return SbiRet::failed(),
+        };
+        if tvm.pt_page_count.saturating_sub(tvm.pt_page_used) < needed {
+            return SbiRet::failed();
+        }
+
+        // Table 25 INVALID_ADDRESS: a destination that was never converted
+        // is not confidential memory (the row names base_page_address). A
+        // converted page that is already in use is the project's
+        // invalid_param.
         let mut tracker = page_tracker();
-        if !tracker.is_converted_and_free(dst_paddr, num_pages) {
-            return SbiRet::invalid_param();
+        match tracker.status_of_range(dst_paddr, num_pages) {
+            RangeStatus::Free => {}
+            RangeStatus::NotConverted => return SbiRet::invalid_address(),
+            RangeStatus::InUse => return SbiRet::invalid_param(),
         }
 
         tracker.assign_range(dst_paddr, num_pages, PageState::AssignedPayload, tvm_id);
-
-        let page_table = &tvm.page_table;
-        let pt_pages = &tvm.pt_pages;
-        let pt_page_used = &mut tvm.pt_page_used;
-        let pt_page_count = tvm.pt_page_count;
 
         for i in 0..num_pages {
             let d_addr = dst_paddr + i * PAGE_SIZE;
@@ -478,20 +658,22 @@ impl TvmManager {
                 core::ptr::write_bytes(d_addr as *mut u8, 0, PAGE_SIZE);
             }
 
-            let mut alloc_fn = || {
-                if *pt_page_used < pt_page_count {
-                    let p = pt_pages[*pt_page_used];
-                    *pt_page_used += 1;
-                    Some(p)
-                } else {
-                    None
-                }
-            };
-            if page_table.map_4k(cur_gpa, d_addr, &mut alloc_fn).is_err() {
-                return SbiRet::failed();
-            }
+            // The whole range was planned and the pool supplies it, so the
+            // mapping cannot fail.
+            let mut pool =
+                page_table::PtPool::new(&tvm.pt_pages[..tvm.pt_page_count], &mut tvm.pt_page_used);
+            tvm.page_table
+                .map_4k(cur_gpa, d_addr, &mut pool)
+                .expect("page tables planned before the first write");
         }
 
+        // A vCPU on another hart could still hold an older translation of
+        // this range.
+        // TODO(multi-hart): the fence is only sufficient because one hart
+        // runs every operation today.
+        unsafe {
+            core::arch::asm!("hfence.gvma");
+        }
         SbiRet::success(0)
     }
 
@@ -608,6 +790,12 @@ impl TvmManager {
         {
             return SbiRet::invalid_address();
         }
+        // Table 34 lists INVALID_ADDRESS for "tvm_vcpu_imsic_gpa was
+        // invalid": a page that already carries a G-stage mapping cannot
+        // become the vCPU's device page.
+        if tvm.page_table.leaf_4k(gpa).is_some_and(|pte| pte != 0) {
+            return SbiRet::invalid_address();
+        }
         // §11.2: no two vCPUs may share the same vIMSIC GPA. Table 34 names
         // no code for a duplicate GPA; invalid_param is the project mapping.
         // The manager holds a single vCPU slot today; with several vCPUs this
@@ -711,33 +899,34 @@ impl TvmManager {
             None => return SbiRet::invalid_param(),
         };
 
+        // Plan the device mapping before the binding changes any state: a
+        // pool that cannot supply it must fail the call up front.
+        let needed = match tvm.page_table.plan_4k(gpa) {
+            Ok(needed) => needed,
+            Err(()) => return SbiRet::failed(),
+        };
+        if tvm.pt_page_count.saturating_sub(tvm.pt_page_used) < needed {
+            return SbiRet::failed();
+        }
+
         // The file must have been converted (COVI FID 2) and fenced, and
         // not owned by any TVM. Lock order: TVM_MANAGER -> PAGE_TRACKER.
         let mut tracker = page_tracker();
-        if let SbiRet { error, .. } = tracker.bind_imsic_page(file_paddr, tvm_id, vcpu_id, gpa) {
-            if error != 0 {
-                return SbiRet::invalid_param();
-            }
+        let bound = tracker.bind_imsic_page(file_paddr, tvm_id, vcpu_id, gpa);
+        if bound.error != 0 {
+            return SbiRet::invalid_param();
         }
 
         // Map the vIMSIC GPA onto the file in the G-stage: device leaf,
-        // never executable. The PT pool belongs to this TVM.
-        let mut pt_used = tvm.pt_page_used;
-        let pt_count = tvm.pt_page_count;
-        let mut alloc = || {
-            if pt_used < pt_count {
-                let p = tvm.pt_pages[pt_used];
-                pt_used += 1;
-                Some(p)
-            } else {
-                None
-            }
-        };
-        if tvm.page_table.map_4k_io(gpa, file_paddr, &mut alloc).is_err() {
+        // never executable. The PT pool belongs to this TVM and was sized
+        // above, so the mapping cannot run out of pages; the release below
+        // stays as defence in depth.
+        let mut pool =
+            page_table::PtPool::new(&tvm.pt_pages[..tvm.pt_page_count], &mut tvm.pt_page_used);
+        if tvm.page_table.map_4k_nx(gpa, file_paddr, &mut pool).is_err() {
             let _ = tracker.release_imsic_file(file_paddr, tvm_id);
             return SbiRet::failed();
         }
-        tvm.pt_page_used = pt_used;
 
         // VGEIN selects the guest file inside the active supervisor
         // interrupt domain (SmmTT §6.3.1): the confidential domain is paired
@@ -965,132 +1154,247 @@ impl TvmManager {
         removed
     }
 
-    pub fn share_memory_internal(&mut self, gpa: usize, len: usize) -> bool {
+    /// COVG share (§12.3): every populated page of the range is scrubbed and
+    /// handed to the host, the leaves are cut out of the TVM, and the range
+    /// is recorded as a shared region.
+    pub fn share_memory_internal(&mut self, gpa: usize, len: usize) -> ShareOutcome {
         let tvm = match self.active_tvm.as_mut() {
             Some(t) => t,
-            None => return false,
+            None => return ShareOutcome::BadParam,
         };
-        if gpa % PAGE_SIZE != 0 || len % PAGE_SIZE != 0 || len == 0 {
-            return false;
-        }
-        let num = len / PAGE_SIZE;
-        let shared_slot = match tvm.shared_regions.iter_mut().find(|slot| slot.is_none()) {
-            Some(slot) => slot,
-            None => return false,
-        };
-        let mut all_ok = true;
-        for i in 0..num {
-            let cur_gpa = gpa + i * PAGE_SIZE;
-            // Look up SPA from G-stage
-            let spa = match tvm.page_table.lookup_4k(cur_gpa) {
-                Ok(s) => s,
-                Err(_) => {
-                    all_ok = false;
-                    continue;
-                }
-            };
-            // Preserve ownership and make the yielded page visible to the tracker.
-            page_tracker().set_shared(spa, cur_gpa, tvm.id);
-            // Unmap from G-stage (guest loses access)
-            let _ = tvm.page_table.unmap_4k(cur_gpa);
-            // Grant Host (SDID=0) RW access to the SPA
-            let (err, _) = crate::rdsm_shim::rdsm_mpt_set(0, spa, PAGE_SIZE, 3);
-            if err != 0 {
-                all_ok = false;
-            }
-        }
-        if all_ok {
-            *shared_slot = Some(SharedRegion { gpa_base: gpa, len });
-        }
-        all_ok
-    }
 
-    pub fn unshare_memory_internal(&mut self, gpa: usize, len: usize) -> bool {
-        let tvm = match self.active_tvm.as_mut() {
-            Some(t) => t,
-            None => return false,
+        // Refusals leave the TVM and the tracker untouched. Table 46 splits
+        // them into an unusable address and an invalid parameter or state.
+        if gpa % PAGE_SIZE != 0 {
+            return ShareOutcome::BadAddress;
+        }
+        if len == 0 || len % PAGE_SIZE != 0 {
+            return ShareOutcome::BadParam;
+        }
+        let end = match gpa.checked_add(len) {
+            Some(end) => end,
+            None => return ShareOutcome::BadAddress,
         };
-        if gpa % PAGE_SIZE != 0 || len % PAGE_SIZE != 0 || len == 0 {
-            return false;
+        // The Sv39x4 G-stage bounds the addresses this page table can hold.
+        if end > (1usize << 41) {
+            return ShareOutcome::BadAddress;
         }
-        if gpa % PAGE_SIZE != 0 || len == 0 || len % PAGE_SIZE != 0 {
-            return false;
+        // Table 46 INVALID_PARAM: the range must map to a confidential
+        // region (§12.3 "must lie within an existing region of confidential
+        // address space").
+        let in_memory = tvm
+            .memory_regions
+            .iter()
+            .flatten()
+            .any(|r| gpa >= r.gpa_base && end <= r.gpa_base + r.len);
+        if !in_memory {
+            return ShareOutcome::BadParam;
         }
-        let slot_index = tvm
+        // A range that is already shared, or that the host emulates, is not
+        // confidential memory.
+        let overlaps = |base: usize, region_len: usize| gpa < base + region_len && base < end;
+        if tvm
             .shared_regions
             .iter()
-            .position(|region| matches!(region, Some(r) if r.gpa_base == gpa && r.len == len));
-        let slot_index = match slot_index {
-            Some(index) => index,
-            None => return false,
+            .flatten()
+            .any(|r| overlaps(r.gpa_base, r.len))
+        {
+            return ShareOutcome::BadParam;
+        }
+        if tvm
+            .mmio_regions
+            .iter()
+            .flatten()
+            .any(|r| overlaps(r.gpa_base, r.len))
+        {
+            return ShareOutcome::BadParam;
+        }
+        // Only a running TVM yields memory: §12.3 blocks the calling vCPU
+        // until the host completes the conversion.
+        if tvm.state != TvmState::Runnable {
+            return ShareOutcome::BadParam;
+        }
+        let slot = match tvm.shared_regions.iter().position(|slot| slot.is_none()) {
+            Some(slot) => slot,
+            None => return ShareOutcome::Failed,
         };
-        let region = tvm.shared_regions[slot_index].unwrap();
-        let num_pages = len / PAGE_SIZE;
-        let pt_pages = tvm.pt_pages;
-        let pt_page_count = tvm.pt_page_count;
-        let pt_page_used = &mut tvm.pt_page_used;
-        let page_table = &tvm.page_table;
 
-        for i in 0..num_pages {
-            let cur_gpa = region.gpa_base + i * PAGE_SIZE;
-            let spa = match page_tracker().find_shared_by_gpa(cur_gpa, tvm.id) {
-                Some(spa) => spa,
-                None => return false,
-            };
-            if crate::rdsm_shim::rdsm_mpt_set(0, spa, PAGE_SIZE, 0).0 != 0 {
-                return false;
-            }
-            if !page_tracker().clear_shared(spa, tvm.id) {
-                return false;
-            }
-            let mut alloc_fn = || {
-                if *pt_page_used < pt_page_count {
-                    let page = pt_pages[*pt_page_used];
-                    *pt_page_used += 1;
-                    Some(page)
-                } else {
-                    None
+        let mut tracker = page_tracker();
+        match share::yield_range(
+            &tvm.page_table,
+            &mut tracker,
+            &mut crate::rdsm_shim::RdsmMpt,
+            tvm.id,
+            gpa,
+            len,
+        ) {
+            Ok(()) => {
+                tvm.shared_regions[slot] = Some(SharedRegion { gpa_base: gpa, len });
+                unsafe {
+                    core::arch::asm!("hfence.gvma");
                 }
-            };
-            if page_table.map_4k(cur_gpa, spa, &mut alloc_fn).is_err() {
-                return false;
+                ShareOutcome::Shared
+            }
+            Err(YieldFailure::Refused) => {
+                crate::println!(
+                    "[TSM] COVG share refused: gpa=0x{:x}, len=0x{:x}",
+                    gpa,
+                    len
+                );
+                ShareOutcome::BadParam
+            }
+            Err(YieldFailure::RolledBack) => {
+                crate::println!(
+                    "[TSM] COVG share rolled back, nothing shared: gpa=0x{:x}, len=0x{:x}",
+                    gpa,
+                    len
+                );
+                ShareOutcome::Failed
+            }
+            Err(YieldFailure::Poisoned) => {
+                crate::println!(
+                    "[TSM] COVG share could not be rolled back, TVM poisoned: gpa=0x{:x}, len=0x{:x}",
+                    gpa,
+                    len
+                );
+                tvm.state = TvmState::Poisoned;
+                unsafe {
+                    core::arch::asm!("hfence.gvma");
+                }
+                ShareOutcome::Poisoned
             }
         }
+    }
 
-        let _ = crate::rdsm_shim::rdsm_mfence_pa(0, 0);
+    /// COVG unshare (§12.4): unmaps every page the host had mapped into the
+    /// range and shrinks the shared regions around it. Nothing is mapped
+    /// back; a later guest access faults and is served by demand-zero.
+    pub fn unshare_memory_internal(&mut self, gpa: usize, len: usize) -> UnshareOutcome {
+        let tvm = match self.active_tvm.as_mut() {
+            Some(t) => t,
+            None => return UnshareOutcome::BadParam,
+        };
+
+        // Table 47 splits its refusals into an unusable address and an
+        // invalid length, range or state.
+        if gpa % PAGE_SIZE != 0 {
+            return UnshareOutcome::BadAddress;
+        }
+        if len == 0 || len % PAGE_SIZE != 0 {
+            return UnshareOutcome::BadParam;
+        }
+        let end = match gpa.checked_add(len) {
+            Some(end) => end,
+            None => return UnshareOutcome::BadAddress,
+        };
+        if end > (1usize << 41) {
+            return UnshareOutcome::BadAddress;
+        }
+        // Only a running TVM unshares memory: §12.3 blocks the calling vCPU
+        // until the host completes the conversion.
+        if tvm.state != TvmState::Runnable {
+            return UnshareOutcome::BadParam;
+        }
+        // Table 47 INVALID_PARAM: the range must span one shared region
+        // (§12.4 "must lie within an existing region of non-confidential
+        // address space"), not several and not a part of one outside it. The
+        // bookkeeping is planned before any leaf changes, so a missing free
+        // slot fails the call before the range is unmapped.
+        let (index, reshape) = match plan_unshare(&tvm.shared_regions, gpa, len) {
+            Ok(plan) => plan,
+            Err(UnsharePlanError::NotShared) => return UnshareOutcome::BadParam,
+            Err(UnsharePlanError::NoFreeSlot) => return UnshareOutcome::Failed,
+        };
+
+        let tracker = page_tracker();
+        if share::retake_range(&tvm.page_table, &tracker, gpa, len).is_err() {
+            crate::println!(
+                "[TSM] COVG unshare refused: gpa=0x{:x}, len=0x{:x}",
+                gpa,
+                len
+            );
+            return UnshareOutcome::BadParam;
+        }
+        drop(tracker);
+
+        apply_unshare(&mut tvm.shared_regions, index, reshape);
+        // TODO(multi-hart): invalidating the translation is only sufficient
+        // because one hart runs every operation today; a vCPU of this TVM
+        // running on another hart would need a shootdown before it resumes.
         unsafe {
             core::arch::asm!("hfence.gvma");
         }
-        tvm.shared_regions[slot_index] = None;
-        true
+        UnshareOutcome::Unshared
     }
 
-    pub fn handle_demand_zero(&mut self, fault_gpa: usize) -> bool {
+    /// Serves a guest page fault with a fresh zero page. The faulting page
+    /// must lie inside a memory region and outside every shared and MMIO
+    /// region: a fault on host-owned memory belongs to the host.
+    pub fn handle_demand_zero(&mut self, fault_gpa: usize) -> DemandZero {
         let tvm = match self.active_tvm.as_mut() {
             Some(t) => t,
-            None => return false,
+            None => return DemandZero::Refused,
         };
 
-        // Verify fault GPA is within a registered memory region
+        // A fault reports the exact address; allocation and mapping work on
+        // the page that contains it.
+        let page_gpa = fault_gpa & !(PAGE_SIZE - 1);
+
+        // Host-owned pages are classified first: a shared page belongs to
+        // the host, and an emulated MMIO region usually lies outside the RAM
+        // regions altogether. Serving either here would hand the guest a
+        // fresh private page behind the host's back.
+        if tvm
+            .shared_regions
+            .iter()
+            .flatten()
+            .any(|r| page_gpa >= r.gpa_base && page_gpa < r.gpa_base + r.len)
+        {
+            return DemandZero::HostPage;
+        }
+        if tvm
+            .mmio_regions
+            .iter()
+            .flatten()
+            .any(|r| page_gpa >= r.gpa_base && page_gpa < r.gpa_base + r.len)
+        {
+            return DemandZero::HostPage;
+        }
+        // Everything else must lie inside a reported memory region.
         let in_region = tvm
             .memory_regions
             .iter()
             .flatten()
-            .any(|r| fault_gpa >= r.gpa_base && fault_gpa < r.gpa_base + r.len);
+            .any(|r| page_gpa >= r.gpa_base && page_gpa < r.gpa_base + r.len);
         if !in_region {
-            return false;
+            return DemandZero::Refused;
+        }
+
+        // An occupied leaf is never a demand-zero candidate, and a pool that
+        // cannot link the tables must leave the fault to the host.
+        let needed = match tvm.page_table.plan_4k(page_gpa) {
+            Ok(needed) => needed,
+            Err(()) => return DemandZero::Refused,
+        };
+        if tvm.pt_page_count.saturating_sub(tvm.pt_page_used) < needed {
+            return DemandZero::Refused;
         }
 
         // Find a free page from the tracker
         let mut tracker = page_tracker();
         let free_page = match tracker.find_free_page() {
             Some(p) => p,
-            None => return false,
+            None => return DemandZero::Refused,
         };
+        // Backstop: a tracker entry outside host-allocatable memory must not
+        // reach the guest, even if the tracker is ever inconsistent.
+        if !is_host_range(free_page, PAGE_SIZE) {
+            return DemandZero::Refused;
+        }
 
         // Assign it to this TVM
         if !tracker.assign_page(free_page, PageState::AssignedPayload, tvm.id) {
-            return false;
+            return DemandZero::Refused;
         }
 
         // Zero-fill the page (demand-zero semantics)
@@ -1098,75 +1402,130 @@ impl TvmManager {
             core::ptr::write_bytes(free_page as *mut u8, 0, PAGE_SIZE);
         }
 
-        // Map in G-stage
-        let page_table = &tvm.page_table;
-        let pt_pages = tvm.pt_pages;
-        let pt_page_count = tvm.pt_page_count;
-        let pt_page_used = &mut tvm.pt_page_used;
-
-        let mut alloc_fn = || {
-            if *pt_page_used < pt_page_count {
-                let p = pt_pages[*pt_page_used];
-                *pt_page_used += 1;
-                Some(p)
-            } else {
-                None
-            }
-        };
-        page_table
-            .map_4k(fault_gpa, free_page, &mut alloc_fn)
-            .is_ok()
+        let mut pool =
+            page_table::PtPool::new(&tvm.pt_pages[..tvm.pt_page_count], &mut tvm.pt_page_used);
+        if tvm.page_table.map_4k(page_gpa, free_page, &mut pool).is_err() {
+            // Cannot happen after the plan above; undo the assignment so the
+            // refused fault does not leak the page.
+            tracker.unassign_page(free_page, tvm.id);
+            return DemandZero::Refused;
+        }
+        DemandZero::Served
     }
 
     // ---- New COVH FIDs ----
 
+    /// COVH FID 13 `add_tvm_shared_pages` (§10.15): maps host memory into a
+    /// shared region the TVM defined with COVG share.
     pub fn add_shared_pages(
         &mut self,
         tvm_id: usize,
-        src_paddr: usize,
-        dst_paddr: usize,
+        base_page_address: usize,
+        tsm_page_type: usize,
         num_pages: usize,
-        gpa: usize,
+        tvm_base_page_address: usize,
     ) -> SbiRet {
+        // Table 26 INVALID_PARAM: tvm_guest_id was invalid.
         let tvm = match self.active_tvm.as_mut() {
             Some(t) if t.id == tvm_id => t,
             _ => return SbiRet::invalid_param(),
         };
-        if gpa % PAGE_SIZE != 0 || num_pages == 0 {
-            return SbiRet::invalid_address();
+        // §10.15: shared pages can be added only after the TVM begins
+        // execution. Table 26 names no state error; invalid_param is the
+        // project mapping, as for the measured and zero-page handlers.
+        if tvm.state != TvmState::Runnable {
+            return SbiRet::invalid_param();
         }
-        // Shared pages must live in host-allocatable memory.
-        // Mapping TSM-private or MPT-pool pages into the guest would grant
-        // it read/write access to confidential memory through the host MPT.
-        let shared_len = match num_pages.checked_mul(PAGE_SIZE) {
-            Some(l) => l,
+        // Table 26 INVALID_PARAM covers an invalid tsm_page_type. Only 4 KiB
+        // pages are implemented: the larger enum values (PAGE_2MB, PAGE_1GB,
+        // PAGE_512GB) are legal but unsupported and answer not_supported, the
+        // way the measured and zero-page handlers do; anything else is not a
+        // legal enum value.
+        match tsm_page_type {
+            0 => {}
+            1..=3 => return SbiRet::not_supported(),
+            _ => return SbiRet::invalid_param(),
+        }
+        // Table 26 INVALID_PARAM: num_pages was invalid.
+        if num_pages == 0 {
+            return SbiRet::invalid_param();
+        }
+        let len = match num_pages.checked_mul(PAGE_SIZE) {
+            Some(len) => len,
             None => return SbiRet::invalid_param(),
         };
-        if !is_host_range(dst_paddr, shared_len) {
+        // Table 26 INVALID_ADDRESS: either address was invalid. Both are
+        // page-granular.
+        if base_page_address % PAGE_SIZE != 0 || tvm_base_page_address % PAGE_SIZE != 0 {
             return SbiRet::invalid_address();
         }
-        let page_table = &tvm.page_table;
-        let pt_pages = tvm.pt_pages;
-        let pt_page_count = tvm.pt_page_count;
-        let pt_page_used = &mut tvm.pt_page_used;
-
+        // The GPA range must be representable in the Sv39x4 G-stage.
+        let gpa_end = match tvm_base_page_address.checked_add(len) {
+            Some(end) if end <= (1usize << 41) => end,
+            _ => return SbiRet::invalid_address(),
+        };
+        // §10.15: the GPA range must lie within a region of non-confidential
+        // memory the TVM defined via the guest interface.
+        let in_shared = tvm
+            .shared_regions
+            .iter()
+            .flatten()
+            .any(|r| tvm_base_page_address >= r.gpa_base && gpa_end <= r.gpa_base + r.len);
+        if !in_shared {
+            return SbiRet::invalid_address();
+        }
+        // The pages handed in must be host-allocatable memory: mapping the
+        // TSM image or the MPT pool would expose confidential memory.
+        if !is_host_range(base_page_address, len) {
+            return SbiRet::invalid_address();
+        }
+        // A confidential page is not a valid base_page_address: no tracked
+        // page may overlap the range.
+        let tracker = page_tracker();
+        if !tracker.range_is_untracked(base_page_address, num_pages) {
+            return SbiRet::invalid_address();
+        }
+        // The pages handed in must not already be mapped into this TVM: one
+        // host page is never mapped at two guest addresses.
+        if tvm.page_table.maps_any(base_page_address, len) {
+            return SbiRet::invalid_address();
+        }
+        // Only empty leaves can receive a shared mapping. Table 26's
+        // INVALID_PARAM row names only tvm_guest_id, tsm_page_type and
+        // num_pages, so an occupied address is an invalid
+        // tvm_base_page_address.
         for i in 0..num_pages {
-            let cur_gpa = gpa + i * PAGE_SIZE;
-            let spa = dst_paddr + i * PAGE_SIZE;
-            let mut alloc_fn = || {
-                if *pt_page_used < pt_page_count {
-                    let p = pt_pages[*pt_page_used];
-                    *pt_page_used += 1;
-                    Some(p)
-                } else {
-                    None
-                }
-            };
-            if page_table.map_4k(cur_gpa, spa, &mut alloc_fn).is_err() {
-                return SbiRet::failed();
+            let gpa = tvm_base_page_address + i * PAGE_SIZE;
+            if tvm.page_table.leaf_4k(gpa).is_some_and(|pte| pte != 0) {
+                return SbiRet::invalid_address();
             }
         }
-        let _ = src_paddr; // src is the Host-side physical addr, already accessible
+        // Reserve the page tables for the whole range before the first
+        // write; a short pool must leave the table untouched.
+        let needed = match tvm.page_table.plan_range_4k(tvm_base_page_address, num_pages) {
+            Ok(needed) => needed,
+            Err(()) => return SbiRet::failed(),
+        };
+        if tvm.pt_page_count.saturating_sub(tvm.pt_page_used) < needed {
+            return SbiRet::failed();
+        }
+
+        for i in 0..num_pages {
+            let gpa = tvm_base_page_address + i * PAGE_SIZE;
+            let spa = base_page_address + i * PAGE_SIZE;
+            // The whole range was planned and the pool supplies it, so the
+            // mapping cannot fail.
+            let mut pool =
+                page_table::PtPool::new(&tvm.pt_pages[..tvm.pt_page_count], &mut tvm.pt_page_used);
+            // Shared memory is untrusted: the leaf is never executable
+            // (CoVE §5.2.3).
+            tvm.page_table
+                .map_4k_nx(gpa, spa, &mut pool)
+                .expect("page tables planned before the first write");
+        }
+        unsafe {
+            core::arch::asm!("hfence.gvma");
+        }
         SbiRet::success(0)
     }
 
@@ -1181,20 +1540,31 @@ impl TvmManager {
         SbiRet::success(0)
     }
 
+    /// COVH FID 17 `tvm_invalidate_pages` (§10.19): blocks present shared
+    /// mappings in the range so the TVM can no longer access them.
     pub fn tvm_invalidate_pages(&mut self, tvm_id: usize, gpa: usize, length: usize) -> SbiRet {
         let tvm = match self.active_tvm.as_mut() {
-            Some(t) if t.id == tvm_id => t,
-            _ => return SbiRet::invalid_param(),
+            Some(t) => t,
+            None => return SbiRet::invalid_param(),
         };
-        if gpa % PAGE_SIZE != 0 || length == 0 || length % PAGE_SIZE != 0 {
-            return SbiRet::invalid_address();
+        if let Err(ret) = check_trio_range(tvm, tvm_id, gpa, length) {
+            return ret;
         }
         let num_pages = length / PAGE_SIZE;
+        let tracker = page_tracker();
+        // Whole-range preflight: no leaf changes before every page passes.
         for i in 0..num_pages {
-            let cur_gpa = gpa + i * PAGE_SIZE;
-            if tvm.page_table.invalidate_4k(cur_gpa).is_err() {
-                return SbiRet::invalid_address();
+            match classify_shared_page(tvm, &tracker, gpa + i * PAGE_SIZE) {
+                Err(ret) => return ret,
+                Ok(SharedPage::Present) => {}
+                // Table 30: "gpa was invalid" when the page is not present.
+                Ok(_) => return SbiRet::invalid_address(),
             }
+        }
+        for i in 0..num_pages {
+            tvm.page_table
+                .invalidate_4k(gpa + i * PAGE_SIZE)
+                .expect("page class checked before the first write");
         }
         unsafe {
             core::arch::asm!("hfence.gvma");
@@ -1202,20 +1572,30 @@ impl TvmManager {
         SbiRet::success(0)
     }
 
+    /// COVH FID 18 `tvm_validate_pages` (§10.20): restores mappings the host
+    /// invalidated, including those it invalidated only to remove them.
     pub fn tvm_validate_pages(&mut self, tvm_id: usize, gpa: usize, length: usize) -> SbiRet {
         let tvm = match self.active_tvm.as_mut() {
-            Some(t) if t.id == tvm_id => t,
-            _ => return SbiRet::invalid_param(),
+            Some(t) => t,
+            None => return SbiRet::invalid_param(),
         };
-        if gpa % PAGE_SIZE != 0 || length == 0 || length % PAGE_SIZE != 0 {
-            return SbiRet::invalid_address();
+        if let Err(ret) = check_trio_range(tvm, tvm_id, gpa, length) {
+            return ret;
         }
-
         let num_pages = length / PAGE_SIZE;
+        let tracker = page_tracker();
         for i in 0..num_pages {
-            if tvm.page_table.validate_4k(gpa + i * PAGE_SIZE).is_err() {
-                return SbiRet::invalid_address();
+            match classify_shared_page(tvm, &tracker, gpa + i * PAGE_SIZE) {
+                Err(ret) => return ret,
+                Ok(SharedPage::Retained) => {}
+                // Table 31: "gpa was invalid" unless §10.19 invalidated it.
+                Ok(_) => return SbiRet::invalid_address(),
             }
+        }
+        for i in 0..num_pages {
+            tvm.page_table
+                .validate_4k(gpa + i * PAGE_SIZE)
+                .expect("page class checked before the first write");
         }
         unsafe {
             core::arch::asm!("hfence.gvma");
@@ -1223,27 +1603,33 @@ impl TvmManager {
         SbiRet::success(0)
     }
 
+    /// COVH FID 19 `tvm_remove_pages` (§10.21): clears mappings the host
+    /// invalidated and fenced. The pages stay host memory, so the tracker is
+    /// not involved.
     pub fn tvm_remove_pages(&mut self, tvm_id: usize, gpa: usize, length: usize) -> SbiRet {
         let tvm = match self.active_tvm.as_mut() {
-            Some(t) if t.id == tvm_id => t,
-            _ => return SbiRet::invalid_param(),
+            Some(t) => t,
+            None => return SbiRet::invalid_param(),
         };
-        if gpa % PAGE_SIZE != 0 || length == 0 || length % PAGE_SIZE != 0 {
-            return SbiRet::invalid_address();
+        if let Err(ret) = check_trio_range(tvm, tvm_id, gpa, length) {
+            return ret;
         }
-
-        // Find and release the SPA pages back to the free pool
-        let mut tracker = page_tracker();
         let num_pages = length / PAGE_SIZE;
+        let tracker = page_tracker();
         for i in 0..num_pages {
-            let cur_gpa = gpa + i * PAGE_SIZE;
-            // Removal is only legal after invalidate + fence, so require a retained PTE.
-            if let Ok(spa) = tvm.page_table.remove_invalid_4k(cur_gpa) {
-                // Return page to free pool
-                tracker.release_page(spa, tvm_id);
-            } else {
-                return SbiRet::invalid_address();
+            match classify_shared_page(tvm, &tracker, gpa + i * PAGE_SIZE) {
+                Err(ret) => return ret,
+                Ok(SharedPage::Retained) => {}
+                // Table 32: "gpa was invalid" unless it was invalidated and
+                // fenced before the call.
+                Ok(_) => return SbiRet::invalid_address(),
             }
+        }
+        for i in 0..num_pages {
+            let _ = tvm
+                .page_table
+                .remove_invalid_4k(gpa + i * PAGE_SIZE)
+                .expect("page class checked before the first write");
         }
         unsafe {
             core::arch::asm!("hfence.gvma");
@@ -1315,6 +1701,65 @@ impl TvmManager {
     }
 }
 
+/// Common argument checks of the invalidate/validate/remove trio (§10.19 to
+/// §10.21, Tables 30-32): a bad id or length is INVALID_PARAM, a bad `gpa` is
+/// INVALID_ADDRESS.
+fn check_trio_range(tvm: &Tvm, tvm_id: usize, gpa: usize, length: usize) -> Result<(), SbiRet> {
+    if tvm.id != tvm_id {
+        return Err(SbiRet::invalid_param());
+    }
+    if length == 0 || length % PAGE_SIZE != 0 {
+        return Err(SbiRet::invalid_param());
+    }
+    if gpa % PAGE_SIZE != 0 {
+        return Err(SbiRet::invalid_address());
+    }
+    match gpa.checked_add(length) {
+        Some(end) if end <= (1usize << 41) => Ok(()),
+        _ => Err(SbiRet::invalid_address()),
+    }
+}
+
+/// Per-page preflight of the invalidate/validate/remove trio.
+///
+/// The trio is the host's tool for removing shared pages, so a page outside
+/// every shared region is INVALID_PARAM (project policy). This TSM tears
+/// confidential pages down only by destroying the TVM, which is narrower than
+/// §10.19's "uniquely owned by the TVM" branch. A present leaf that maps a
+/// tracked page is refused by the same code as a defence: it is a
+/// confidential mapping, not a shared page.
+fn classify_shared_page(
+    tvm: &Tvm,
+    tracker: &PageTracker,
+    gpa: usize,
+) -> Result<SharedPage, SbiRet> {
+    let in_shared = tvm
+        .shared_regions
+        .iter()
+        .flatten()
+        .any(|r| gpa >= r.gpa_base && gpa < r.gpa_base + r.len);
+    if !in_shared {
+        return Err(SbiRet::invalid_param());
+    }
+    match tvm.page_table.leaf_4k(gpa) {
+        None | Some(0) => Ok(SharedPage::Absent),
+        Some(pte) if leaf_is_present(pte) => {
+            if tracker.lookup(leaf_pa(pte)).is_some() {
+                return Err(SbiRet::invalid_param());
+            }
+            Ok(SharedPage::Present)
+        }
+        Some(pte) => {
+            // A retained entry is still a mapping the host may re-validate,
+            // so its page must stay host memory as well.
+            if tracker.lookup(leaf_pa(pte)).is_some() {
+                return Err(SbiRet::invalid_param());
+            }
+            Ok(SharedPage::Retained)
+        }
+    }
+}
+
 /// Shared TVM manager.
 ///
 /// The mutex is only ever held for short configuration operations
@@ -1341,6 +1786,10 @@ pub fn run_tvm_vcpu(tvm_id: usize, vcpu_id: usize) -> SbiRet {
             Some(t) if t.id == tvm_id => t,
             _ => return SbiRet::invalid_param(),
         };
+        // Table 28 INVALID_PARAM: the TVM "wasn't in TVM_RUNNABLE state". A
+        // poisoned TVM never runs again (§12.3 blocks the vCPU whose share
+        // could not be completed), so it is answered here like any other
+        // non-runnable TVM.
         if tvm.state != TvmState::Runnable {
             return SbiRet::invalid_param();
         }
@@ -1366,17 +1815,32 @@ pub fn run_tvm_vcpu(tvm_id: usize, vcpu_id: usize) -> SbiRet {
 
     let res = vcpu.run();
     let exit_reason = vcpu.ctx.last_exit.reason;
+    let exit_page = vcpu.ctx.last_exit.gpa & !(PAGE_SIZE - 1);
 
     let mut mgr = tvm_manager();
-    match mgr.active_tvm.as_mut() {
+    let tvm = match mgr.active_tvm.as_mut() {
         // The TVM must still be the one the vCPU was detached from; a
         // concurrent destroy while detached is a torn state, reported as
         // a failed run.
-        Some(t) if t.id == tvm_id => t.vcpu = Some(vcpu),
+        Some(t) if t.id == tvm_id => t,
         _ => return SbiRet::failed(),
+    };
+    tvm.vcpu = Some(vcpu);
+    // A run that poisoned the TVM (a COVG share it could not roll back) is
+    // reported as a failed run and the TVM never runs again.
+    if tvm.state == TvmState::Poisoned {
+        return SbiRet::failed();
     }
     if res == 0 {
-        SbiRet::success(exit_reason)
+        // The reason occupies the low seven bits; a host-owned page fault
+        // carries the faulting guest page address above them so the host
+        // knows which page to service.
+        let value = if exit_reason == vcpu::EXIT_GUEST_PAGE_FAULT {
+            (exit_page << 7) | exit_reason
+        } else {
+            exit_reason
+        };
+        SbiRet::success(value)
     } else {
         SbiRet::failed()
     }

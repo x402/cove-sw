@@ -1,5 +1,7 @@
 use core::arch::global_asm;
 
+use crate::tvm::{DemandZero, ShareOutcome, UnshareOutcome};
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct ExitInfo {
@@ -128,7 +130,9 @@ unsafe extern "C" {
 pub const TRAP_ACTION_RESUME: usize = 0;
 pub const TRAP_ACTION_EXIT: usize = 1;
 
-// Exit reasons reported to Host via sbi_covh_run_tvm_vcpu return value
+// Exit reasons reported to the host in bits 0-6 of the value returned by
+// sbi_covh_run_tvm_vcpu. For [`EXIT_GUEST_PAGE_FAULT`] the remaining bits
+// carry the faulting guest page address: `value >> 7`.
 pub const EXIT_CLEAN: usize = 0;
 pub const EXIT_COVG_SHARE: usize = 1;
 pub const EXIT_COVG_UNSHARE: usize = 2;
@@ -139,11 +143,28 @@ pub const EXIT_UNEXPECTED_TRAP: usize = 5;
 pub const EXIT_COVG_ALLOW_EXT: usize = 6;
 /// COVG FID 5 (`deny_external_interrupt`): recorded, then resumed.
 pub const EXIT_COVG_DENY_EXT: usize = 7;
+/// A guest faulted on a page the host owns: a shared region the host has not
+/// populated yet, or an MMIO region. The host must service it and resume;
+/// `value >> 7` of the run result is the faulting guest page address.
+pub const EXIT_GUEST_PAGE_FAULT: usize = 8;
 
 /// COVG external-interrupt sentinel: all identities at once (CoVE §12.5).
 const EXT_INTERRUPT_ALL: usize = usize::MAX;
 
 const EID_COVG: usize = 0x434F5647;
+
+// SBI error codes returned to the guest in a0.
+const SBI_ERR_FAILED: usize = (-1isize) as usize;
+const SBI_ERR_INVALID_PARAM: usize = (-3isize) as usize;
+const SBI_ERR_INVALID_ADDRESS: usize = (-5isize) as usize;
+
+/// Resumes the guest as if the ecall had returned `error` in a0 and 0 in a1.
+fn resume_with_sbi_error(ctx: &mut GuestContext, error: usize) -> usize {
+    ctx.gprs[10] = error; // a0
+    ctx.gprs[11] = 0; // a1
+    ctx.sepc += 4;
+    TRAP_ACTION_RESUME
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn handle_guest_trap(ctx: *mut GuestContext) -> usize {
@@ -197,25 +218,65 @@ pub extern "C" fn handle_guest_trap(ctx: *mut GuestContext) -> usize {
                     return TRAP_ACTION_EXIT;
                 }
                 2 => {
-                    // SHARE_MEMORY_REGION: unmap G-stage, grant Host MPT access
-                    let ok = crate::tvm::tvm_manager().share_memory_internal(gpa, len);
-                    ctx_ref.sepc += 4;
-                    let e = &mut ctx_ref.last_exit;
-                    e.reason = EXIT_COVG_SHARE;
-                    e.gpa = gpa;
-                    e.len = len;
-                    let _ = ok; // Even if partial, still exit so host can inspect
-                    return TRAP_ACTION_EXIT;
+                    // SHARE_MEMORY_REGION (§12.3): the TSM scrubs the
+                    // populated pages, hands them to the host and cuts them
+                    // out of the TVM.
+                    let outcome = crate::tvm::tvm_manager().share_memory_internal(gpa, len);
+                    match outcome {
+                        ShareOutcome::Shared | ShareOutcome::Poisoned => {
+                            // The request was accepted, so the guest sees
+                            // SBI_SUCCESS when the host resumes it (Table 46).
+                            ctx_ref.gprs[10] = 0; // a0
+                            ctx_ref.gprs[11] = 0; // a1
+                            ctx_ref.sepc += 4;
+                            let e = &mut ctx_ref.last_exit;
+                            e.reason = EXIT_COVG_SHARE;
+                            e.gpa = gpa;
+                            e.len = len;
+                            return TRAP_ACTION_EXIT;
+                        }
+                        // Table 46's errors are answered to the guest: only a
+                        // request the TSM accepted is forwarded to the host.
+                        ShareOutcome::BadAddress => {
+                            return resume_with_sbi_error(ctx_ref, SBI_ERR_INVALID_ADDRESS)
+                        }
+                        ShareOutcome::BadParam => {
+                            return resume_with_sbi_error(ctx_ref, SBI_ERR_INVALID_PARAM)
+                        }
+                        ShareOutcome::Failed => {
+                            return resume_with_sbi_error(ctx_ref, SBI_ERR_FAILED)
+                        }
+                    }
                 }
                 3 => {
-                    // UNSHARE_MEMORY_REGION
-                    crate::tvm::tvm_manager().unshare_memory_internal(gpa, len);
-                    ctx_ref.sepc += 4;
-                    let e = &mut ctx_ref.last_exit;
-                    e.reason = EXIT_COVG_UNSHARE;
-                    e.gpa = gpa;
-                    e.len = len;
-                    return TRAP_ACTION_EXIT;
+                    // UNSHARE_MEMORY_REGION (§12.4): the TSM unmaps the pages
+                    // the host had mapped into the range.
+                    let outcome = crate::tvm::tvm_manager().unshare_memory_internal(gpa, len);
+                    match outcome {
+                        UnshareOutcome::Unshared => {
+                            // The request was accepted, so the guest sees
+                            // SBI_SUCCESS when the host resumes it (Table 47).
+                            ctx_ref.gprs[10] = 0; // a0
+                            ctx_ref.gprs[11] = 0; // a1
+                            ctx_ref.sepc += 4;
+                            let e = &mut ctx_ref.last_exit;
+                            e.reason = EXIT_COVG_UNSHARE;
+                            e.gpa = gpa;
+                            e.len = len;
+                            return TRAP_ACTION_EXIT;
+                        }
+                        // Table 47's errors are answered to the guest, for the
+                        // same reason as Table 46's above.
+                        UnshareOutcome::BadAddress => {
+                            return resume_with_sbi_error(ctx_ref, SBI_ERR_INVALID_ADDRESS)
+                        }
+                        UnshareOutcome::BadParam => {
+                            return resume_with_sbi_error(ctx_ref, SBI_ERR_INVALID_PARAM)
+                        }
+                        UnshareOutcome::Failed => {
+                            return resume_with_sbi_error(ctx_ref, SBI_ERR_FAILED)
+                        }
+                    }
                 }
                 4 | 5 => {
                     // COVG allow/deny external interrupt (§12.5/§12.6).
@@ -265,24 +326,46 @@ pub extern "C" fn handle_guest_trap(ctx: *mut GuestContext) -> usize {
         return TRAP_ACTION_EXIT;
     }
 
-    // Guest page/access faults:
-    // scause 13: Guest load page fault
-    // scause 15: Guest store/AMO page fault
-    // scause 22: Guest load access fault (MPT denied at G-stage)
-    // scause 23: Guest store/AMO access fault (MPT denied at G-stage)
-    if scause == 13 || scause == 15 || scause == 22 || scause == 23 {
+    // Guest-page faults (RISC-V Privileged Architecture §5.6): while the
+    // guest runs, a page fault is reported as a guest-page fault instead of
+    // a page fault (§5.5), and htval carries the faulting guest physical
+    // address shifted right by 2 bits. An address without a G-stage leaf,
+    // such as a page the guest unshared, faults this way.
+    // scause 21: load guest-page fault
+    // scause 23: store/AMO guest-page fault
+    // Every other trap, including scause 22 (virtual instruction), falls
+    // through to the generic report below.
+    if scause == 21 || scause == 23 {
         let fault_gpa = ctx_ref.htval << 2;
-        let handled = crate::tvm::tvm_manager().handle_demand_zero(fault_gpa);
-        if handled {
-            return TRAP_ACTION_RESUME;
+        // Privileged Architecture §5.5.2: htval holds "either zero or" the
+        // faulting guest physical address. Without an address there is no
+        // page to serve, so fall through to the generic report.
+        if fault_gpa != 0 {
+            match crate::tvm::tvm_manager().handle_demand_zero(fault_gpa) {
+                DemandZero::Served => return TRAP_ACTION_RESUME,
+                DemandZero::HostPage => {
+                    crate::println!(
+                        "[TSM] Guest fault on a host-owned page: gpa=0x{:x}, scause={}",
+                        fault_gpa,
+                        scause
+                    );
+                    let e = &mut ctx_ref.last_exit;
+                    e.reason = EXIT_GUEST_PAGE_FAULT;
+                    e.gpa = fault_gpa;
+                    e.len = 0;
+                    return TRAP_ACTION_EXIT;
+                }
+                DemandZero::Refused => {
+                    crate::println!(
+                        "[TSM] Unhandled guest page fault: gpa=0x{:x}, scause={}",
+                        fault_gpa,
+                        scause
+                    );
+                    ctx_ref.last_exit.reason = EXIT_UNEXPECTED_TRAP;
+                    return TRAP_ACTION_EXIT;
+                }
+            }
         }
-        crate::println!(
-            "[TSM] Unhandled guest page fault: gpa=0x{:x}, scause={}",
-            fault_gpa,
-            scause
-        );
-        ctx_ref.last_exit.reason = EXIT_UNEXPECTED_TRAP;
-        return TRAP_ACTION_EXIT;
     }
 
     crate::println!(

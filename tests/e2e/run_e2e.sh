@@ -34,11 +34,9 @@ FIRMWARE="$RUSTSBI_ROOT/target/riscv64gc-unknown-none-elf/release/rustsbi-protot
 # - MARKER 03 is printed by the TSM on RDSM's behalf right before its
 #   TSM_READY TEERET (UART output inside RDSM trap handlers mid
 #   domain-switch proved unstable).
-# - MARKER 10-13 map onto test-guest's existing output lines: growing the
-#   guest binary by extra marker strings currently destabilises the
-#   guest/firmware interaction (see phase-5.5 follow-up), so the guest
-#   binary is kept byte-identical to the phase-4 baseline and its existing
-#   lifecycle lines are matched instead.
+# - MARKER 10-13 map onto test-guest's existing output lines instead of
+#   dedicated marker strings, so the guest output stays close to its
+#   baseline and only its lifecycle lines are matched.
 #
 # MARKER_PROFILE selects the marker set:
 #   full    (default) all 24 markers — complete TEECALL/TEERET lifecycle
