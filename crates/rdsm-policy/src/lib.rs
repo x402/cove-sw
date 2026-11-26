@@ -384,14 +384,79 @@ pub fn rdsm_sidn_allocator() -> spin::MutexGuard<'static, SidnAllocator> {
     SIDN_ALLOCATOR.lock()
 }
 
-/// Serializes MPT tree updates through the shared page pool.
+/// The firmware-wide MPT page pool.
 ///
-/// [`rdsm_mech::MptBumpAlloc`] instances handed to `MptTree::set_perm` carve
-/// pages from the reserved pool; two concurrent updates (e.g. MPT_SET from
-/// two harts) must not interleave their allocations.
-static MPT_UPDATE_LOCK: Mutex<()> = Mutex::new(());
+/// Every page the MPT trees consume — both boot roots and every runtime
+/// update — comes from this one bump allocator over the reserved pool. The
+/// guard serialises tree updates between harts and owns the allocator
+/// cursor, so concurrent updates cannot interleave their allocations and no
+/// second allocator instance can hand out a page that already belongs to a
+/// table.
+static MPT_PAGE_POOL: Mutex<rdsm_mech::MptBumpAlloc> = Mutex::new(rdsm_mech::MptBumpAlloc::new(
+    rdsm_mech::MPT_PAGE_POOL_PADDR,
+    rdsm_mech::MPT_PAGE_POOL_SIZE,
+));
+
+/// Returns the guard on the shared MPT page pool.
+fn mpt_page_pool() -> spin::MutexGuard<'static, rdsm_mech::MptBumpAlloc> {
+    MPT_PAGE_POOL.lock()
+}
+
+// ── Fatal bring-up failure ─────────────────────────────────────────────
+
+/// Reports a fatal bring-up failure and parks the calling hart.
+///
+/// Used once the CoVE payload images are in RAM: returning from [`init`] at
+/// that point would let the firmware jump into a TSM whose memory is not
+/// protected by any MPT.
+fn fail_stop(msg: &str) -> ! {
+    error!("RDSM: {}", msg);
+    park_forever()
+}
+
+/// Reports a bring-up failure that leaves the substrate unusable. With a
+/// CoVE payload in RAM the hart parks ([`fail_stop`]); without one the
+/// caller returns and the substrate stays inactive.
+fn report_boot_failure(is_cove: bool, msg: &str) {
+    if is_cove {
+        fail_stop(msg);
+    }
+    error!("RDSM: {}", msg);
+}
+
+/// Applies the result of a boot-time MPT update. Returns `false` when the
+/// update failed and no CoVE payload is in RAM: the caller then returns with
+/// the substrate inactive and `mmpt` still in Bare mode, exactly as on
+/// hardware without Smmpt. With a payload in RAM the hart parks instead:
+/// a half-built tree would leave the TSM unprotected.
+fn boot_perm(is_cove: bool, what: &str, result: Result<(), rdsm::mpt::MptError>) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(err) => {
+            error!("RDSM: {}: MPT update failed: {:?}", what, err);
+            if is_cove {
+                park_forever();
+            }
+            false
+        }
+    }
+}
+
+/// Stops the calling hart for good.
+fn park_forever() -> ! {
+    loop {
+        #[cfg(target_arch = "riscv64")]
+        riscv::asm::wfi();
+        #[cfg(not(target_arch = "riscv64"))]
+        core::hint::spin_loop();
+    }
+}
 
 // ── RDSM initialization ────────────────────────────────────────────────
+
+/// ABI types re-exported for the embedding firmware (`RdsmPlatformInfo`
+/// construction in the prototyper's RDSM shim).
+pub use rdsm_abi::{RdsmImsicGeometry, RdsmPlatformInfo};
 
 /// Initialize the Supervisor Domain substrate on the boot hart.
 ///
@@ -406,19 +471,26 @@ static MPT_UPDATE_LOCK: Mutex<()> = Mutex::new(());
 ///    `MFENCE.PA`.
 /// 5. Switches to the host interrupt domain by setting `msdcfg.SIDN = 0`.
 ///
-/// The MPT tree is intentionally leaked - it must persist for the
-/// firmware's lifetime.
+/// Both MPT trees stay live for the firmware's lifetime: their root PPNs are
+/// recorded in the global context and every page comes from the pool that is
+/// never reclaimed.
+///
+/// # Failure handling
+///
+/// Once a CoVE payload has been loaded, the TSM and host images are already
+/// in RAM and [`RdsmContext::is_cove`] is set, so returning here would let
+/// the firmware launch a TSM with no protected memory. Every failure after
+/// that point therefore parks the calling hart in [`fail_stop`] instead of
+/// returning. Without a payload every failure logs and returns, leaving the
+/// substrate inactive with `mmpt` in Bare mode.
 ///
 /// # Boot Flow Ordering
 ///
-/// Must be called after the firmware has set up PMP on the boot hart.
-/// Non-boot harts will have their `mmpt` CSRs left in Bare mode (reset
-/// state) and must be programmed with the host MPT root before MPT
-/// restrictions are enforced in future phases.
-/// ABI types re-exported for the embedding firmware (`RdsmPlatformInfo`
-/// construction in the prototyper's RDSM shim).
-pub use rdsm_abi::{RdsmImsicGeometry, RdsmPlatformInfo};
-
+/// Must be called after the firmware has set up PMP on the boot hart. Only
+/// the calling hart gets its `mmpt` programmed here; every other hart keeps
+/// the reset Bare mode, under which the MPT restricts nothing.
+/// TODO(multi-hart): program the other harts with the host MPT root before
+/// they run supervisor code.
 pub fn init<P: rdsm::probe::TrapSafeCsr>(env: InitEnv<'_, P>) {
     use rdsm::{
         domain::activate_domain,
@@ -432,19 +504,23 @@ pub fn init<P: rdsm::probe::TrapSafeCsr>(env: InitEnv<'_, P>) {
         let r_ctx = context_mut();
         r_ctx.hart_id = env.hart_id;
         r_ctx.ram_range = env.ram_range;
-                // Open the Smstateen AIA/CSRIND/IMSIC gates for supervisor and VS
+        // Open the Smstateen AIA/CSRIND/IMSIC gates for supervisor and VS
         // accesses: the COVI indirect-window path (TSM and guest) traps
         // with them closed. M-mode is the only writer of these CSRs, so
         // this runs here at substrate init rather than in the TSM.
         rdsm_mech::open_aia_stateen_gates();
-r_ctx.supervisor_imsic = env.supervisor_imsic;
+        r_ctx.supervisor_imsic = env.supervisor_imsic;
     }
 
-    // Check and load CoVE payload if present
+    // Check and load CoVE payload if present. From here on a failure with a
+    // payload loaded must not return: the images are already in RAM.
     let is_cove = load_cove_payload(env.payload_base);
 
     // Check if RDSM extensions are detected via device tree.
     if !env.dt_smsdid {
+        if is_cove {
+            fail_stop("Smsdid not detected while a CoVE payload is loaded");
+        }
         info!("RDSM: Smsdid not detected, skipping RDSM initialization");
         return;
     }
@@ -464,6 +540,9 @@ r_ctx.supervisor_imsic = env.supervisor_imsic;
 
     // Probe hardware support via CSR access.
     if !probe_smsdid(probe) {
+        if is_cove {
+            fail_stop("mmpt CSR not readable while a CoVE payload is loaded");
+        }
         warn!("RDSM: mmpt CSR not readable, Smsdid not implemented in hardware");
         return;
     }
@@ -471,6 +550,9 @@ r_ctx.supervisor_imsic = env.supervisor_imsic;
     let mpt_mode = match probe_smmpt(&mut *probe) {
         Some(mode) => mode,
         None => {
+            if is_cove {
+                fail_stop("no Smmpt mode supported while a CoVE payload is loaded");
+            }
             warn!("RDSM: No Smmpt mode supported, skipping MPT initialization");
             return;
         }
@@ -522,23 +604,24 @@ r_ctx.supervisor_imsic = env.supervisor_imsic;
     register_sidn_owner(host_sidn, host_sdid);
     register_sidn_owner(conf_sidn, conf_sdid);
 
-    // Create MPT page allocator from the reserved pool.
-    let mut mpt_alloc = rdsm_mech::MptBumpAlloc::from_pool();
+    // Both roots and every intermediate table below come from the one
+    // firmware-wide pool; holding its guard keeps the cursor with this build.
+    let mut pool = mpt_page_pool();
 
     // Build the confidential MPT tree (MPT_CONF, SDID=1).
-    let mut conf_tree = match MptTree::new(mpt_mode, &mut mpt_alloc) {
+    let mut conf_tree = match MptTree::new(mpt_mode, &mut *pool) {
         Some(tree) => tree,
         None => {
-            error!("RDSM: Failed to allocate MPT_CONF root page");
+            report_boot_failure(is_cove, "failed to allocate the MPT_CONF root page");
             return;
         }
     };
 
     // Build the host MPT tree (MPT_HOST, SDID=0).
-    let mut host_tree = match MptTree::new(mpt_mode, &mut mpt_alloc) {
+    let mut host_tree = match MptTree::new(mpt_mode, &mut *pool) {
         Some(tree) => tree,
         None => {
-            error!("RDSM: Failed to allocate MPT_HOST root page");
+            report_boot_failure(is_cove, "failed to allocate the MPT_HOST root page");
             return;
         }
     };
@@ -548,10 +631,13 @@ r_ctx.supervisor_imsic = env.supervisor_imsic;
     // Only the platform's memory region is covered to keep page-pool
     // usage bounded.  Full address-space coverage (0 ... usize::MAX) requires
     // NAPOT support and is deferred.
+    //
+    // A CoVE payload can only have been loaded after its load regions were
+    // checked against this range, so this is the no-payload path.
     let (ram_start, ram_end) = match env.ram_range {
         Some(range) => range,
         None => {
-            error!("RDSM: Platform memory range not initialized");
+            report_boot_failure(is_cove, "Platform memory range not initialized");
             return;
         }
     };
@@ -563,17 +649,35 @@ r_ctx.supervisor_imsic = env.supervisor_imsic;
 
     // Low memory (MMIO, firmware data below main RAM, e.g. 0..0x80000000).
     if ram_start > 0 {
-        conf_tree.set_perm(0, ram_start, MptPerm::RWX, &mut mpt_alloc);
-        host_tree.set_perm(0, ram_start, MptPerm::RWX, &mut mpt_alloc);
+        if !boot_perm(
+            is_cove,
+            "MPT_CONF low memory",
+            conf_tree.set_perm(0, ram_start, MptPerm::RWX, &mut *pool),
+        ) {
+            return;
+        }
+        if !boot_perm(
+            is_cove,
+            "MPT_HOST low memory",
+            host_tree.set_perm(0, ram_start, MptPerm::RWX, &mut *pool),
+        ) {
+            return;
+        }
     }
 
     // MPT_CONF (SDID=1): Full platform RAM range with RWX permissions.
-    conf_tree.set_perm(
-        ram_start,
-        ram_end.saturating_sub(ram_start),
-        MptPerm::RWX,
-        &mut mpt_alloc,
-    );
+    if !boot_perm(
+        is_cove,
+        "MPT_CONF platform RAM",
+        conf_tree.set_perm(
+            ram_start,
+            ram_end.saturating_sub(ram_start),
+            MptPerm::RWX,
+            &mut *pool,
+        ),
+    ) {
+        return;
+    }
 
     // MPT_HOST (SDID=0):
     if is_cove {
@@ -583,41 +687,65 @@ r_ctx.supervisor_imsic = env.supervisor_imsic;
 
         // Platform RAM before TSM range: RWX
         if tsm_load_paddr > ram_start {
-            host_tree.set_perm(
-                ram_start,
-                tsm_load_paddr.saturating_sub(ram_start),
-                MptPerm::RWX,
-                &mut mpt_alloc,
-            );
+            if !boot_perm(
+                is_cove,
+                "MPT_HOST platform RAM before the TSM",
+                host_tree.set_perm(
+                    ram_start,
+                    tsm_load_paddr.saturating_sub(ram_start),
+                    MptPerm::RWX,
+                    &mut *pool,
+                ),
+            ) {
+                return;
+            }
         }
 
         // TSM memory range [tsm_load_paddr, host_load_paddr): NONE (inaccessible)
         if host_load_paddr > tsm_load_paddr {
-            host_tree.set_perm(
-                tsm_load_paddr,
-                host_load_paddr.saturating_sub(tsm_load_paddr),
-                MptPerm::NONE,
-                &mut mpt_alloc,
-            );
+            if !boot_perm(
+                is_cove,
+                "MPT_HOST TSM memory",
+                host_tree.set_perm(
+                    tsm_load_paddr,
+                    host_load_paddr.saturating_sub(tsm_load_paddr),
+                    MptPerm::NONE,
+                    &mut *pool,
+                ),
+            ) {
+                return;
+            }
         }
 
         // Platform RAM from host_load_paddr onwards: RWX
         if ram_end > host_load_paddr {
-            host_tree.set_perm(
-                host_load_paddr,
-                ram_end.saturating_sub(host_load_paddr),
-                MptPerm::RWX,
-                &mut mpt_alloc,
-            );
+            if !boot_perm(
+                is_cove,
+                "MPT_HOST platform RAM after the TSM",
+                host_tree.set_perm(
+                    host_load_paddr,
+                    ram_end.saturating_sub(host_load_paddr),
+                    MptPerm::RWX,
+                    &mut *pool,
+                ),
+            ) {
+                return;
+            }
         }
     } else {
         // Not a CoVE payload: full platform RAM with RWX
-        host_tree.set_perm(
-            ram_start,
-            ram_end.saturating_sub(ram_start),
-            MptPerm::RWX,
-            &mut mpt_alloc,
-        );
+        if !boot_perm(
+            is_cove,
+            "MPT_HOST platform RAM",
+            host_tree.set_perm(
+                ram_start,
+                ram_end.saturating_sub(ram_start),
+                MptPerm::RWX,
+                &mut *pool,
+            ),
+        ) {
+            return;
+        }
     }
 
     info!(
@@ -654,10 +782,9 @@ r_ctx.supervisor_imsic = env.supervisor_imsic;
         info!("RDSM: Host supervisor domain (SDID=0) activated, SIDN=0 set");
     }
 
-    // Intentional leak: the MPT trees must persist for the firmware's lifetime.
-    core::mem::forget(host_tree);
-    core::mem::forget(conf_tree);
-
+    // The trees stay live for the firmware's lifetime: their root PPNs are
+    // recorded in the context above and the pages come from a pool that is
+    // never reclaimed, so neither tree has anything to release here.
     context_mut().substrate_active = true;
     info!("RDSM: Initialization complete");
 }
@@ -822,17 +949,35 @@ fn mpt_set(args: [usize; 6]) -> SbiRet {
         };
     }
 
-    // The tree update draws pages from the shared MPT pool; hold the update
-    // lock so concurrent harts cannot interleave their pool allocations.
-    let _mpt_guard = MPT_UPDATE_LOCK.lock();
+    // The tree update draws its tables from the shared MPT pool; the pool
+    // guard serialises updates between harts and owns the allocator cursor.
+    let mut pool = mpt_page_pool();
     let mut tree = rdsm::mpt::MptTree::from_root(mode, root_ppn);
-    let mut alloc = rdsm_mech::MptBumpAlloc::from_pool();
-    tree.set_perm(paddr, len, perm, &mut alloc);
-    core::mem::forget(tree);
+    match tree.set_perm(paddr, len, perm, &mut *pool) {
+        Ok(()) => SbiRet {
+            error: SBI_SUCCESS,
+            value: 0,
+        },
+        Err(err) => SbiRet {
+            error: mpt_error_to_sbi(err),
+            value: 0,
+        },
+    }
+}
 
-    SbiRet {
-        error: SBI_SUCCESS,
-        value: 0,
+/// Maps an MPT update failure onto the private error channel of the
+/// RDSM_MPT_SET call.
+///
+/// Only a malformed request (an unaligned range) is the caller's fault;
+/// every other failure reports that the update could not be applied.
+fn mpt_error_to_sbi(err: rdsm::mpt::MptError) -> usize {
+    use rdsm::mpt::MptError;
+
+    match err {
+        MptError::InvalidRange => ERR_INVALID_PARAM,
+        MptError::AllocationFailed
+        | MptError::UnsupportedLeaf { .. }
+        | MptError::MalformedEntry { .. } => ERR_FAILED,
     }
 }
 
@@ -1353,5 +1498,31 @@ pub mod switch {
             // Leave the substrate down for the rest of the test binary.
             context_mut().substrate_active = false;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rdsm::mpt::MptError;
+
+    use super::{ERR_FAILED, ERR_INVALID_PARAM, SBI_NOT_SUPPORTED, mpt_error_to_sbi};
+
+    #[test]
+    fn mpt_error_mapping() {
+        // A malformed request is the caller's fault.
+        assert_eq!(mpt_error_to_sbi(MptError::InvalidRange), ERR_INVALID_PARAM);
+        // Everything else means the update could not be applied.
+        assert_eq!(mpt_error_to_sbi(MptError::AllocationFailed), ERR_FAILED);
+        assert_eq!(
+            mpt_error_to_sbi(MptError::UnsupportedLeaf { level: 1 }),
+            ERR_FAILED
+        );
+        assert_eq!(
+            mpt_error_to_sbi(MptError::MalformedEntry { level: 0 }),
+            ERR_FAILED
+        );
+        // The private codes stay clear of the standard SBI ones.
+        assert_ne!(ERR_INVALID_PARAM, SBI_NOT_SUPPORTED);
+        assert_ne!(ERR_FAILED, SBI_NOT_SUPPORTED);
     }
 }

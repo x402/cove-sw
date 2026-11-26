@@ -14,6 +14,10 @@
 //! only the CSR half ([`DomainCsrs`]) is saved/restored here.
 
 #![no_std]
+#![cfg_attr(test, allow(unused_extern_crates))]
+
+#[cfg(test)]
+extern crate std;
 
 use core::cell::UnsafeCell;
 
@@ -482,9 +486,14 @@ pub fn open_aia_stateen_gates() {
 /// A simple bump-pointer allocator that hands out 4 KiB pages from a
 /// contiguous physical memory region.
 ///
-/// Pages are never reclaimed (`free_page` is a no-op).  This is sufficient
-/// for the current phases where MPT trees are built once and kept for the
-/// firmware lifetime.
+/// Pages are never reclaimed (`free_page` is a no-op): every table of the
+/// MPT trees, whether built at boot or by a later permission update, stays
+/// in use for the firmware's lifetime.
+///
+/// One instance must serve the firmware for its whole lifetime: the cursor
+/// only moves forward and nothing marks a page as in use, so a second
+/// instance over the same region would hand out pages that are already part
+/// of an MPT.
 pub struct MptBumpAlloc {
     base_paddr: usize,
     size: usize,
@@ -495,18 +504,12 @@ impl MptBumpAlloc {
     /// Create a new bump allocator over the region `[base_paddr, base_paddr + size)`.
     ///
     /// The region must be 4 KiB aligned and reserved (not used by anything else).
-    #[allow(dead_code)]
     pub const fn new(base_paddr: usize, size: usize) -> Self {
         Self {
             base_paddr,
             size,
             next_offset: 0,
         }
-    }
-
-    /// Create a bump allocator backed by the reserved MPT page pool.
-    pub fn from_pool() -> Self {
-        Self::new(MPT_PAGE_POOL_PADDR, MPT_PAGE_POOL_SIZE)
     }
 
     /// Allocate `num_pages` contiguous 4 KiB pages and return the PPN of
@@ -535,5 +538,97 @@ impl MptPageAlloc for MptBumpAlloc {
 
     fn free_page(&mut self, _ppn: usize) {
         // Bump allocator: no-op.  Pages are not reclaimed.
+    }
+
+    fn can_allocate(&self, count: usize) -> bool {
+        count
+            .checked_mul(4096)
+            .and_then(|bytes| self.next_offset.checked_add(bytes))
+            .is_some_and(|end| end <= self.size)
+    }
+}
+
+// ── Unit tests ─────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::{MPT_PAGE_POOL_PADDR, MPT_PAGE_POOL_SIZE, MptBumpAlloc};
+    use rdsm::mpt::MptPageAlloc;
+
+    /// Arbitrary 4 KiB aligned base; the allocator never touches memory.
+    const BASE: usize = 0x1234_5000;
+
+    #[test]
+    fn hands_out_contiguous_pages_from_the_base() {
+        let mut alloc = MptBumpAlloc::new(BASE, 4 * 4096);
+        assert_eq!(alloc.alloc_page(), Some(BASE >> 12));
+        assert_eq!(alloc.alloc_page(), Some((BASE >> 12) + 1));
+        assert_eq!(alloc.alloc_page(), Some((BASE >> 12) + 2));
+        assert_eq!(alloc.alloc_page(), Some((BASE >> 12) + 3));
+    }
+
+    #[test]
+    fn exhausts_after_the_pool_size() {
+        let mut alloc = MptBumpAlloc::new(BASE, 2 * 4096);
+        assert_eq!(alloc.alloc_page(), Some(BASE >> 12));
+        assert_eq!(alloc.alloc_page(), Some((BASE >> 12) + 1));
+        assert_eq!(alloc.alloc_page(), None);
+        // Exhaustion is stable.
+        assert_eq!(alloc.alloc_page(), None);
+    }
+
+    #[test]
+    fn empty_pool_allocates_nothing() {
+        let mut alloc = MptBumpAlloc::new(BASE, 0);
+        assert_eq!(alloc.alloc_page(), None);
+        assert!(!alloc.can_allocate(1));
+        assert!(alloc.can_allocate(0));
+    }
+
+    #[test]
+    fn can_allocate_boundaries() {
+        let mut alloc = MptBumpAlloc::new(BASE, 2 * 4096);
+        assert!(alloc.can_allocate(0));
+        assert!(alloc.can_allocate(1));
+        assert!(alloc.can_allocate(2));
+        assert!(!alloc.can_allocate(3));
+
+        assert_eq!(alloc.alloc_page(), Some(BASE >> 12));
+        assert!(alloc.can_allocate(0));
+        assert!(alloc.can_allocate(1));
+        assert!(!alloc.can_allocate(2));
+
+        assert_eq!(alloc.alloc_page(), Some((BASE >> 12) + 1));
+        assert!(alloc.can_allocate(0));
+        assert!(!alloc.can_allocate(1));
+    }
+
+    #[test]
+    fn can_allocate_rejects_overflow() {
+        let mut alloc = MptBumpAlloc::new(BASE, 2 * 4096);
+        alloc.alloc_page().unwrap();
+        assert!(!alloc.can_allocate(usize::MAX));
+        assert!(!alloc.can_allocate(usize::MAX / 4096 + 1));
+    }
+
+    #[test]
+    fn free_page_does_not_recycle() {
+        let mut alloc = MptBumpAlloc::new(BASE, 2 * 4096);
+        let first = alloc.alloc_page().unwrap();
+        let second = alloc.alloc_page().unwrap();
+        alloc.free_page(first);
+        assert_eq!(alloc.alloc_page(), None);
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn reserved_pool_geometry() {
+        assert_eq!(MPT_PAGE_POOL_PADDR % 4096, 0, "pool base must be aligned");
+        assert_eq!(
+            MPT_PAGE_POOL_SIZE % 4096,
+            0,
+            "pool size must be whole pages"
+        );
+        assert_eq!(MPT_PAGE_POOL_SIZE / 4096, 1024);
     }
 }

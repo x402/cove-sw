@@ -92,6 +92,18 @@ impl MptMode {
         }
     }
 
+    /// Number of physical address bits the tables cover. The hardware
+    /// faults on an address with a higher bit set, and a table walk ignores
+    /// those bits.
+    pub const fn address_bits(self) -> usize {
+        match self {
+            Self::Bare => 0,
+            Self::Smmpt43 => 43,
+            Self::Smmpt52 => 52,
+            Self::Smmpt64 => usize::BITS as usize,
+        }
+    }
+
     /// Number of entries in the root table.
     pub const fn root_entries(self) -> usize {
         match self {
